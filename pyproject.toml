@@ -1,0 +1,29 @@
+[project]
+name = "deep-research-agent"
+version = "0.1.0"
+description = "A persistent, subagent-orchestrating research agent built on Deep Agents (LangChain + LangGraph)."
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    # Deep Agents harness (bundles langgraph transitively)
+    "deepagents",
+    # LangChain 1.0 LTS core + framework
+    "langchain>=1.0,<2.0",
+    "langchain-core>=1.0,<2.0",
+    # Anthropic provider (Claude models)
+    "langchain-anthropic",
+    # Web search tool for research (dedicated partner package)
+    "langchain-tavily",
+    # Orchestration runtime + disk-backed checkpointer for HITL/persistence
+    "langgraph>=1.0,<2.0",
+    "langgraph-checkpoint-sqlite",
+    # Observability
+    "langsmith>=0.3.0",
+    # Load .env into the environment
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+]
