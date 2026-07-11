@@ -22,6 +22,10 @@ uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
 ```
 
+- **Use the Astral skills.** When working with Python here, invoke the relevant
+  `/astral:<skill>` — `/astral:uv`, `/astral:ty`, `/astral:ruff` — so that
+  dependency management, type checking, and lint/format follow current best
+  practices rather than remembered defaults.
 - **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
