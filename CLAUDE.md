@@ -13,17 +13,31 @@ package is small support modules around it.
 ## Commands
 
 ```bash
-uv sync                          # install deps into ./.venv (Python >=3.11)
+uv sync                          # install deps + the project itself (editable) into ./.venv
 uv run python -m deep_research   # run the interactive REPL (the only entry point)
-uv run ruff check                # lint
-uv run ruff check --fix          # lint + autofix
+uv run pytest                    # offline test suite (no keys/network needed)
+uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
+uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
 ```
 
-- **No test suite exists** — do not invent `pytest`/`make`/`tox` commands. If you
-  add tests, they'll be the first, so also add the test runner to the `dev`
-  dependency group in `pyproject.toml`.
+- **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
+  it targets the branching logic in `cli.py` and the load-bearing wiring
+  invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
+  gate, the Opus 4.8 no-sampling invariant), not the agent's LLM output. Tests
+  use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
+  marker is registered and **deselected by default** (`addopts = -m 'not live'`);
+  those need real keys. New behavior should come with a test in the matching
+  file; verify a safety/invariant test actually bites by breaking the source and
+  watching it go red.
+- **The project is installable** (`[build-system]` = hatchling; the import package
+  `deep_research` differs from the distribution name `deep-research-agent`, wired
+  via `[tool.hatch.build.targets.wheel]`). So `uv sync` installs it editable and
+  `import deep_research` works without a `pythonpath` shim.
+- **CI** (`.github/workflows/ci.yml`): a `lint` job (ruff + `ruff format --check` +
+  ty) and a `test` matrix over Python 3.11–3.13, all via `uv`. The offline suite
+  needs no secrets. Keep it green.
 - **No console-script entry point** — the app is invoked only as a module
   (`python -m deep_research` → `__main__.py` → `cli.main`).
 - **`ruff` has no config** (pure defaults). **`ty`** (Astral's type checker) is a

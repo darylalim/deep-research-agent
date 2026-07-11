@@ -23,6 +23,10 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
@@ -30,10 +34,14 @@ dev = [
     "ty>=0.0.58",
 ]
 
+# The distribution name (deep-research-agent) differs from the import package
+# (deep_research), so point hatchling at the right directory for the wheel.
+[tool.hatch.build.targets.wheel]
+packages = ["deep_research"]
+
 [tool.pytest.ini_options]
-# The package isn't pip-installed (no [build-system]), so put the repo root on
-# sys.path to make `import deep_research` work during collection.
-pythonpath = ["."]
+# `deep_research` imports without a sys.path shim because the project itself is
+# installed (editable) into the venv by `uv sync`.
 testpaths = ["tests"]
 # `live` tests hit real Anthropic/Tavily APIs — opt in with `pytest -m live`.
 addopts = "-m 'not live'"
