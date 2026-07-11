@@ -25,6 +25,18 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ruff",
     "ty>=0.0.58",
+]
+
+[tool.pytest.ini_options]
+# The package isn't pip-installed (no [build-system]), so put the repo root on
+# sys.path to make `import deep_research` work during collection.
+pythonpath = ["."]
+testpaths = ["tests"]
+# `live` tests hit real Anthropic/Tavily APIs — opt in with `pytest -m live`.
+addopts = "-m 'not live'"
+markers = [
+    "live: exercises real external APIs (needs keys + network); deselected by default",
 ]
