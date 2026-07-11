@@ -39,6 +39,16 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["deep_research"]
 
+[tool.ruff.lint]
+# Ruff's defaults are only E4/E7/E9 + F. Widen to catch import order (I),
+# outdated idioms (UP), likely bugs (B), needless complexity (SIM), dead `noqa`
+# directives (RUF100), and blind excepts (BLE) — the last of these is what makes
+# the deliberate suppression in `cli.py` an enforced decision rather than a
+# decorative comment. `target-version` is inferred from `requires-python`.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+# The formatter owns line length; E501 would only ever fire on prose it won't rewrap.
+ignore = ["E501"]
+
 [tool.pytest.ini_options]
 # `deep_research` imports without a sys.path shim because the project itself is
 # installed (editable) into the venv by `uv sync`.

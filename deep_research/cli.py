@@ -27,7 +27,7 @@ BANNER = f"""\
 │  Commands:  /help   /thread <id>   /exit                      │
 ╰──────────────────────────────────────────────────────────────╯"""
 
-HELP = """\
+HELP = f"""\
 Commands:
   /help          show this help
   /thread <id>   switch to a different conversation thread (default: "main")
@@ -37,10 +37,8 @@ Notes:
   • Conversation, todos, and pending approvals persist across restarts
     (checkpointed to .deep_research/checkpoints.sqlite).
   • Durable findings the agent saves under /memories/ persist across every
-    thread and session ({memory_db}).
-  • Writing files or running commands pauses for your approval.""".format(
-    memory_db=MEMORY_DB.name
-)
+    thread and session ({MEMORY_DB.name}).
+  • Writing files or running commands pauses for your approval."""
 
 
 def _text_of(message: Any) -> str:

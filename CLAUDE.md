@@ -44,10 +44,16 @@ uv run ty check                  # type check (Astral's ty)
   needs no secrets. Keep it green.
 - **No console-script entry point** — the app is invoked only as a module
   (`python -m deep_research` → `__main__.py` → `cli.main`).
-- **`ruff` has no config** (pure defaults). **`ty`** (Astral's type checker) is a
-  pinned `dev` dependency; run it with `uv run ty check`. Some source files carry
-  inline `# ty: ignore[...]` comments — see the deliberate false-positive
-  suppression in `config.py::build_model`.
+- **`ruff` selects more than the defaults** (`[tool.ruff.lint]` in `pyproject.toml`):
+  `E,F,I,UP,B,SIM,RUF,BLE`, with `E501` ignored because the formatter owns line
+  length. `BLE` is load-bearing — it is what makes the `# noqa: BLE001` on the
+  broad `except` in `cli.py::main` an *enforced* suppression; under ruff's
+  defaults that rule is off, so the directive would be dead (`RUF100` catches
+  exactly this). `target-version` is inferred from `requires-python`, so the
+  3.11 floor governs `UP` fixes without a separate setting.
+- **`ty`** (Astral's type checker) is a pinned `dev` dependency; run it with
+  `uv run ty check`. Some source files carry inline `# ty: ignore[...]` comments
+  — see the deliberate false-positive suppression in `config.py::build_model`.
 - Requires `.env` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` (copy from
   `.env.example`). `config.missing_keys()` hard-exits the CLI if either is unset.
 
