@@ -1,4 +1,4 @@
-# deep-agent
+# Deep Research Agent
 
 A **deep research agent** built with [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
 (LangChain 1.0 + LangGraph). Ask it a research question; it plans the work,
