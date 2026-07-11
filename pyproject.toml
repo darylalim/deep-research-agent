@@ -5,22 +5,27 @@ description = "A persistent, subagent-orchestrating research agent built on Deep
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    # Deep Agents harness (bundles langgraph transitively)
-    "deepagents",
+    # Deep Agents harness (bundles langgraph transitively).
+    # Capped at the MINOR: deepagents is 0.x, so a minor bump is its breaking
+    # boundary, and 0.7.0 is a known break — it removes the `runtime` argument to
+    # StateBackend/StoreBackend and the callable-factory form of `backend=`, both
+    # of which `agent.py` used to rely on. Everything else here is capped at the
+    # major, matching the LangChain 1.0 LTS line.
+    "deepagents>=0.6.12,<0.7",
     # LangChain 1.0 LTS core + framework
     "langchain>=1.0,<2.0",
     "langchain-core>=1.0,<2.0",
     # Anthropic provider (Claude models)
-    "langchain-anthropic",
+    "langchain-anthropic>=1.0,<2.0",
     # Web search tool for research (dedicated partner package)
-    "langchain-tavily",
+    "langchain-tavily>=0.2,<1.0",
     # Orchestration runtime + disk-backed checkpointer for HITL/persistence
     "langgraph>=1.0,<2.0",
-    "langgraph-checkpoint-sqlite",
+    "langgraph-checkpoint-sqlite>=3.0,<4.0",
     # Observability
-    "langsmith>=0.3.0",
+    "langsmith>=0.3,<1.0",
     # Load .env into the environment
-    "python-dotenv>=1.0",
+    "python-dotenv>=1.0,<2.0",
 ]
 
 [build-system]

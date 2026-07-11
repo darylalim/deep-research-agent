@@ -71,13 +71,24 @@ sqlite file so everything survives a restart with no DB server:
 - **Store** (`SqliteStore` → `.deep_research/memories.sqlite`) — long-term memory
   shared across *all* threads.
 
-The bridge between them is the `_backend_factory` in `agent.py`: a
-`CompositeBackend` whose `default=StateBackend` (ephemeral, per-thread, but
-checkpointed) and whose `routes={"/memories/": StoreBackend}` sends only that
-path prefix to the durable Store. **Consequence:** a file the agent writes to
-`/memories/foo.md` is readable in the next session; anything it writes elsewhere
-(e.g. `/report.md`) lives only in that thread. The system prompt in `agent.py`
-encodes this convention, so changing the route or the prompt must stay in sync.
+The bridge between them is `build_backend()` in `agent.py`: a `CompositeBackend`
+whose `default=StateBackend()` (ephemeral, per-thread, but checkpointed) and whose
+`routes={"/memories/": StoreBackend()}` sends only that path prefix to the durable
+Store. **Consequence:** a file the agent writes to `/memories/foo.md` is readable
+in the next session; anything it writes elsewhere (e.g. `/report.md`) lives only in
+that thread. The system prompt in `agent.py` encodes this convention, so changing
+the route or the prompt must stay in sync.
+
+It is passed to `create_deep_agent()` as an **instance** (`backend=build_backend()`).
+deepagents also accepts a `Callable[[Runtime], BackendProtocol]` factory there, and
+this project used to — but the factory form, along with `StateBackend(runtime)` /
+`StoreBackend(runtime)`, is deprecated for **removal in deepagents 0.7.0** (the
+backends resolve the runtime themselves now). Hence the `deepagents>=0.6.12,<0.7`
+cap in `pyproject.toml`: it is capped at the *minor* because deepagents is 0.x, so
+that is where it breaks. `test_backend_construction_is_free_of_deprecation_warnings`
+turns any such DeprecationWarning into a test failure, because nothing else would
+catch it — a factory is not invoked until the first filesystem tool call at *invoke*
+time, so the assembly smoke test never reaches it.
 
 ### 2. The `interrupt_on` ↔ `checkpointer` dependency (`agent.py`)
 

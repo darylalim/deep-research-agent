@@ -481,15 +481,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "deepagents" },
+    { name = "deepagents", specifier = ">=0.6.12,<0.7" },
     { name = "langchain", specifier = ">=1.0,<2.0" },
-    { name = "langchain-anthropic" },
+    { name = "langchain-anthropic", specifier = ">=1.0,<2.0" },
     { name = "langchain-core", specifier = ">=1.0,<2.0" },
-    { name = "langchain-tavily" },
+    { name = "langchain-tavily", specifier = ">=0.2,<1.0" },
     { name = "langgraph", specifier = ">=1.0,<2.0" },
-    { name = "langgraph-checkpoint-sqlite" },
-    { name = "langsmith", specifier = ">=0.3.0" },
-    { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "langgraph-checkpoint-sqlite", specifier = ">=3.0,<4.0" },
+    { name = "langsmith", specifier = ">=0.3,<1.0" },
+    { name = "python-dotenv", specifier = ">=1.0,<2.0" },
 ]
 
 [package.metadata.requires-dev]
