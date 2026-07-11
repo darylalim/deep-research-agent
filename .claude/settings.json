@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Edit(.env)",
+      "Read(./.deep_research/**)",
+      "Edit(./.deep_research/**)",
+      "Edit(./uv.lock)"
+    ],
+    "allow": [
+      "Bash(uv sync *)",
+      "Bash(uv lock *)",
+      "Bash(uv run ruff check *)",
+      "Bash(uv run ruff format *)",
+      "Bash(uv run ty check *)",
+      "Bash(uv run pytest)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}\"/.claude/hooks/post-edit.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

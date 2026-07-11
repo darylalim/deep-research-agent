@@ -13,3 +13,7 @@ __pycache__/
 
 # Local agent state (checkpoints + persistent memory)
 .deep_research/
+
+# Claude Code: `.claude/settings.json` and `.claude/hooks/` ARE committed (they
+# encode project facts, not preferences). Personal overrides are not.
+.claude/settings.local.json

@@ -26,6 +26,16 @@ uv run ty check                  # type check (Astral's ty)
   `/astral:<skill>` — `/astral:uv`, `/astral:ty`, `/astral:ruff` — so that
   dependency management, type checking, and lint/format follow current best
   practices rather than remembered defaults.
+- **A PostToolUse hook already runs ruff and pytest for you.** `.claude/settings.json`
+  wires `.claude/hooks/post-edit.sh` to every `Edit`/`Write` of a `.py` file: it
+  formats and autofixes with ruff, reports whatever ruff *can't* autofix, and — for
+  edits under `deep_research/` or `tests/` — runs the offline suite (~1s, no keys,
+  no network). A non-zero exit blocks with the failure in stderr. Both steps live in
+  one script, in that order, deliberately: `ruff check --fix` rewrites the file, so a
+  pytest run racing it in a parallel hook could read a half-rewritten tree. The same
+  settings file `deny`s reads/edits of `.env`, `.deep_research/**` (live agent state:
+  checkpoints, memories, *pending approvals*), and `uv.lock` — all gitignored, so git
+  cannot undo damage to them.
 - **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
