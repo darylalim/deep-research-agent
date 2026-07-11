@@ -14,6 +14,13 @@
 #
 # exit 2 = block and feed stderr back to Claude. PostToolUse cannot un-write the
 # file, but it does force Claude to fix it before moving on.
+#
+# settings.json invokes this as `bash <path>`, not as a bare executable. The file
+# IS committed mode 100755, but the exec bit is deliberately not load-bearing: if
+# it were ever lost (a Windows checkout, a zip download, the file recreated without
+# +x), a directly-invoked hook fails with "permission denied" and simply stops
+# running — no error surfaced, no checks performed, no sign the safety net is gone.
+# Going through `bash` means the worst case is the hook still working.
 
 set -uo pipefail
 
