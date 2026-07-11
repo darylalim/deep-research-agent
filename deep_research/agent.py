@@ -86,9 +86,11 @@ def build_backend() -> CompositeBackend:
 
 # Tools that mutate the world (or run shell) are gated behind human approval.
 # `interrupt_on` REQUIRES a checkpointer — that dependency is satisfied below.
-# `True` gates a tool with the default approve/edit/reject choices; a per-tool
-# `InterruptOnConfig` (e.g. `{"allowed_decisions": ["approve", "reject"]}`) can
-# restrict the options instead.
+# `True` expands to all four decisions (approve / edit / reject / respond); a
+# per-tool `InterruptOnConfig` (e.g. `{"allowed_decisions": ["approve", "reject"]}`)
+# narrows them. Narrowing is honored by the CLI — `cli.py::_prompt_decision` builds
+# its menu from the interrupt's `ReviewConfig` — so it needs no change here. Sending
+# a decision a tool forbids raises `ValueError` inside the middleware.
 GATED_TOOLS: dict[str, bool | InterruptOnConfig] = {
     "write_file": True,
     "edit_file": True,

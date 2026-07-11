@@ -66,7 +66,7 @@ you > What are the leading approaches to long-context retrieval in 2025, and the
 
   ⏸  Approval required — write_file
      args: {"file_path": "/memories/long-context-retrieval.md", ...}
-     [a]pprove / [e]dit / [r]eject (default a) > a
+     [a]pprove / [e]dit / [r]eject / re[s]pond (default a) > a
 
 agent > <synthesized, cited answer>
 ```
@@ -96,9 +96,14 @@ create_deep_agent(
 
 The CLI drives the human-in-the-loop protocol: `invoke()` returns with an
 `__interrupt__` when a gated tool is proposed; the CLI shows the pending action,
-collects an approve/edit/reject decision, and resumes with
+collects one decision per pending action, and resumes with
 `Command(resume={"decisions": [...]})`. Resuming can hit the next gated tool, so
 it loops until the turn finishes.
+
+The options it offers aren't fixed — the interrupt carries a per-tool
+`allowed_decisions`, and the middleware rejects anything outside it, so the menu is
+built from that (`approve` / `edit` / `reject` / `respond`, minus whatever the tool
+forbids).
 
 ## Project layout
 

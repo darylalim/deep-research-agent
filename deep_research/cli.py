@@ -2,13 +2,19 @@
 
 Runs a REPL against a single persistent thread. When the agent proposes a gated
 action (writing a file, running a command) the turn pauses and this CLI collects
-an approve / edit / reject decision, then resumes the run.
+one decision per pending action, then resumes the run.
+
+Which decisions are on offer is not fixed: each interrupt carries a `ReviewConfig`
+per tool saying what that tool permits, and the middleware raises `ValueError` on
+anything outside it. `_prompt_decision` therefore builds its menu from that config
+rather than hardcoding approve/edit/reject.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Sequence
 from typing import Any
 
 from langgraph.types import Command
@@ -76,11 +82,57 @@ def _short(value: Any, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
-def _prompt_decision(request: dict[str, Any]) -> dict[str, Any]:
-    """Ask the human to approve / edit / reject one proposed action."""
+# The decision types the middleware understands, in the order we offer them, each
+# mapped to the key that selects it and how it renders in the menu. `respond` has
+# no free letter left, hence `re[s]pond`.
+DECISION_KEYS: dict[str, tuple[str, str]] = {
+    "approve": ("a", "[a]pprove"),
+    "edit": ("e", "[e]dit"),
+    "reject": ("r", "[r]eject"),
+    "respond": ("s", "re[s]pond"),
+}
+
+# What the middleware itself assumes for a tool gated with a bare `True`. Used
+# only as a fallback for an interrupt that carries no matching `ReviewConfig`.
+DEFAULT_ALLOWED_DECISIONS = ("approve", "edit", "reject", "respond")
+
+
+def _prompt_decision(
+    request: dict[str, Any], allowed_decisions: Sequence[str] | None = None
+) -> dict[str, Any]:
+    """Ask the human to decide on one proposed action.
+
+    Only the decisions `allowed_decisions` permits for *this* tool are offered.
+    That restriction is load-bearing, not cosmetic: the middleware raises
+    `ValueError` on a decision type outside the tool's `allowed_decisions`, and
+    `main`'s broad `except` would swallow it into a one-line error, losing the
+    turn. Every value in `GATED_TOOLS` is currently `True` (which permits all
+    four), but an `InterruptOnConfig` narrowing them is a supported, documented
+    thing to do — so the CLI has to honor whatever it is handed.
+    """
     name = request.get("name", "<tool>")
     args = request.get("args", {})
     description = request.get("description")
+
+    # `None` means "no ReviewConfig came with this request" → assume the default.
+    # An *empty* list is different: it means nothing is permitted. Don't conflate.
+    permitted = set(
+        DEFAULT_ALLOWED_DECISIONS if allowed_decisions is None else allowed_decisions
+    )
+    allowed = [d for d in DECISION_KEYS if d in permitted]
+    if not allowed:
+        # The tool is gated with a decision set this CLI cannot produce. Guessing
+        # would just raise inside the graph, so fail loudly with the real reason.
+        raise ValueError(
+            f"no supported decision for '{name}' "
+            f"(tool allows: {sorted(permitted) or 'nothing'})"
+        )
+
+    by_key = {DECISION_KEYS[d][0]: d for d in allowed}
+    menu = " / ".join(DECISION_KEYS[d][1] for d in allowed)
+    # Approving is the default only when it is actually on offer.
+    default = "approve" if "approve" in permitted else None
+    prompt = f"     {menu}{' (default a)' if default else ''} > "
 
     print(f"\n  ⏸  Approval required — {name}")
     if description:
@@ -88,45 +140,102 @@ def _prompt_decision(request: dict[str, Any]) -> dict[str, Any]:
     print(f"     args: {_short(args)}")
 
     while True:
-        choice = (
-            input("     [a]pprove / [e]dit / [r]eject (default a) > ").strip().lower()
-        )
-        if choice in ("", "a", "approve"):
+        choice = input(prompt).strip().lower()
+        if not choice and default:
+            decision = default
+        elif choice in by_key:
+            decision = by_key[choice]
+        elif choice in permitted and choice in DECISION_KEYS:
+            decision = choice  # the full word, e.g. "approve"
+        else:
+            print(f"     ? choose {', '.join(DECISION_KEYS[d][0] for d in allowed)}.")
+            continue
+
+        if decision == "approve":
             return {"type": "approve"}
-        if choice in ("r", "reject"):
+        if decision == "reject":
             reason = input("     reason for the agent (optional) > ").strip()
             return {"type": "reject", **({"message": reason} if reason else {})}
-        if choice in ("e", "edit"):
-            print("     enter replacement args as JSON (blank = approve as-is):")
-            raw = input("     > ").strip()
-            if not raw:
+        if decision == "respond":
+            # The human answers *on behalf of* the tool; the tool never runs, so
+            # an empty message would hand the model an empty tool result.
+            message = input("     reply to the agent on the tool's behalf > ").strip()
+            if not message:
+                print("     ? a response needs a message.")
+                continue
+            return {"type": "respond", "message": message}
+
+        # edit — falling back to approve is only legal when approve is permitted.
+        can_fall_back = "approve" in permitted
+        hint = "blank = approve as-is" if can_fall_back else "required"
+        print(f"     enter replacement args as JSON ({hint}):")
+        raw = input("     > ").strip()
+        if not raw:
+            if can_fall_back:
                 return {"type": "approve"}
-            try:
-                new_args = json.loads(raw)
-            except json.JSONDecodeError:
+            print(
+                "     ? this tool does not allow approving unchanged — edit or reject."
+            )
+            continue
+        try:
+            new_args = json.loads(raw)
+        except json.JSONDecodeError:
+            if can_fall_back:
                 print("     ! not valid JSON — approving with the original args.")
                 return {"type": "approve"}
-            return {"type": "edit", "edited_action": {"name": name, "args": new_args}}
-        print("     ? choose a, e, or r.")
+            print("     ! not valid JSON — try again.")
+            continue
+        if not isinstance(new_args, dict):
+            # `"/memories/y.md"` and `[1, 2]` are valid JSON but not valid *args*.
+            # The middleware doesn't validate, so this would sail through into a
+            # ToolCall with non-dict args and only blow up at tool execution.
+            print('     ! args must be a JSON object, e.g. {"file_path": "..."}.')
+            continue
+        return {"type": "edit", "edited_action": {"name": name, "args": new_args}}
 
 
-def _collect_decisions(interrupts: list[Any]) -> list[dict[str, Any]]:
-    """Build one decision per pending action across all active interrupts.
+def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]:
+    """Collect decisions for every pending action, grouped by interrupt id.
 
-    The human-in-the-loop middleware bundles every pending tool call for a turn
-    into a single interrupt whose value is a HITLRequest with `action_requests`;
-    the resume payload is `{"decisions": [...]}` with one decision per request,
-    in order.
+    The human-in-the-loop middleware bundles all of *one agent's* pending tool
+    calls into a single interrupt whose value is a HITLRequest with two parallel
+    lists: `action_requests` (what the agent wants to do) and `review_configs`
+    (which decisions are legal for each, keyed by `action_name`). That interrupt's
+    resume value is `{"decisions": [...]}`, one decision per *request*, in order.
+
+    But a turn can carry **more than one** interrupt. The orchestrator dispatches
+    each `task` call as its own concurrent graph task, and every subagent inherits
+    `interrupt_on` — so two `researcher` subagents fanned out in one turn (which
+    `SYSTEM_PROMPT` explicitly encourages) can each raise their own interrupt. This
+    is why the result is keyed by `interrupt.id` and not flattened: LangGraph
+    raises `RuntimeError("When there are multiple pending interrupts, you must
+    specify the interrupt id when resuming")` unless the resume value is a mapping
+    of interrupt id → that interrupt's resume value. The mapping form is also
+    correct for the ordinary single-interrupt case, so there is one code path.
+
+    `review_configs` is looked up by name rather than by position: the middleware
+    happens to append the two lists in lockstep today, but it documents the field
+    as the policy "for all possible actions", so a name lookup stays correct if
+    it is ever deduplicated.
     """
-    decisions: list[dict[str, Any]] = []
+    by_interrupt: dict[str, list[dict[str, Any]]] = {}
     for interrupt in interrupts:
         value = getattr(interrupt, "value", interrupt)
-        action_requests = (
-            value.get("action_requests", []) if isinstance(value, dict) else []
-        )
-        for request in action_requests:
-            decisions.append(_prompt_decision(request))
-    return decisions
+        interrupt_id = getattr(interrupt, "id", None)
+        if not isinstance(value, dict) or interrupt_id is None:
+            continue
+        allowed_by_tool = {
+            config["action_name"]: config["allowed_decisions"]
+            for config in value.get("review_configs", [])
+            if config.get("action_name") and config.get("allowed_decisions")
+        }
+        decisions = [
+            _prompt_decision(request, allowed_by_tool.get(request.get("name")))
+            for request in value.get("action_requests", [])
+        ]
+        if decisions:
+            by_interrupt[interrupt_id] = decisions
+    return by_interrupt
 
 
 def main() -> None:
@@ -175,9 +284,22 @@ def main() -> None:
                 )
                 # Resuming may hit the next gated tool, so loop until no interrupt.
                 while result.get("__interrupt__"):
-                    decisions = _collect_decisions(result["__interrupt__"])
+                    by_interrupt = _collect_decisions(result["__interrupt__"])
+                    if not by_interrupt:
+                        # Nothing reviewable — resuming would just re-interrupt.
+                        print("\n! paused with no reviewable action; abandoning turn.")
+                        break
+                    # Keyed by interrupt id: a turn can hold several interrupts at
+                    # once (concurrent subagents), and LangGraph rejects a resume
+                    # that doesn't say which interrupt each value belongs to.
                     result = agent.invoke(
-                        Command(resume={"decisions": decisions}), config=config
+                        Command(
+                            resume={
+                                interrupt_id: {"decisions": decisions}
+                                for interrupt_id, decisions in by_interrupt.items()
+                            }
+                        ),
+                        config=config,
                     )
             except KeyboardInterrupt:
                 # Ctrl-C is a BaseException (not Exception), so it must be caught

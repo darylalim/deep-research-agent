@@ -96,8 +96,9 @@ time, so the assembly smoke test never reaches it.
 which pauses the graph for human approval. **This REQUIRES a checkpointer** — the
 pending interrupt is persisted there. The two are wired together in the same
 `create_deep_agent()` call; don't add interrupts without a checkpointer, and note
-that gating a *new* tool is just adding its name to `GATED_TOOLS` (a `bool` uses
-the default approve/edit/reject choices; an `InterruptOnConfig` restricts them).
+that gating a *new* tool is just adding its name to `GATED_TOOLS` (a `True` expands
+to all four decisions — `approve`, `edit`, `reject`, `respond`; an
+`InterruptOnConfig` narrows them).
 
 ### 3. The HITL resume loop is split across `agent.py` and `cli.py`
 
@@ -107,11 +108,22 @@ drives them:
 - `agent.invoke(...)` returns a state containing `__interrupt__` when a gated tool
   is proposed.
 - The middleware bundles *all* pending tool calls for a turn into one interrupt
-  whose value has `action_requests`; `_collect_decisions` produces **one decision
-  per request, in order**.
+  whose value carries **two parallel lists**: `action_requests` (what the agent
+  wants to do — name/args/description, and *not* what may be decided about it) and
+  `review_configs` (per-tool `allowed_decisions`, keyed by `action_name`).
+  `_collect_decisions` produces **one decision per `action_request`, in order**, and
+  looks the permitted decisions up **by name**, not by position.
 - Resume with `Command(resume={"decisions": [...]})`. Resuming can hit the *next*
   gated tool, so `cli.py` **loops** `while result.get("__interrupt__")` until the
   turn finishes.
+
+**The menu is not hardcoded, and must not be.** The middleware raises `ValueError`
+if a decision's type is outside that tool's `allowed_decisions`, and `main`'s broad
+`except` would swallow it into a one-line `! error:` — losing the whole turn. So
+`_prompt_decision` builds its options from the `ReviewConfig` it is handed. This is
+invisible today only because every `GATED_TOOLS` value is `True` (all four
+decisions); the moment one becomes an `InterruptOnConfig` that drops `edit`, a
+hardcoded `[e]dit` option would break the turn.
 
 If you change what's gated, or how decisions are shaped, both `_collect_decisions`
 / `_prompt_decision` in `cli.py` and `GATED_TOOLS` in `agent.py` are in scope.
