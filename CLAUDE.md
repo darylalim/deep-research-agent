@@ -204,6 +204,43 @@ arbitrary: the CLI calls `agent.invoke()` (non-streaming), and 16k keeps a respo
 comfortably under the Anthropic SDK's HTTP timeout while still leaving room for a
 synthesized report. Raising it materially means switching to streaming.
 
+## Prompt caching is already on — don't wire it again
+
+`create_deep_agent()` appends an `AnthropicPromptCachingMiddleware` itself, to the
+orchestrator *and* to every subagent (`deepagents/graph.py`, `_append_prompt_caching_middleware`).
+It sets three breakpoints — last system-prompt block, last tool definition (which
+covers the whole contiguous tool set), and a top-level `cache_control` in
+`model_settings` that auto-caches the growing message tail. So the system prompt,
+the tool schemas, and the conversation history are all cached already. Adding
+another caching middleware via `middleware=[...]` would give you *two* of them
+fighting over the same breakpoints; don't.
+
+**This is easy to get wrong, so check before you "fix" it.** Nothing in this repo
+mentions caching, and the middleware hooks `wrap_model_call` — which is *not* a
+graph node, so it never appears in `agent.nodes`. Reading `agent.py` and `config.py`
+gives no hint it exists, and the natural (wrong) conclusion is that every call
+re-sends the prefix at full price. It doesn't. More generally: `create_deep_agent()`
+does substantially more than its arguments suggest, so "this repo doesn't configure
+X" is not evidence that X is off — grep the installed package before acting.
+
+The default TTL is **5m**. That covers a whole turn (its many model calls fire back
+to back) but expires while a human reads a report or sits on an approval, so a slow
+turn re-writes its prefix. Leave it: the 1h TTL doubles the write multiplier
+(2x vs 1.25x) to buy back only the idle gap.
+
+`test_live.py::test_prompt_caching_actually_serves_the_prefix_from_cache` asserts the
+cache is genuinely *read* (`cache_read` > 0), not merely that the middleware is
+present — a prefix under Anthropic's 4096-token minimum would honor `cache_control`
+and still cache nothing. Measured, the system+tools prefix is **~11.9k tokens**, so
+it clears that bar with room to spare. The cache is keyed on the **prefix, not the
+thread**: a brand-new `thread_id` reads a prefix an earlier thread (or an earlier
+*process*) warmed. That is why the test runs two one-turn threads rather than two
+turns on one thread — an opening turn can't hit the sharp edge where invoking fresh
+input on a thread with a *pending HITL interrupt* resumes the model node on a message
+list ending in an assistant message, which Opus 4.8 rejects as prefill (400). `cli.py`
+never trips this because it loops on `__interrupt__` and resumes with `Command(resume=...)`
+instead of sending a new turn.
+
 ## Extending it (where things go)
 
 - **New tool** → build in `tools.py`, then add to `tools=[...]` in `agent.py`
