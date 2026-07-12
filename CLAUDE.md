@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
-(currently v0.6.x) on LangChain 1.0 + LangGraph. Almost all the substance lives in
-*how* `create_deep_agent()` is wired in `deep_research/agent.py`; the rest of the
-package is small support modules around it.
+(currently v0.6.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
+`agent.py` (~130 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
+(~320 lines, the largest module here) — the human-in-the-loop interrupt/resume
+protocol that wiring implies. `config.py`, `tools.py`, and `subagents.py` are
+genuinely small support modules.
 
 ## Commands
 
@@ -27,19 +29,23 @@ uv run ty check                  # type check (Astral's ty)
   dependency management, type checking, and lint/format follow current best
   practices rather than remembered defaults.
 - **A PostToolUse hook already runs ruff and pytest for you.** `.claude/settings.json`
-  wires `.claude/hooks/post-edit.sh` to every `Edit`/`Write` of a `.py` file: it
-  formats and autofixes with ruff, reports whatever ruff *can't* autofix, and — for
-  edits under `deep_research/` or `tests/` — runs the offline suite (~1s, no keys,
-  no network). A non-zero exit blocks with the failure in stderr. Both steps live in
-  one script, in that order, deliberately: `ruff check --fix` rewrites the file, so a
-  pytest run racing it in a parallel hook could read a half-rewritten tree. The same
-  settings file `deny`s reads/edits of `.env`, `.deep_research/**` (live agent state:
-  checkpoints, memories, *pending approvals*), and `uv.lock` — all gitignored, so git
-  cannot undo damage to them.
+  wires `.claude/hooks/post-edit.sh` to every `Edit`/`Write` of a `.py` file — as
+  `bash <path>`, deliberately, so a lost exec bit can't silently disable the gate;
+  wire any new hook the same way. It formats and autofixes with ruff, reports
+  whatever ruff *can't* autofix, and — for edits under `deep_research/` or `tests/` —
+  runs the offline suite (~1s, no keys, no network). A non-zero exit blocks with the
+  failure in stderr. Both steps live in one script, in that order, deliberately:
+  `ruff check --fix` rewrites the file, so a pytest run racing it in a parallel hook
+  could read a half-rewritten tree. The same settings file `deny`s reads *and* edits
+  of `.env` and `.deep_research/**` (live agent state: checkpoints, memories,
+  *pending approvals*) — both gitignored, so git cannot undo damage to them — and
+  `deny`s *edits* of `uv.lock`, which **is** committed: regenerate it with `uv lock`,
+  never hand-edit it.
 - **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
-  gate, the Opus 4.8 no-sampling invariant), not the agent's LLM output. Tests
+  gate, the Opus 4.8 no-sampling invariant, the `/memories/` route and its store
+  namespace, and deepagents 0.7.0 backend readiness), not the agent's LLM output. Tests
   use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
   marker is registered and **deselected by default** (`addopts = -m 'not live'`);
   those need real keys. New behavior should come with a test in the matching
@@ -83,22 +89,40 @@ sqlite file so everything survives a restart with no DB server:
 
 The bridge between them is `build_backend()` in `agent.py`: a `CompositeBackend`
 whose `default=StateBackend()` (ephemeral, per-thread, but checkpointed) and whose
-`routes={"/memories/": StoreBackend()}` sends only that path prefix to the durable
-Store. **Consequence:** a file the agent writes to `/memories/foo.md` is readable
-in the next session; anything it writes elsewhere (e.g. `/report.md`) lives only in
-that thread. The system prompt in `agent.py` encodes this convention, so changing
-the route or the prompt must stay in sync.
+`routes={"/memories/": StoreBackend(namespace=lambda _runtime: MEMORY_NAMESPACE)}`
+sends only that path prefix to the durable Store. **Consequence:** a file the agent
+writes to `/memories/foo.md` is readable in the next session; anything it writes
+elsewhere (e.g. `/report.md`) lives only in that thread. The system prompt in
+`agent.py` encodes this convention, so changing the route or the prompt must stay in
+sync.
 
-It is passed to `create_deep_agent()` as an **instance** (`backend=build_backend()`).
-deepagents also accepts a `Callable[[Runtime], BackendProtocol]` factory there, and
-this project used to — but the factory form, along with `StateBackend(runtime)` /
-`StoreBackend(runtime)`, is deprecated for **removal in deepagents 0.7.0** (the
-backends resolve the runtime themselves now). Hence the `deepagents>=0.6.12,<0.7`
-cap in `pyproject.toml`: it is capped at the *minor* because deepagents is 0.x, so
-that is where it breaks. `test_backend_construction_is_free_of_deprecation_warnings`
-turns any such DeprecationWarning into a test failure, because nothing else would
-catch it — a factory is not invoked until the first filesystem tool call at *invoke*
-time, so the assembly smoke test never reaches it.
+`MEMORY_NAMESPACE = ("filesystem",)` is the Store namespace those files are filed
+under, and its **value must never change**. It is exactly what deepagents' legacy
+auto-detection resolves to for this app (its `assistant_id` branch is a LangGraph
+Platform concept a local CLI never sets), so it is the key every note already in
+`memories.sqlite` lives under — change it and the user's durable memory is orphaned,
+silently. Passing it *explicitly* is separately required: a `StoreBackend` with no
+`namespace` is itself deprecated for removal in 0.7.0.
+
+The backend is passed to `create_deep_agent()` as an **instance**
+(`backend=build_backend()`). deepagents also accepts a
+`Callable[[Runtime], BackendProtocol]` factory there, and this project used to — but
+the factory form, along with `StateBackend(runtime)` / `StoreBackend(runtime)` and a
+`StoreBackend` with no explicit `namespace`, is deprecated for **removal in
+deepagents 0.7.0** (the backends resolve the runtime themselves now). Hence the
+`deepagents>=0.6.12,<0.7` cap in `pyproject.toml`: it is capped at the *minor*
+because deepagents is 0.x, so that is where it breaks.
+
+**Three tests in `test_agent_wiring.py` keep this 0.7.0-ready**, because the
+deprecations fire at *different times* and no single test sees them all:
+`test_backend_construction_is_free_of_deprecation_warnings` (the `runtime` form —
+warns at construction), `test_memory_namespace_is_explicit_and_unchanged` (the
+missing-`namespace` form — warns only when a store op actually *resolves* the
+namespace, so the construction test cannot see it), and
+`test_open_agent_passes_a_backend_instance_not_a_factory` (the factory form — it
+asserts on what `create_deep_agent()` actually receives). None of these is reachable
+from the assembly smoke test: a backend is not exercised until the first filesystem
+tool call at *invoke* time.
 
 ### 2. The `interrupt_on` ↔ `checkpointer` dependency (`agent.py`)
 
@@ -117,15 +141,25 @@ drives them:
 
 - `agent.invoke(...)` returns a state containing `__interrupt__` when a gated tool
   is proposed.
-- The middleware bundles *all* pending tool calls for a turn into one interrupt
-  whose value carries **two parallel lists**: `action_requests` (what the agent
-  wants to do — name/args/description, and *not* what may be decided about it) and
-  `review_configs` (per-tool `allowed_decisions`, keyed by `action_name`).
-  `_collect_decisions` produces **one decision per `action_request`, in order**, and
-  looks the permitted decisions up **by name**, not by position.
-- Resume with `Command(resume={"decisions": [...]})`. Resuming can hit the *next*
-  gated tool, so `cli.py` **loops** `while result.get("__interrupt__")` until the
-  turn finishes.
+- The middleware bundles all of *one agent's* pending tool calls into a single
+  interrupt whose value carries **two parallel lists**: `action_requests` (what the
+  agent wants to do — name/args/description, and *not* what may be decided about it)
+  and `review_configs` (per-tool `allowed_decisions`, keyed by `action_name`).
+  `_collect_decisions` returns `dict[interrupt_id, list[decision]]` — one decision
+  per `action_request`, in order, *within each interrupt* — and looks the permitted
+  decisions up **by name**, not by position.
+- **A turn can hold more than one interrupt.** The orchestrator dispatches each
+  `task` call as its own concurrent graph task, and every subagent inherits
+  `interrupt_on` — so two `researcher`s fanned out in one turn (which `SYSTEM_PROMPT`
+  explicitly encourages) each raise their own. Resume therefore takes a **mapping of
+  interrupt id → that interrupt's resume value**:
+  `Command(resume={interrupt_id: {"decisions": [...]}, ...})`. A flat
+  `Command(resume={"decisions": [...]})` makes LangGraph raise `RuntimeError: When
+  there are multiple pending interrupts, you must specify the interrupt id when
+  resuming`. The mapping is also correct for the ordinary single-interrupt case, so
+  there is one code path — keep it that way.
+- Resuming can hit the *next* gated tool, so `cli.py` **loops**
+  `while result.get("__interrupt__")` until the turn finishes.
 
 **The menu is not hardcoded, and must not be.** The middleware raises `ValueError`
 if a decision's type is outside that tool's `allowed_decisions`, and `main`'s broad
@@ -162,7 +196,13 @@ The default model is `claude-opus-4-8`, built in `config.py::build_model()` **wi
 no `temperature`/`top_p`/`top_k`** — Opus 4.8 returns a 400 if any sampling param
 is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
-accepts them.
+accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
+has no `model` key — so the rule covers them too.
+
+`max_tokens` defaults to **16000** (`DEEP_RESEARCH_MAX_TOKENS`), and that is not
+arbitrary: the CLI calls `agent.invoke()` (non-streaming), and 16k keeps a response
+comfortably under the Anthropic SDK's HTTP timeout while still leaving room for a
+synthesized report. Raising it materially means switching to streaming.
 
 ## Extending it (where things go)
 
@@ -174,4 +214,7 @@ accepts them.
 - **Production persistence** → swap `SqliteStore`/`SqliteSaver` for the Postgres
   equivalents in `open_agent()`; the `CompositeBackend` routing is unchanged.
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
-  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`.
+  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`. All three are resolved into
+  module-level constants at *import* time, so they must be set before
+  `deep_research.config` is first imported — a `monkeypatch.setenv` in a test body is
+  too late, which is why `tests/conftest.py` sets them as top-level code.
