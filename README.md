@@ -95,10 +95,24 @@ create_deep_agent(
 ```
 
 The CLI drives the human-in-the-loop protocol: `invoke()` returns with an
-`__interrupt__` when a gated tool is proposed; the CLI shows the pending action,
-collects one decision per pending action, and resumes with
-`Command(resume={"decisions": [...]})`. Resuming can hit the next gated tool, so
-it loops until the turn finishes.
+`__interrupt__` when a gated tool is proposed; the CLI shows each pending action,
+collects one decision for it, and resumes. Resuming can hit the next gated tool,
+so it loops until the turn finishes.
+
+A turn can carry **more than one** interrupt — the orchestrator dispatches each
+`task` call as its own concurrent graph task and every subagent inherits
+`interrupt_on`, so two `researcher`s fanned out in one turn can each raise their
+own. The resume value is therefore a mapping of interrupt id → that interrupt's
+decisions:
+
+```python
+Command(resume={interrupt_id: {"decisions": [...]}, ...})
+```
+
+A flat `Command(resume={"decisions": [...]})` makes LangGraph raise `RuntimeError:
+When there are multiple pending interrupts, you must specify the interrupt id when
+resuming`. The mapping form is also correct for the single-interrupt case, so there
+is one code path.
 
 The options it offers aren't fixed — the interrupt carries a per-tool
 `allowed_decisions`, and the middleware rejects anything outside it, so the menu is
