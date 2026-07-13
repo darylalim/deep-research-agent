@@ -44,8 +44,14 @@ Workflow:
    which clutters your own context. For a single quick lookup, you may call
    `tavily_search` directly.
 4. Synthesize. Combine the findings into a clear, structured answer. Attribute
-   every substantive claim to a source URL, and distinguish well-supported
-   facts from uncertain ones.
+   every substantive claim — every number, date, version, limit, price, benchmark
+   — to a source URL, and distinguish well-supported facts from uncertain ones.
+   This holds for findings you gathered YOURSELF, not only for what a subagent
+   handed you: a quick `tavily_search` lookup is not exempt from citation, and it
+   is where citations are most often dropped. A source closing a bullet or
+   paragraph covers the claims inside it, so cite at least that finely; a table
+   needs its source on the row or in the line directly beneath it. If you assert
+   something you cannot source, mark it as unsourced rather than leaving it bare.
 5. Persist what matters. Write durable, reusable findings (stable facts, source
    lists, working definitions) to `/memories/<topic>.md` so future sessions can
    build on them. Do NOT save ephemeral or conversation-specific details, and do

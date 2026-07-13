@@ -193,6 +193,31 @@ def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
 # --- LLM judges -------------------------------------------------------------
 
 
+class _UncitedClaim(TypedDict):
+    """One claim the judge believes has no source — and its proof of that.
+
+    `nearest_source` and `why_insufficient` are not decoration: they are what stops
+    the judge inventing violations. Asked only to *list* uncited claims, it flagged
+    figures whose citation sat at the end of their own bullet — wrong on 9 of 12
+    verdicts when they were adjudicated one by one against the text. Forced to first
+    quote the nearest citation and say why it fails, it has to actually look.
+    """
+
+    claim: Annotated[str, ..., "The unsupported claim, quoted or closely paraphrased."]
+    nearest_source: Annotated[
+        str,
+        ...,
+        "The closest citation to this claim anywhere in the answer, quoted verbatim — "
+        "or the exact string 'none' if the answer cites nothing nearby at all.",
+    ]
+    why_insufficient: Annotated[
+        str,
+        ...,
+        "Why that nearest source does not cover this claim: it is in a different "
+        "section, it is about a different assertion, or there is none.",
+    ]
+
+
 class _CitationGrade(TypedDict):
     reasoning: Annotated[str, ..., "One or two sentences justifying the verdict."]
     substantive_claims: Annotated[
@@ -201,14 +226,15 @@ class _CitationGrade(TypedDict):
         "How many substantive factual claims the answer makes in total (cited or not).",
     ]
     uncited_claims: Annotated[
-        list[str],
+        list[_UncitedClaim],
         ...,
-        "Those claims, if any, with no source attributed to them.",
+        "Only claims whose containing bullet, paragraph, table or section carries no "
+        "usable source. Empty if every claim is covered.",
     ]
 
 
-def _citation_score(substantive_claims: int, uncited: int) -> float:
-    """The share of substantive claims that carry a source.
+def _coverage_score(total: int, missing: int) -> float:
+    """The share of a whole that is accounted for — cited claims, answered sub-questions.
 
     A *proportion*, deliberately, where this used to be an all-or-nothing bool — and
     the difference is not a matter of taste. "Every claim is cited" is a conjunction
@@ -222,17 +248,35 @@ def _citation_score(substantive_claims: int, uncited: int) -> float:
     Vacuously perfect when there is nothing to attribute; an answer that asserts
     nothing is `answers_the_question`'s problem, not this one's.
     """
-    if substantive_claims <= 0:
+    if total <= 0:
         return 1.0
-    return max(0.0, (substantive_claims - uncited) / substantive_claims)
+    return max(0.0, (total - missing) / total)
+
+
+class _UnansweredPart(TypedDict):
+    """A part of the question the answer never addresses — with proof."""
+
+    part: Annotated[str, ..., "The sub-question that went unanswered."]
+    closest_the_answer_gets: Annotated[
+        str,
+        ...,
+        "Quote the passage that comes nearest to addressing it, verbatim — or the "
+        "exact string 'nothing' if the answer never touches it.",
+    ]
+    why_insufficient: Annotated[
+        str, ..., "Why that passage does not actually answer this part."
+    ]
 
 
 class _AnswerGrade(TypedDict):
     reasoning: Annotated[str, ..., "One or two sentences justifying the verdict."]
-    answers: Annotated[
-        bool,
+    question_parts: Annotated[
+        int, ..., "How many distinct things the question asks for (at least 1)."
+    ]
+    unanswered_parts: Annotated[
+        list[_UnansweredPart],
         ...,
-        "True if the response directly and completely answers the question asked.",
+        "Only the parts genuinely left unanswered. Empty if the answer covers all of them.",
     ]
 
 
@@ -241,7 +285,7 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
 
     Claim-level, where `response_cites_sources` is only URL-presence: an answer can
     carry one link and still assert six unsourced facts around it. Scored as a
-    proportion — see `_citation_score` for why that is load-bearing rather than
+    proportion — see `_coverage_score` for why that is load-bearing rather than
     cosmetic.
     """
     prose = _outputs(run).get("response", "")
@@ -259,16 +303,29 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
                     "Grade how well a research agent attributed its claims to sources.\n\n"
                     "A SUBSTANTIVE CLAIM is a specific, checkable assertion — a number, "
                     "date, version, limit, price, benchmark, or capability. Framing, "
-                    "hedges, opinions, and summary sentences are not claims and need no "
+                    "hedges, opinions, and recommendations are not claims and need no "
                     "source.\n\n"
-                    "A claim COUNTS AS CITED if a source is identifiable for it: a link, a "
-                    "bare domain, or a named publication, either alongside the claim or on "
-                    "the section/table/row it belongs to. Judge attribution, NOT "
-                    "formatting — `docs.tavily.com/pricing` is a citation even though it is "
-                    "not a clickable link, and a table whose row cites its source covers "
-                    "the figures in that row.\n\n"
-                    "Count every substantive claim, then list only those with no "
-                    "identifiable source.\n\n"
+                    "ATTRIBUTION IS INHERITED, and this is where graders usually go wrong. "
+                    "A citation covers everything in the unit it closes:\n"
+                    "  - a source at the END OF A BULLET cites every figure in that bullet\n"
+                    "  - a source at the END OF A PARAGRAPH cites every claim in it\n"
+                    "  - a source in the paragraph immediately BELOW A TABLE cites the "
+                    "table's rows\n"
+                    "Judge attribution, not formatting: a bare `astral.sh/blog/ty` is a "
+                    "citation.\n\n"
+                    "Worked example — every figure below is CITED, none of them belong in "
+                    "your list:\n"
+                    "  '- **ty:** Astral claims 10-60x faster than mypy. Full PyTorch in "
+                    "~1.12s vs pyright ~48.1s. ([astral.sh/blog/ty](...))'\n"
+                    "The bullet's closing source covers the 10-60x figure AND the timings.\n\n"
+                    "So list a claim as uncited ONLY when its bullet, paragraph, table or "
+                    "section carries no usable source — or when the nearest source plainly "
+                    "cannot support it (a project's own docs cited for a rival's benchmark). "
+                    "For each one you list, you must quote the nearest citation you found "
+                    "and say why it fails. If you cannot do that, the claim is cited: leave "
+                    "it out.\n\n"
+                    "Count every substantive claim, then list only the genuinely "
+                    "unsupported ones.\n\n"
                     f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
                     f"ANSWER:\n{prose}"
                 ),
@@ -277,20 +334,29 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
     )
     total = grade.get("substantive_claims") or 0
     uncited = grade.get("uncited_claims") or []
-    score = _citation_score(total, len(uncited))
+    score = _coverage_score(total, len(uncited))
     cited = total - len(uncited)
+    summary = "; ".join(item.get("claim", "?") for item in uncited[:5])
     return {
         "score": score,
         "comment": f"{cited}/{total} claims cited ({score:.0%}). "
-        + (f"Uncited: {uncited[:8]}" if uncited else "all attributed."),
+        + (f"Unsupported: {summary}" if uncited else "all attributed."),
     }
 
 
 def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
-    """Judge: does the user-visible response actually answer what was asked?"""
+    """Judge: what share of what was asked did the user-visible response deliver?
+
+    Evidence-forced and proportional, for the same reason `claims_are_cited` is. As a
+    bare bool it failed an answer that gave complete per-tier RPM/ITPM/OTPM tables,
+    because that answer *opened* with a caveat that the exact figures move and the
+    reader's own console is authoritative — the judge read the hedge and stopped. An
+    honest caveat is not a refusal to answer, and a judge made to quote the passage
+    that comes nearest to answering cannot mistake one for the other.
+    """
     response = _outputs(run).get("response", "")
     if not response.strip():
-        return {"score": 0, "comment": "empty response"}
+        return {"score": 0.0, "comment": "empty response"}
 
     judge = JUDGE.with_structured_output(
         _AnswerGrade, method="json_schema", strict=True
@@ -300,18 +366,33 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
             {
                 "role": "user",
                 "content": (
-                    "Does this response directly and completely answer the question? A "
-                    "response that defers to a file, or summarizes without answering, does "
-                    "not.\n\n"
+                    "How much of this question did the response actually answer?\n\n"
+                    "Break the question into the distinct things it asks for, then list "
+                    "only the parts the response never delivers.\n\n"
+                    "A part IS answered even when the response hedges it: caveats, ranges, "
+                    "confidence labels and 'sources disagree' notes are honest research, not "
+                    "evasion. An answer that gives the figures AND warns they move is a "
+                    "complete answer. Only count a part as unanswered when the substance is "
+                    "genuinely absent — the response defers you elsewhere INSTEAD of "
+                    "answering, or discusses the topic without ever delivering what was "
+                    "asked for.\n\n"
+                    "For each part you list, quote the passage that comes closest to "
+                    "answering it and say why that passage falls short. If you cannot, the "
+                    "part was answered: leave it out.\n\n"
                     f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
                     f"RESPONSE:\n{response}"
                 ),
             }
         ]
     )
+    parts = max(grade.get("question_parts") or 1, 1)
+    missing = grade.get("unanswered_parts") or []
+    score = _coverage_score(parts, len(missing))
+    summary = "; ".join(item.get("part", "?") for item in missing[:4])
     return {
-        "score": int(bool(grade.get("answers"))),
-        "comment": grade.get("reasoning", ""),
+        "score": score,
+        "comment": f"{parts - len(missing)}/{parts} of the question answered "
+        f"({score:.0%}). " + (f"Missing: {summary}" if missing else "fully answered."),
     }
 
 

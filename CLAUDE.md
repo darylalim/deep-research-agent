@@ -343,16 +343,43 @@ takes `system_prompt=`, but deepagents constructs it internally as `TodoListMidd
 and passing your own via `middleware=[...]` registers a *second* `write_todos` tool —
 there is no dedupe). That coupling was judged not worth it; the eval watches it instead.
 
-**`claims_are_cited` scores a proportion, and must not be turned back into a bool.**
-"Is *every* claim cited?" is a conjunction over every claim in the report: at 95%
-per-claim compliance a 30-claim report passes 0.95³⁰ ≈ 21% of the time, at 90% it passes
-4%. The boolean therefore read 0 on anything long enough to be worth writing, and scored
-"missing one citation" identically to "cited nothing" — no gradient, so it could never
-show that a fix had worked. It measured 0 on 4 of 5 examples while `response_cites_sources`
-passed 5 of 5. As a proportion the same five answers score 0%, 23%, 36%, 71%, 100%, which
-localises the real gap: the agent *does* put URLs in the answer, but leaves dates, versions
-and benchmark figures floating free of them. `_citation_score` carries the argument, and
-`test_citation_score_is_a_proportion_not_a_conjunction` pins it.
+**`claims_are_cited` took two fixes, and both are the kind that get undone.**
+
+*It scores a proportion, and must not become a bool again.* "Is *every* claim cited?" is a
+conjunction over every claim in the report: at 95% per-claim compliance a 30-claim report
+passes 0.95³⁰ ≈ 21% of the time, at 90% it passes 4%. The boolean read 0 on anything long
+enough to be worth writing, and scored "missing one citation" identically to "cited
+nothing" — no gradient, so it could never show a fix had worked. `_citation_score` carries
+the argument; `test_citation_score_is_a_proportion_not_a_conjunction` pins it.
+
+*It must justify each verdict, or it invents them.* Asked merely to list uncited claims, it
+flagged figures whose citation sat at the end of their own bullet. Adjudicated claim by
+claim against the text, **it was wrong on 9 of 12** — it does not spontaneously honour
+inherited attribution (a source closing a bullet, paragraph, or the line under a table
+covers what it closes). The `_UncitedClaim` schema now forces it to quote the nearest
+citation and say why that source fails, so it has to look before it accuses. That single
+change moved the same five stored answers from 0/23/36/71/100% to **25/83/87/90/100%**
+(mean 46% → 77%) — and 77% matches what independent adjudicators found by hand. **Do not
+simplify `uncited_claims` back to a list of strings.**
+
+The corrected numbers also relocated the defect. It was never "the agent doesn't cite":
+every *delegated* answer scored 83-100%, because `RESEARCHER_PROMPT` mandates inline
+citations and anything a subagent touches comes back sourced. It was the orchestrator's own
+`tavily_search` path — the one answer it researched itself scored **25%**. `SYSTEM_PROMPT`
+step 4 now says citation applies to what you gathered yourself, not only to what a subagent
+handed you. Measured A/B on the same dataset with the same judge: **77% → 98% mean
+coverage**, and that direct-search answer went 25% → 100%.
+
+**`answers_the_question` needed the identical treatment, so treat this as the pattern, not
+an anecdote.** As a bare bool it failed an answer carrying complete per-tier RPM/ITPM/OTPM
+tables, because that answer *opened* with a caveat that exact figures move and the reader's
+console is authoritative — the judge read the hedge and stopped. Given the same
+evidence-forced, proportional schema (`_UnansweredPart`: quote the passage that comes
+nearest, say why it falls short) it scores the same text 2/2. **An LLM judge's false
+positives are an output-schema problem, not a prompt-wording one.** Both judges had already
+been *told* the right rule in prose and ignored it; making the evidence a required field is
+what fixed them. Three separate judge miscalibrations in this file's history mistook a judge
+defect for an agent defect — check the instrument before you tune the agent.
 
 This is the `create_deep_agent()` lesson again, and it is the second time it has bitten in
 this repo: **the harness injects prompts and middleware you never wrote.** "The repo
