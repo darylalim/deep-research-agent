@@ -12,9 +12,12 @@ rather than hardcoding approve/edit/reject.
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from langgraph.types import Command
@@ -30,16 +33,20 @@ BANNER = f"""\
 │  searches to a subagent, synthesizes a cited answer, and      │
 │  remembers durable findings across sessions.                  │
 │                                                               │
-│  Commands:  /help   /thread <id>   /exit                      │
+│  Commands:  /help  /thread <id>  /export [path]  /exit        │
 ╰──────────────────────────────────────────────────────────────╯"""
 
 HELP = f"""\
 Commands:
-  /help          show this help
-  /thread <id>   switch to a different conversation thread (default: "main")
-  /exit, /quit   leave
+  /help            show this help
+  /thread <id>     switch to a different conversation thread (default: "main")
+  /export [path]   write this thread — every question and its cited answer — to
+                   a markdown file (default: ./research-<thread>-<utc>.md)
+  /exit, /quit     leave
 
 Notes:
+  • The agent's work is shown live as it happens: its plan, each sub-question it
+    delegates, and every search it runs.
   • Conversation, todos, and pending approvals persist across restarts
     (checkpointed to .deep_research/checkpoints.sqlite).
   • Durable findings the agent saves under /memories/ persist across every
@@ -107,6 +114,53 @@ def render_turn(result: dict[str, Any]) -> str:
     # function and hands it to the judges: they would grade the question, or a JSON blob,
     # as the agent's answer.
     return "\n\n".join(texts)
+
+
+def render_thread(state: dict[str, Any]) -> str:
+    """The whole conversation as markdown — every question with its cited answer.
+
+    `render_turn` with the slice removed. `AgentState.messages` uses `add_messages`, so
+    the checkpointed list *is* the whole thread; nothing needs to walk
+    `get_state_history`.
+
+    Same discipline as `render_turn`, and for the same measured reason: assistant prose
+    only. Not the last message (a sign-off — "findings saved, see the summary above" —
+    with none of the 33 source URLs the turn actually produced, which is the exact
+    regression this repo has already paid for once), and not tool payloads. Every claim
+    the user might rely on a week later lives in the prose, because `SYSTEM_PROMPT` step
+    4 requires the citations inline there.
+
+    Include the question. A cited report with no question is unusable later, and the
+    question is right there.
+
+    One dependency worth naming, because it is invisible from this repo's source: this is
+    complete only because deepagents' summarization middleware — which
+    `create_deep_agent()` appends without being asked — is deliberately *non-mutating*.
+    It records eviction in a private field and leaves `state["messages"]` intact,
+    explicitly so that replay and evals still work. LangChain's own
+    `SummarizationMiddleware` instead rewrites the list with
+    `RemoveMessage(id=REMOVE_ALL_MESSAGES)`. Wire that one via `middleware=[...]` and
+    every long thread's export silently truncates, with no error and no failing test.
+    """
+    sections: list[tuple[str, list[str]]] = []
+    for message in state.get("messages", []):
+        kind = getattr(message, "type", None)
+        if kind not in ("human", "ai"):
+            continue
+        if not (text := _text_of(message).strip()):
+            continue  # e.g. an assistant message that only carried a tool call
+        # Consecutive messages from the same speaker are ONE section. The agent's turn is
+        # routinely two messages — the cited report (sent alongside the `write_file` call)
+        # and then a sign-off once the tool returns — and splitting them into two `##
+        # agent` headings would make one answer look like two.
+        if sections and sections[-1][0] == kind:
+            sections[-1][1].append(text)
+        else:
+            sections.append((kind, [text]))
+    return "\n\n".join(
+        f"## {'you' if kind == 'human' else 'agent'}\n\n" + "\n\n".join(texts)
+        for kind, texts in sections
+    )
 
 
 def _short(value: Any, limit: int = 300) -> str:
@@ -339,6 +393,20 @@ def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]
         interrupt_id = getattr(interrupt, "id", None)
         if not isinstance(value, dict) or interrupt_id is None:
             continue
+        if interrupt_id in by_interrupt:
+            # THE SAME INTERRUPT, TWICE. With `subgraphs=True` an interrupt raised inside
+            # a subagent is emitted at the subagent's namespace AND again, bubbled, at
+            # the root — same `Interrupt.id`, two chunks. Prompting per occurrence would
+            # ask the human to approve one researcher's `write_file` twice, and (since
+            # this dict is keyed by id) silently keep only the second answer. Approval
+            # fatigue is exactly how a gate stops being a gate.
+            #
+            # Deduped HERE, in the function that does the prompting, rather than in the
+            # caller — the invariant is "one prompt per pending action", and it should
+            # hold however this is called. `evals/harness._approve_all` is immune to the
+            # same duplication only by accident: it writes into a dict keyed by id
+            # without asking anyone anything, so a duplicate is idempotent.
+            continue
         allowed_by_tool = {
             config["action_name"]: config["allowed_decisions"]
             for config in value.get("review_configs", [])
@@ -351,6 +419,214 @@ def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]
         if decisions:
             by_interrupt[interrupt_id] = decisions
     return by_interrupt
+
+
+class ActivityFeed:
+    """Prints what the agent is doing, as it does it.
+
+    The turn used to be a black box: one `… working …` line, then minutes of nothing,
+    then a wall of text. This renders the tool activity arriving on
+    `agent.stream(..., stream_mode="updates", subgraphs=True)`.
+
+    Three things it must get right, each of which is a bug waiting to happen:
+
+    **It prints actions, never prose.** The stream carries the *researchers'* assistant
+    messages too, and the user must never see one — they are a subagent's internal
+    working, and `evals/harness.py` refuses to build its graded `response` from the
+    stream for exactly this reason. The answer comes from `render_turn` on the final
+    checkpoint, so the terminal, the exported file, and the eval's `response` stay the
+    same bytes. Same rule as `harness.TurnRecorder`: actions only.
+
+    **It prints each event once, keyed on the TOOL CALL id.** On resume,
+    `HumanInTheLoopMiddleware.after_model` re-emits the AIMessage that proposed the gated
+    call, and the re-streamed superstep re-emits the *cached writes* of tasks that
+    already finished — so without deduping, every approval replays lines the user just
+    watched scroll past. The key is the call id (`tool_call["id"]`, and `tool_call_id` on
+    the result) rather than the *message* id, because a tool call executes exactly once,
+    while `BaseMessage.id` is optional — a re-emitted `ToolMessage` need not carry one,
+    and keying on it silently lets the duplicate through. (Observed: the completion line
+    for a finished researcher printed twice, once per approval round.)
+
+    **It does not pretend to know which researcher is which.** A subagent's namespace is
+    `('tools:<pregel-task-uuid>',)`, and that uuid is not the `task` tool-call id — so
+    binding a search back to the sub-question that spawned it would mean assuming
+    dispatch order matches first-emission order under concurrency. It doesn't have to:
+    the *dispatch* and *completion* lines carry the real description (recovered by
+    `tool_call_id`), and each search line carries its actual query. That is the
+    information worth having, and all of it is true.
+    """
+
+    def __init__(self) -> None:
+        self._printed: set[str] = set()  # event keys already on screen
+        self._task_descriptions: dict[str, str] = {}  # task tool_call id -> description
+        self._ls_paths: dict[str, str] = {}  # ls tool_call id -> the path it listed
+
+    def absorb(self, namespace: tuple[str, ...], chunk: Any) -> list[Any]:
+        """Fold in one `(namespace, update)` chunk; return any interrupts it carried.
+
+        Deliberately the same shape as `harness.TurnRecorder.absorb` — that one has been
+        run against the live agent, and divergence between the two is how the REPL and
+        the eval start disagreeing about what happened.
+        """
+        if not isinstance(chunk, dict):
+            return []
+
+        interrupts: list[Any] = []
+        is_orchestrator = not namespace
+        for node, update in chunk.items():
+            if node == "__interrupt__":
+                interrupts.extend(update)
+                continue
+            if not isinstance(update, dict):
+                continue
+            if (todos := update.get("todos")) and is_orchestrator:
+                # ORCHESTRATOR ONLY. deepagents gives every declarative subagent its own
+                # `TodoListMiddleware`, so a `researcher` really can call `write_todos` —
+                # and its list streams out under `('tools:<uuid>',)`. Rendering that would
+                # print a researcher's private checklist as the agent's plan, appearing to
+                # supersede the plan the user was just shown. This is the same
+                # orchestrator/subagent conflation `evals/harness.py` keeps apart with
+                # `orchestrator_trajectory` vs `trajectory`; the display layer has to make
+                # the same distinction, for the same reason.
+                self._render_plan(todos)
+            for message in update.get("messages", []) or []:
+                self._render_message(namespace, message)
+        return interrupts
+
+    def _once(self, key: str) -> bool:
+        """True the first time this event is seen, False every time after."""
+        if key in self._printed:
+            return False
+        self._printed.add(key)
+        return True
+
+    def _render_plan(self, todos: list[Any]) -> None:
+        # `write_todos` returns a Command that updates the `todos` channel, so the whole
+        # list arrives in the chunk — no need to parse the tool call.
+        items = [t.get("content", "?") for t in todos if isinstance(t, dict)]
+        # Keyed on the contents: a replayed superstep re-emits the identical plan (noise),
+        # but a plan the agent genuinely revised is a different list, and worth showing.
+        if not items or not self._once(f"plan:{items}"):
+            return
+        print(f"\n  ✎ plan · {len(items)} item{'s' if len(items) != 1 else ''}")
+        for index, item in enumerate(items, 1):
+            print(f"      {index}. {item}")
+
+    def _render_message(self, namespace: tuple[str, ...], message: Any) -> None:
+        is_orchestrator = not namespace
+        kind = getattr(message, "type", None)
+
+        if kind == "ai":
+            for call in getattr(message, "tool_calls", None) or []:
+                self._render_call(call, is_orchestrator)
+        elif kind == "tool":
+            self._render_result(message, is_orchestrator)
+
+    def _render_call(self, call: dict[str, Any], is_orchestrator: bool) -> None:
+        name = call.get("name")
+        args = call.get("args") or {}
+        if not self._once(f"call:{call.get('id')}"):
+            return
+
+        if name == "task":
+            # `TaskToolSchema` guarantees `description` — it is the self-contained prompt
+            # the orchestrator wrote, and it becomes the researcher's only message.
+            description = args.get("description", "?")
+            self._task_descriptions[call.get("id", "")] = description
+            print(f"  → researcher · {_one_line(description, 90)}")
+        elif name == "tavily_search":
+            # Announced at CALL time, not on the result: the query is the informative
+            # part and this keeps the feed live. It also means never touching the
+            # ToolMessage body, which for a search is multiple KB of serialized results.
+            indent = "  " if is_orchestrator else "      "
+            print(f'{indent}⌕ "{_one_line(args.get("query", "?"), 80)}"')
+        elif name == "read_file" and is_orchestrator:
+            print(f"  ▸ reading {args.get('file_path', '?')}")
+        elif name == "ls" and is_orchestrator:
+            # Remember what it listed, so the result line can name it. `ls` takes an
+            # arbitrary `path`; hardcoding "/memories/" would be a guess, and it is the
+            # ONE line of the feed the user reads to check the agent obeyed SYSTEM_PROMPT
+            # step 2 — a line that lies about that is worse than no line.
+            self._ls_paths[call.get("id", "")] = args.get("path", "?")
+
+    def _render_result(self, message: Any, is_orchestrator: bool) -> None:
+        name = getattr(message, "name", None)
+        call_id = getattr(message, "tool_call_id", "")
+        if not self._once(f"result:{call_id}"):
+            return
+
+        # A failed tool is the one result worth surfacing — Tavily raises rather than
+        # returning an empty list, so a fruitless search arrives as an error, and a
+        # silent feed would make it look like the search simply never happened.
+        if getattr(message, "status", None) == "error":
+            print(f"  ! {name} failed: {_one_line(_text_of(message), 100)}")
+            return
+
+        if name == "ls" and is_orchestrator:
+            # ORCHESTRATOR ONLY — a `researcher` has its own `FilesystemMiddleware` and
+            # can call `ls` on its own state-backed filesystem. Rendering that would tell
+            # the user durable memory was consulted on a turn where the orchestrator never
+            # looked, hiding the exact "the direct path skips /memories/" defect CLAUDE.md
+            # says to keep watching.
+            #
+            # And the body is NOT newline-separated entries: deepagents builds it as
+            # `str(paths)` — a Python list repr, `"[]"` or `"['/memories/a.md']"`. Counting
+            # lines therefore reported "1 file(s)" for an EMPTY store, every time, and the
+            # "empty" branch was unreachable. Parse the repr, and if it is not one, say so
+            # rather than inventing a number.
+            path = self._ls_paths.get(call_id, "/memories/")
+            try:
+                entries = ast.literal_eval(_text_of(message).strip())
+            except (ValueError, SyntaxError):
+                entries = None
+            if isinstance(entries, list):
+                count = f"{len(entries)} file(s)" if entries else "empty"
+            else:
+                count = "?"
+            print(f"  ⌕ {path} · {count}")
+        elif name == "task":
+            # The one honest way to name a researcher: recover the sub-question from the
+            # `task` call this result answers. Its stream namespace cannot be bound back
+            # to that call without assuming dispatch order matches emission order under
+            # concurrency, so we don't pretend to.
+            description = self._task_descriptions.get(call_id)
+            print(
+                f"  ✓ researcher · {_one_line(description, 90)}"
+                if description
+                else "  ✓ researcher"
+            )
+
+
+def _one_line(text: Any, limit: int) -> str:
+    """Collapse a value to a single, bounded line — feed lines must not wrap or wrap
+    the terminal in a researcher's whole prompt."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _stream_turn(
+    agent: Any, payload: Any, config: dict[str, Any], feed: ActivityFeed
+) -> list[Any]:
+    """Run one stream to exhaustion, printing the feed; return the pending interrupts.
+
+    **Drain, THEN prompt.** Not a style choice — an interrupt chunk does not end the
+    stream. LangGraph does not treat a `GraphInterrupt` as a failure, so sibling tasks in
+    the same superstep keep running and a *second* researcher's interrupt arrives after
+    the first. Worse, the graph executes inside this generator: blocking on `input()`
+    mid-iteration freezes the Pregel loop, and starting the resume stream would tear the
+    old generator down — cancelling a still-running researcher whose interrupt was never
+    emitted, and throwing away searches you already paid for.
+
+    So the loop is: exhaust the stream, collect everything pending, decide on the whole
+    set, restream with `Command(resume=...)`. That is the shape `evals/harness.py` has
+    been running against the live agent all along.
+    """
+    pending: list[Any] = []
+    for namespace, chunk in agent.stream(
+        payload, config=config, stream_mode="updates", subgraphs=True
+    ):
+        pending.extend(feed.absorb(namespace, chunk))
+    return pending
 
 
 def _print_unfinished_turn(agent: Any, config: dict[str, Any]) -> None:
@@ -378,6 +654,63 @@ def _print_unfinished_turn(agent: Any, config: dict[str, Any]) -> None:
         return
     if text:
         print(f"\nagent (unfinished turn) > {text}")
+
+
+def _export(agent: Any, config: dict[str, Any], thread_id: str, target: str) -> None:
+    """Write the thread to a markdown file the user can actually keep.
+
+    Plain `Path.write_text`, deliberately — NOT the agent's own `write_file` tool. That
+    route is not merely heavier, it is incoherent: `HumanInTheLoopMiddleware` interrupts
+    on the tool calls of the *model's* last message, so there is no way to invoke a gated
+    tool without a model turn. Exporting through the agent would mean an Opus call, and
+    an approval prompt asking the human to approve the thing the human just typed — with
+    the model free to rename, reword, or decline it. And a `/memories/` path is not a
+    file at all: it is a row in `memories.sqlite`, which is precisely why `SYSTEM_PROMPT`
+    step 5 says "/memories/ or nothing" and stopped asking the agent to write reports.
+    `/export` gives the user the artifact that prompt deliberately stopped producing, at
+    zero tokens and zero approvals — so `SYSTEM_PROMPT` needs no changes and must not be
+    told about it.
+
+    Sourced from the checkpoint, never from the stream, even though the streaming loop
+    has the chunks in hand. The stream carries the researchers' own prose, which the user
+    never saw and whose citations the eval deliberately refuses to credit; taking the
+    convenient path would put subagent-internal text into the user's file and drift the
+    export away from both the terminal output and the eval's graded `response`.
+    """
+    text = render_thread(agent.get_state(config).values)
+    if not text:
+        print("! nothing to export — this thread has no answers yet.")
+        return
+
+    named = bool(target)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    # `expanduser`, because `/export ~/report.md` is the obvious thing to type and no
+    # shell expanded it for us — the path arrived as the literal string `~/report.md`.
+    # Without this it fails with a bare ENOENT (or, if a stray `~` directory exists in
+    # cwd, silently succeeds into `./~/report.md`), losing a report that took minutes.
+    path = (
+        Path(target).expanduser() if named else Path(f"research-{thread_id}-{stamp}.md")
+    )
+    if path.exists() and not named:
+        print(f"! {path} already exists — pass an explicit path to overwrite.")
+        return
+
+    header = (
+        f"# Deep research — thread `{thread_id}`\n\n"
+        f"*Model: `{MODEL_NAME}`. Exported {stamp}.*\n"
+        # "Exported", not "answered": the messages carry no timestamps, and the only
+        # per-turn clock lives in the checkpointer's snapshots. A date we did not
+        # measure is a date we invented.
+    )
+    try:
+        # Explicit encoding, always: the default is locale-dependent, and a real report
+        # is full of em-dashes. Failing on the one machine the user cannot debug is not
+        # a hypothetical. Caught here, not by main's turn-scoped `except`.
+        path.write_text(f"{header}\n{text}\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"! export failed: {exc}")
+        return
+    print(f"(exported to {path.resolve()})")
 
 
 def main() -> None:
@@ -416,32 +749,39 @@ def main() -> None:
                 else:
                     print(f"(current thread: '{thread_id}')")
                 continue
+            if user_input.startswith("/export"):
+                parts = user_input.split(maxsplit=1)
+                _export(
+                    agent,
+                    {"configurable": {"thread_id": thread_id}},
+                    thread_id,
+                    parts[1].strip() if len(parts) == 2 else "",
+                )
+                continue
 
             config = {"configurable": {"thread_id": thread_id}}
-            print("… working (planning, searching, synthesizing)…")
+            feed = ActivityFeed()
+            payload: Any = {"messages": [{"role": "user", "content": user_input}]}
             try:
-                result = agent.invoke(
-                    {"messages": [{"role": "user", "content": user_input}]},
-                    config=config,
-                )
-                # Resuming may hit the next gated tool, so loop until no interrupt.
-                while result.get("__interrupt__"):
-                    by_interrupt = _collect_decisions(result["__interrupt__"])
+                # Drain the stream, decide on everything it paused for, restream. There
+                # is no `__interrupt__` key to loop on any more: under `stream_mode=
+                # "updates"` interrupts only ever arrive as chunks, and `invoke()`'s
+                # `result["__interrupt__"]` was itself just a post-drain aggregate that
+                # LangGraph assembled internally. Same loop as `evals/harness.py`.
+                while pending := _stream_turn(agent, payload, config, feed):
+                    by_interrupt = _collect_decisions(pending)
                     if not by_interrupt:
                         # Nothing reviewable — resuming would just re-interrupt.
                         print("\n! paused with no reviewable action; abandoning turn.")
                         break
-                    # Keyed by interrupt id: a turn can hold several interrupts at
-                    # once (concurrent subagents), and LangGraph rejects a resume
-                    # that doesn't say which interrupt each value belongs to.
-                    result = agent.invoke(
-                        Command(
-                            resume={
-                                interrupt_id: {"decisions": decisions}
-                                for interrupt_id, decisions in by_interrupt.items()
-                            }
-                        ),
-                        config=config,
+                    # Keyed by interrupt id: a turn can hold several interrupts at once
+                    # (concurrent researchers), and LangGraph rejects a resume that
+                    # doesn't say which interrupt each value belongs to.
+                    payload = Command(
+                        resume={
+                            interrupt_id: {"decisions": decisions}
+                            for interrupt_id, decisions in by_interrupt.items()
+                        }
                     )
             except KeyboardInterrupt:
                 # Ctrl-C is a BaseException (not Exception), so it must be caught
@@ -455,10 +795,13 @@ def main() -> None:
                 _print_unfinished_turn(agent, config)
                 continue
 
-            # `render_turn` is prose-or-nothing now, so an empty string is possible —
-            # a turn abandoned at the "nothing reviewable" break above, say. Say so
-            # rather than printing a bare `agent > ` and looking broken.
-            answer = render_turn(result)
+            # From the checkpoint, NOT from the stream — even though the stream just went
+            # past us and it would be easy. The stream carries the researchers' own
+            # assistant messages, and the user must never be shown one; `evals/harness.py`
+            # renders its graded `response` with this same call for exactly that reason,
+            # so building the printed answer any other way makes the citation metrics
+            # fiction. The feed shows *actions*; the answer comes from state.
+            answer = render_turn(agent.get_state(config).values)
             print(f"\nagent > {answer}" if answer else "\n(the agent said nothing)")
 
 

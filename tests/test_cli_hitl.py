@@ -15,18 +15,25 @@ from typing import Any
 
 import pytest
 from langchain.agents.middleware.human_in_the_loop import HumanInTheLoopMiddleware
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from deep_research import cli as cli_module
 from deep_research.cli import (
     DEFAULT_ALLOWED_DECISIONS,
     PREVIEW_LINES,
+    ActivityFeed,
     _collect_decisions,
     _prompt_decision,
     _render_action,
     main,
 )
+
+
+def _updates(node: str, *messages: object) -> dict:
+    """One `stream(stream_mode="updates")` chunk, as `evals/test_evals.py` builds them."""
+    return {node: {"messages": list(messages)}}
+
 
 REQUEST = {"name": "write_file", "args": {"file_path": "/memories/x.md"}}
 
@@ -491,18 +498,37 @@ PENDING_WRITE = Interrupt(
     },
 )
 
+# What a subagent's stream namespace actually looks like (measured): the pregel task id
+# is retained, so two concurrent researchers are distinguishable.
+SUBAGENT_NS: tuple[str, ...] = ("tools:9d0c2f4e",)
+
 
 class _FakeAgent:
-    """Just enough agent for `main()`: an `invoke` and a checkpointed `get_state`.
+    """Just enough agent for `main()`: a `stream` and a checkpointed `get_state`.
 
-    `get_state` returning the prose is not a convenience — it is the fact the fix
-    depends on. The report is already durably checkpointed by the time the human is
-    asked to approve the write, which is precisely why abandoning the turn need not
-    lose it.
+    Faithful to the two things production actually does, because a fake that is merely
+    *convenient* would let `main()` pass a test it would fail for real:
+
+    - `stream(..., stream_mode="updates", subgraphs=True)` yields `(namespace, chunk)`
+      pairs, and an interrupt arrives as a `{"__interrupt__": (...)}` CHUNK — there is no
+      `__interrupt__` key on any result, which is what the old `invoke()` shape had.
+    - a subagent's interrupt is emitted TWICE with the same `Interrupt.id` (once at the
+      subagent namespace, once bubbled to the root), so the fake emits it twice. If
+      `_collect_decisions` ever stops deduping, `test_one_prompt_per_pending_action`
+      goes red instead of a real human being asked to approve the same write twice.
+
+    `get_state` returning the prose is not a convenience either — it is the fact the
+    salvage depends on. The report is already durably checkpointed by the time the human
+    is asked to approve the write, because the `model` node writes it one superstep
+    before the `HumanInTheLoopMiddleware.after_model` node interrupts.
     """
 
     def __init__(
-        self, *, raises: Exception | None = None, messages: list[Any] | None = None
+        self,
+        *,
+        raises: Exception | None = None,
+        messages: list[Any] | None = None,
+        chunks: list[tuple[tuple[str, ...], dict[str, Any]]] | None = None,
     ):
         self._raises = raises
         self.messages = (
@@ -510,13 +536,33 @@ class _FakeAgent:
             if messages is None
             else messages
         )
+        # Default: one gated write, emitted from a subagent — hence duplicated.
+        self._chunks = (
+            [
+                (SUBAGENT_NS, {"__interrupt__": (PENDING_WRITE,)}),
+                ((), {"__interrupt__": (PENDING_WRITE,)}),
+            ]
+            if chunks is None
+            else chunks
+        )
         self.invocations: list[Any] = []
 
-    def invoke(self, payload: Any, config: Any = None) -> dict[str, Any]:
+    def stream(
+        self,
+        payload: Any,
+        config: Any = None,
+        stream_mode: str | None = None,
+        subgraphs: bool = False,
+    ) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
+        # Assert the contract the whole design rests on, at the point of use: node-level
+        # updates (not "messages", which would leak researcher prose) and subgraphs=True
+        # (without which the searches are invisible — the entire reason to stream).
+        assert stream_mode == "updates"
+        assert subgraphs is True
         self.invocations.append(payload)
         if self._raises is not None:
             raise self._raises
-        return {"messages": self.messages, "__interrupt__": [PENDING_WRITE]}
+        yield from self._chunks
 
     def get_state(self, config: Any) -> SimpleNamespace:
         return SimpleNamespace(values={"messages": self.messages})
@@ -621,3 +667,304 @@ class TestMainSalvagesAnAbandonedTurn:
         second = agent.invocations[1]
         assert not isinstance(second, Command)
         assert second["messages"][0]["content"] == "and haiku?"
+
+
+class TestDuplicateInterrupts:
+    """One prompt per pending action, however many times the interrupt is emitted.
+
+    With `subgraphs=True` an interrupt raised inside a subagent is emitted TWICE — once
+    at the subagent's namespace, once bubbled to the root — carrying the SAME
+    `Interrupt.id`. Without deduping, the human is asked to approve one researcher's
+    `write_file` twice, and only the second answer survives (the resume mapping is keyed
+    by id). Approval fatigue is how a gate stops being a gate.
+
+    The old blocking `invoke()` never saw this — it streams with `subgraphs=False`, so
+    the child emitted nothing — which is why this could only appear alongside the feed.
+    """
+
+    def test_the_same_interrupt_twice_prompts_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prompts = _feed(monkeypatch, "a")  # exactly ONE decision is scripted
+        # Two chunks, one real approval. A second `input()` call raises StopIteration.
+        decisions = _collect_decisions([PENDING_WRITE, PENDING_WRITE])
+
+        assert decisions == {"i1": [{"type": "approve"}]}
+        assert sum("[a]pprove" in p for p in prompts) == 1
+
+    def test_distinct_interrupts_still_each_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The dedupe must key on the id, not collapse everything: two researchers each
+        # proposing their own write are two real decisions.
+        other = Interrupt(
+            id="i2", value={"action_requests": [{"name": "write_file", "args": {}}]}
+        )
+        _feed(monkeypatch, "a", "a")
+        assert _collect_decisions([PENDING_WRITE, other]) == {
+            "i1": [{"type": "approve"}],
+            "i2": [{"type": "approve"}],
+        }
+
+    def test_main_asks_once_for_a_subagents_write(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # End to end through the real turn loop: the fake agent emits the duplicate the
+        # way LangGraph does, and the human is asked exactly once.
+        agent = _FakeAgent()
+        _drive(monkeypatch, agent, "what does opus cost?", KeyboardInterrupt(), "/exit")
+        assert capsys.readouterr().out.count("Approval required — write_file") == 1
+
+
+class TestActivityFeed:
+    """The feed shows ACTIONS. Never prose — a researcher's words are not the agent's."""
+
+    def test_it_shows_the_plan_the_delegations_and_the_queries(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        feed = ActivityFeed()
+        feed.absorb(
+            (),
+            {
+                "tools": {
+                    "todos": [
+                        {"content": "pricing for Opus 4.8", "status": "pending"},
+                        {"content": "rate limits by tier", "status": "pending"},
+                    ]
+                }
+            },
+        )
+        feed.absorb(
+            (),
+            _updates(
+                "model",
+                AIMessage(
+                    content="",
+                    id="ai-1",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": "pricing for Opus 4.8",
+                                "subagent_type": "researcher",
+                            },
+                            "id": "t1",
+                        }
+                    ],
+                ),
+            ),
+        )
+        feed.absorb(
+            SUBAGENT_NS,
+            _updates(
+                "model",
+                AIMessage(
+                    content="",
+                    id="ai-2",
+                    tool_calls=[
+                        {
+                            "name": "tavily_search",
+                            "args": {"query": "anthropic opus 4.8 price"},
+                            "id": "s1",
+                        }
+                    ],
+                ),
+            ),
+        )
+        feed.absorb(
+            (),
+            _updates(
+                "tools",
+                ToolMessage("cited summary", tool_call_id="t1", name="task"),
+            ),
+        )
+        out = capsys.readouterr().out
+
+        assert "✎ plan · 2 items" in out
+        assert "1. pricing for Opus 4.8" in out
+        assert "→ researcher · pricing for Opus 4.8" in out
+        assert '⌕ "anthropic opus 4.8 price"' in out
+        # The completion line recovers the description via `tool_call_id` — the one
+        # honest way to name a researcher, since its stream namespace cannot be bound
+        # back to the task call that spawned it.
+        assert "✓ researcher · pricing for Opus 4.8" in out
+
+    def test_it_never_prints_a_researchers_prose(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # THE rule. The stream carries the researchers' own assistant messages, which
+        # the user must never see — `evals/harness.py` refuses to build its graded
+        # `response` from the stream for exactly this reason. Printing them here would
+        # show a subagent's cited paragraphs as if they were the agent's answer, and
+        # would show the SAME report twice (once from the stream, once from the final
+        # `render_turn`).
+        feed = ActivityFeed()
+        feed.absorb(
+            SUBAGENT_NS,
+            _updates(
+                "model", AIMessage(content="Opus is $15/Mtok ([x](u))", id="ai-9")
+            ),
+        )
+        feed.absorb(
+            SUBAGENT_NS,
+            _updates(
+                "tools",
+                ToolMessage(
+                    '{"results": [{"url": "https://x.test"}]}',
+                    tool_call_id="s1",
+                    name="tavily_search",
+                ),
+            ),
+        )
+        out = capsys.readouterr().out
+
+        assert "Opus is $15/Mtok" not in out  # the researcher's prose
+        assert "https://x.test" not in out  # the raw search payload
+
+    def test_a_reemitted_call_is_not_announced_twice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # On resume, HumanInTheLoopMiddleware re-emits the AIMessage that proposed the
+        # gated call. Without dedupe the user watches lines they have already seen scroll
+        # past again, once per approval round.
+        call = AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {
+                    "name": "task",
+                    "args": {"description": "d", "subagent_type": "researcher"},
+                    "id": "t1",
+                }
+            ],
+        )
+        feed = ActivityFeed()
+        feed.absorb((), _updates("model", call))
+        feed.absorb((), _updates("HumanInTheLoopMiddleware.after_model", call))
+
+        assert capsys.readouterr().out.count("→ researcher") == 1
+
+    def test_a_replayed_tool_result_without_a_message_id_is_not_shown_twice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # THE reason the seen-set is keyed on the CALL id and not the message id. A
+        # re-streamed superstep re-emits the cached writes of tasks that already
+        # finished, and `BaseMessage.id` is optional — a ToolMessage carrying no id
+        # defeats message-id dedupe entirely. Caught by driving the real loop: the
+        # completion line for a finished researcher printed a second time, after the
+        # approval. A tool call executes exactly once, so its id is the honest key.
+        feed = ActivityFeed()
+        announce = _updates(
+            "model",
+            AIMessage(
+                content="",
+                id="ai-1",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "pricing",
+                            "subagent_type": "researcher",
+                        },
+                        "id": "t1",
+                    }
+                ],
+            ),
+        )
+        feed.absorb((), announce)
+        # Two DISTINCT ToolMessage objects, neither carrying an `id` — exactly what a
+        # replayed superstep hands you.
+        for _ in range(2):
+            feed.absorb(
+                (),
+                _updates(
+                    "tools", ToolMessage("summary", tool_call_id="t1", name="task")
+                ),
+            )
+
+        assert capsys.readouterr().out.count("✓ researcher") == 1
+
+    def test_the_ls_line_reads_the_list_repr_not_the_line_count(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # deepagents builds the `ls` body as `str(paths)` — a Python list repr on ONE
+        # line, `"[]"` or `"['/memories/a.md', '/b.md']"` — not newline-separated entries.
+        # Counting lines reported "1 file(s)" for an EMPTY store every single time, and
+        # made the "empty" branch unreachable. This line is how the user sees whether
+        # durable memory was consulted; one that lies is worse than no line at all.
+        cases = (("[]", "empty"), ("['/memories/a.md', '/b.md']", "2 file(s)"))
+        for body, expected in cases:
+            feed = ActivityFeed()
+            feed.absorb(
+                (),
+                _updates(
+                    "model",
+                    AIMessage(
+                        content="",
+                        id="ai-1",
+                        tool_calls=[
+                            {"name": "ls", "args": {"path": "/memories/"}, "id": "l1"}
+                        ],
+                    ),
+                ),
+            )
+            feed.absorb(
+                (), _updates("tools", ToolMessage(body, tool_call_id="l1", name="ls"))
+            )
+            assert f"⌕ /memories/ · {expected}" in capsys.readouterr().out
+
+    def test_a_researchers_own_todos_and_ls_are_not_shown_as_the_agents(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # deepagents gives EVERY declarative subagent its own TodoListMiddleware and
+        # FilesystemMiddleware, so a `researcher` really can call `write_todos` and `ls`
+        # regardless of what `subagents.py` lists in its `tools`. Rendering those
+        # namespace-blind would:
+        #   - print a researcher's private checklist as a second `✎ plan`, appearing to
+        #     supersede the plan the user was just shown;
+        #   - print `⌕ /memories/` on a turn where the ORCHESTRATOR never looked, hiding
+        #     the very "the direct path skips /memories/" defect CLAUDE.md says to watch.
+        # The same orchestrator/subagent conflation `evals/harness.py` keeps apart with
+        # `orchestrator_trajectory` vs `trajectory`. It has to hold in the display too.
+        feed = ActivityFeed()
+        feed.absorb(
+            SUBAGENT_NS,
+            {"tools": {"todos": [{"content": "my private step", "status": "pending"}]}},
+        )
+        feed.absorb(
+            SUBAGENT_NS,
+            _updates(
+                "tools", ToolMessage("['/scratch/a.md']", tool_call_id="l9", name="ls")
+            ),
+        )
+        out = capsys.readouterr().out
+
+        assert "✎ plan" not in out
+        assert "my private step" not in out
+        assert "⌕ /memories/" not in out
+
+    def test_a_failed_tool_is_surfaced(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Tavily raises rather than returning an empty list, so a fruitless search
+        # arrives as an error. A silent feed would make it look like it never ran.
+        feed = ActivityFeed()
+        feed.absorb(
+            SUBAGENT_NS,
+            _updates(
+                "tools",
+                ToolMessage(
+                    "no results for that query",
+                    tool_call_id="s1",
+                    name="tavily_search",
+                    status="error",
+                ),
+            ),
+        )
+        assert "! tavily_search failed" in capsys.readouterr().out
+
+    def test_it_returns_the_interrupts_it_sees(self) -> None:
+        # The feed is also the interrupt collector, exactly like harness.TurnRecorder —
+        # one traversal, not two.
+        feed = ActivityFeed()
+        assert feed.absorb((), {"__interrupt__": (PENDING_WRITE,)}) == [PENDING_WRITE]

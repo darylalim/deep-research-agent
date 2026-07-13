@@ -166,8 +166,26 @@ all six other code metrics and both judges green.
 `agent.py` declares *which* tools interrupt. `cli.py` implements the protocol that
 drives them:
 
-- `agent.invoke(...)` returns a state containing `__interrupt__` when a gated tool
-  is proposed.
+- **The CLI streams** (`stream_mode="updates"`, `subgraphs=True`) — same call the eval
+  harness has always made — so an interrupt arrives as an `{"__interrupt__": (...)}`
+  *chunk*, not as a key on a result. (`invoke()`'s `result["__interrupt__"]` was itself
+  only a post-drain aggregate LangGraph assembled internally.)
+- **Drain the stream, THEN prompt, then restream.** Not a style choice. An interrupt chunk
+  does not end the stream: LangGraph does not treat a `GraphInterrupt` as a failure, so
+  sibling tasks in the same superstep run on and a *second* researcher's interrupt arrives
+  after the first. And the graph executes *inside* the generator — blocking on `input()`
+  mid-iteration freezes the Pregel loop, and starting the resume stream tears the old
+  generator down, cancelling a still-running researcher whose interrupt was never emitted
+  and throwing away searches you already paid for. `_stream_turn` drains; `main` decides on
+  the whole set; the loop restreams with `Command(resume=...)`.
+- **The same interrupt is emitted TWICE, and `_collect_decisions` must dedupe by id.**
+  With `subgraphs=True`, an interrupt raised inside a subagent is emitted at the subagent's
+  namespace *and* again, bubbled, at the root — same `Interrupt.id`. Prompting per
+  occurrence asks the human to approve one researcher's `write_file` twice and (since the
+  resume mapping is keyed by id) silently keeps only the second answer. The old blocking
+  `invoke()` never saw this because it streams with `subgraphs=False`, so the child emitted
+  nothing — the duplication appears the moment you stream. `evals/harness._approve_all` is
+  immune only by accident: it writes into a dict keyed by id without asking anyone anything.
 - The middleware bundles all of *one agent's* pending tool calls into a single
   interrupt whose value carries **two parallel lists**: `action_requests` (what the
   agent wants to do — name/args/description, and *not* what may be decided about it)
@@ -186,7 +204,38 @@ drives them:
   resuming`. The mapping is also correct for the ordinary single-interrupt case, so
   there is one code path — keep it that way.
 - Resuming can hit the *next* gated tool, so `cli.py` **loops**
-  `while result.get("__interrupt__")` until the turn finishes.
+  `while pending := _stream_turn(...)` until the turn finishes.
+
+**The feed shows actions; the answer comes from state.** `ActivityFeed` renders the tool
+activity on the stream — the plan, each delegated sub-question, every search query — and
+prints **no prose**, because the stream carries the *researchers'* assistant messages and
+the user must never see one. The printed answer is `render_turn(agent.get_state(config).values)`,
+which is the same call `evals/harness.py` makes to build the `response` it grades. Build the
+printed answer from stream chunks instead and the citation metrics become fiction — and a
+subagent's internal prose gets shown as the agent's answer. Same rule for `/export`
+(`render_thread`), which reads the checkpoint for exactly this reason even though the
+streaming loop has the chunks in hand.
+
+**The feed's plan and `ls` lines are orchestrator-only, and that is the same rule the evals
+enforce.** Every declarative subagent gets its own `TodoListMiddleware` *and*
+`FilesystemMiddleware`, so a `researcher` really does call `write_todos` and `ls` — and
+those chunks stream out under its namespace. Render them namespace-blind and you print a
+researcher's private checklist as the agent's plan (appearing to supersede the plan the user
+was just shown), and print `⌕ /memories/` on a turn where the orchestrator never looked —
+hiding the very direct-path defect this file tells you to keep watching. It is the
+`orchestrator_trajectory` vs `trajectory` distinction, in the display layer. Also note the
+`ls` body is **not** newline-separated: deepagents builds it as `str(paths)`, a Python list
+repr (`"[]"`), so counting lines reports "1 file(s)" for an empty store, forever.
+
+A subagent's stream namespace (`('tools:<pregel-task-uuid>',)`) **cannot be bound** back to
+the `task` tool-call that spawned it — the uuid is not the tool-call id, and correlating
+them would mean assuming dispatch order matches emission order under concurrency. So the
+feed doesn't pretend to: dispatch and completion lines carry the real sub-question
+(recovered via `tool_call_id`), and each search line carries its query. The feed's seen-set
+is keyed on **call ids**, not message ids — a re-streamed superstep re-emits cached writes
+as fresh `ToolMessage` objects, and `BaseMessage.id` is optional, so message-id dedupe lets
+the duplicate through (observed: a researcher's completion line printed twice, once per
+approval round).
 
 **The menu is not hardcoded, and must not be.** The middleware raises `ValueError`
 if a decision's type is outside that tool's `allowed_decisions`, and `main`'s broad
@@ -226,10 +275,35 @@ model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
 accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
 has no `model` key — so the rule covers them too.
 
-`max_tokens` defaults to **16000** (`DEEP_RESEARCH_MAX_TOKENS`), and that is not
-arbitrary: the CLI calls `agent.invoke()` (non-streaming), and 16k keeps a response
-comfortably under the Anthropic SDK's HTTP timeout while still leaving room for a
-synthesized report. Raising it materially means switching to streaming.
+`max_tokens` defaults to **32000** (`DEEP_RESEARCH_MAX_TOKENS`), and what makes that
+safe is **`streaming=True` on the model**, not anything about the CLI. The two are
+orthogonal and it is easy to conflate them:
+
+- `streaming=True` flips the *model's own HTTP request* to SSE (`_should_stream()` →
+  `_stream()` → `generate_from_stream()`), while still handing the graph one complete
+  `AIMessage`. Nothing downstream — LangGraph, deepagents, the HITL middleware, the eval
+  harness — can tell the difference.
+- The **graph's** `stream_mode` does *not* affect the wire format. The agent's model node
+  calls `model_.invoke()` unconditionally, so `cli.py` streaming with
+  `stream_mode="updates"` buys a live activity feed and **zero** `max_tokens` headroom.
+
+This corrects a premise that was wrong here for a long time. The old note claimed 16k kept
+responses "comfortably under the Anthropic SDK's HTTP timeout". **There is no such
+timeout**: langchain passes `default_request_timeout=None` straight into
+`anthropic.Client(timeout=None)`, and the httpx client ends up with `Timeout(timeout=None)`
+— measured. That also *disarms* the SDK's own guard, which only fires when the client still
+carries the SDK default timeout. So a non-streaming request over the guard's threshold
+(`3600 * max_tokens / 128_000 > 600`, i.e. **max_tokens > 21_333**) would not raise — it
+would hang the REPL indefinitely, which is strictly worse than the failure the 16k pin was
+imagined to prevent.
+
+**Raise `max_tokens` and set `streaming=True` together, or neither.** Verified that
+streaming adds only `stream: true` to the payload, so the Opus 4.8 no-sampling-params rule
+is untouched, and prompt caching still reports `cache_read` (it moves to the
+`message_delta`). Two tests in `test_config.py` pin this: `_should_stream()` must be True,
+and the request payload must carry no sampling param. Note `streaming=False` passed
+*explicitly* would hard-disable streaming via `_streaming_disabled()`, so don't "be safe"
+by spelling out the default.
 
 ## Prompt caching is already on — don't wire it again
 
