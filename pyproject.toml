@@ -41,8 +41,11 @@ dev = [
 
 # The distribution name (deep-research-agent) differs from the import package
 # (deep_research), so point hatchling at the right directory for the wheel.
+# `evals` rides along not because it belongs in the wheel — nothing imports it at
+# runtime — but because the editable install is what puts it on `sys.path`, and
+# without that neither `python -m evals` nor `tests/test_evals.py` can import it.
 [tool.hatch.build.targets.wheel]
-packages = ["deep_research"]
+packages = ["deep_research", "evals"]
 
 [tool.ruff.lint]
 # Ruff's defaults are only E4/E7/E9 + F. Widen to catch import order (I),

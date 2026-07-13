@@ -19,6 +19,8 @@ uv sync                          # install deps + the project itself (editable) 
 uv run python -m deep_research   # run the interactive REPL (the only entry point)
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
+uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
+uv run python -m evals --run --limit 1   # score the agent (~100k tokens PER example)
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
@@ -45,7 +47,8 @@ uv run ty check                  # type check (Astral's ty)
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
   gate, the Opus 4.8 no-sampling invariant, the `/memories/` route and its store
-  namespace, and deepagents 0.7.0 backend readiness), not the agent's LLM output. Tests
+  namespace, and deepagents 0.7.0 backend readiness), not the agent's LLM output —
+  that half lives in `evals/` (see *Evaluating it*, below). Tests
   use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
   marker is registered and **deselected by default** (`addopts = -m 'not live'`);
   those need real keys. New behavior should come with a test in the matching
@@ -92,9 +95,10 @@ whose `default=StateBackend()` (ephemeral, per-thread, but checkpointed) and who
 `routes={"/memories/": StoreBackend(namespace=lambda _runtime: MEMORY_NAMESPACE)}`
 sends only that path prefix to the durable Store. **Consequence:** a file the agent
 writes to `/memories/foo.md` is readable in the next session; anything it writes
-elsewhere (e.g. `/report.md`) lives only in that thread. The system prompt in
-`agent.py` encodes this convention, so changing the route or the prompt must stay in
-sync.
+elsewhere lives only in that thread. The system prompt in `agent.py` encodes this
+convention — it now tells the agent to write to `/memories/` *or nothing*, since the
+report itself goes to the user (see *Evaluating it*) and every write costs a human
+approval — so changing the route or the prompt must stay in sync.
 
 `MEMORY_NAMESPACE = ("filesystem",)` is the Store namespace those files are filed
 under, and its **value must never change**. It is exactly what deepagents' legacy
@@ -240,6 +244,101 @@ input on a thread with a *pending HITL interrupt* resumes the model node on a me
 list ending in an assistant message, which Opus 4.8 rejects as prefill (400). `cli.py`
 never trips this because it loops on `__interrupt__` and resumes with `Command(resume=...)`
 instead of sending a new turn.
+
+## Evaluating it (`evals/`) — the half pytest deliberately skips
+
+`pytest` grades the *wiring*; `evals/` grades the *agent*. It runs the real thing
+against a LangSmith dataset and scores the trajectory (the workflow `SYSTEM_PROMPT`
+promises) and the prose (citations, responsiveness). Traces are already on — LangChain
+auto-instruments from `LANGSMITH_TRACING`/`LANGSMITH_API_KEY`, which `config.py`'s
+import-time `load_dotenv()` puts in the environment. No code wires it.
+
+Four things here were **measured**, not inferred, and each one breaks a harness that
+assumes otherwise:
+
+- **The trajectory is not in the returned state.** `invoke()` on a two-part question
+  returns messages containing `['ls', 'task', 'task', 'write_file']` and **zero**
+  `tavily_search` calls — every search happens inside a `researcher`, whose context is
+  isolated. The searches exist only in the stream (`subgraphs=True`, collect
+  `ToolMessage.name` across all namespaces; a subagent's namespace looks like
+  `('tools:<uuid>',)`) or in the trace. Measured: 7 searches, all in subagents, none
+  visible to the orchestrator. An evaluator reading `result["messages"]` is blind to
+  the agent's entire research activity.
+- **Every full run interrupts**, because `write_file` is gated and step 5 of the prompt
+  says to persist findings. An unattended `invoke()` returns `__interrupt__` and no
+  answer, scoring 0 for the wrong reason. `harness._approve_all` mirrors `cli.py`'s
+  id-keyed resume.
+- **Grade the orchestrator against `orchestrator_trajectory`, never `trajectory`.**
+  deepagents gives *every* declarative subagent its own `TodoListMiddleware` and
+  `FilesystemMiddleware` (`graph.py:643-651`), so the `researcher` really can call
+  `write_todos`, `ls` and `write_file` — whatever `subagents.py` lists in its `tools` —
+  and its tool messages stream out *before* the parent's `task` result. Flatten the two
+  and a researcher tidying up after itself scores the **orchestrator** a pass on plan /
+  check-memory / persist, including on the very `write_todos` defect this eval exists to
+  watch. It would read as "the prompt fix worked" when it had not. Only
+  `searched_the_web` counts the whole tree, deliberately.
+- **A unique `thread_id` is not isolation.** `/memories/` is routed to the Store, which
+  is shared across *every* thread — so example 2 reads what example 1 wrote and skips
+  researching. `harness._reset_state()` drops both databases between examples, which is
+  exactly why `evaluate(..., max_concurrency=1)` is mandatory: `config.py` freezes
+  `STATE_DIR` at import, so all examples share one directory and would delete each
+  other's database mid-run. Parallelism here needs a *process* per example.
+- **The evals OWN their state dir — they never inherit one.** This is a three-layer
+  invariant and each layer exists because the one above it is not enough:
+  `__main__.py` **overrides** `DEEP_RESEARCH_STATE_DIR` with a fresh temp dir rather
+  than `setdefault`-ing it (`setdefault` no-ops against the value `load_dotenv()` just
+  read from the user's `.env` — and `DEEP_RESEARCH_STATE_DIR` is the documented way to
+  *relocate the agent's real state*, so the eval would have dropped the user's live
+  memories); `_reset_state()` unlinks the two databases **by name** and never
+  `rmtree`s the directory (a blank `DEEP_RESEARCH_STATE_DIR=` resolves to the repo
+  root, and `Path("").resolve()` + `rmtree` deletes the working tree); and
+  `ensure_isolated_state_dir` refuses any path that **is or contains** the live
+  `.deep_research/`. If you touch any of these, keep the others.
+- **The judge is Haiku, not the app's Opus.** Grading is cheap classification, and Opus
+  4.8 400s on `temperature` — a judge wants `temperature=0`. Do not reuse
+  `config.build_model()` for it.
+
+The dataset (`evals/dataset.py`) is deliberately **reference-free**: examples carry a
+structural expectation (`min_delegations`) rather than a hand-written gold answer, because
+inventing facts about live services and grading against them is worse than not grading.
+Add references by curating them from real traces, per the `langsmith-dataset` skill.
+
+`evals` is listed in `[tool.hatch.build.targets.wheel]` not because it belongs in the
+wheel — nothing imports it at runtime — but because the editable install is what puts it
+on `sys.path` for `python -m evals` and `tests/test_evals.py`.
+
+### What the evals found, and what came of it
+
+**The user was being shown uncited claims — fixed.** `cli.py` printed only the *last*
+assistant message, but the agent composes its cited report in the message that also
+proposes `write_file` and then signs off after the tool returns. Measured: 33 source URLs
+in the turn, **zero** in what the user saw, and a closing line pointing at a "summary
+above" that had never been printed. `cli.render_turn()` now renders the whole turn.
+`evals/harness.py` imports that exact function — the eval must grade the bytes the REPL
+prints, or the citation metric is fiction. Two consequences: `/report.md` is gone from
+`SYSTEM_PROMPT` (it existed to hold a report the user couldn't see, and cost a second
+approval), and the prompt now tells the agent not to narrate, since its words all arrive
+at once.
+
+**`write_todos` compliance is a threshold effect, not a blanket failure.**
+`TodoListMiddleware` injects *its own* system prompt that says, four different ways, to
+skip the todo list for anything under three steps ("it is better to just do the task
+directly and NOT call this tool at all"). `SYSTEM_PROMPT` step 1 now explicitly names and
+overrides that guidance. Measured after the change: **5/5 across the dataset's five
+questions, but only 2/5 when the same *marginal* question (a two-part comparison) is run
+five times.** The agent is not ignoring step 1 — it is judging whether the question earns
+a todo list, and a simple two-parter sits right on its threshold, so it flips. Harder
+questions plan every time. Treat a `plans_with_todos` failure on an easy question as
+signal about the *question*, not proof of a regression — and never "fix" it by weakening
+the evaluator. A deterministic fix would
+mean monkeypatching `deepagents.graph.TodoListMiddleware` to replace its prompt (the class
+takes `system_prompt=`, but deepagents constructs it internally as `TodoListMiddleware()`,
+and passing your own via `middleware=[...]` registers a *second* `write_todos` tool —
+there is no dedupe). That coupling was judged not worth it; the eval watches it instead.
+
+This is the `create_deep_agent()` lesson again, and it is the second time it has bitten in
+this repo: **the harness injects prompts and middleware you never wrote.** "The repo
+doesn't configure X" is not evidence that X is unconfigured — grep the installed package.
 
 ## Extending it (where things go)
 
