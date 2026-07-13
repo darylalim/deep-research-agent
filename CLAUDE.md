@@ -436,6 +436,31 @@ leaked). Pooled, 12/15 ≈ **80%**. Both samples are individually unremarkable a
 apparent contradiction is what small n looks like. Do not tune the prompt off a handful of
 runs, and never "fix" a `plans_with_todos` failure by weakening the evaluator.
 
+**The SAME mechanism bit a second time, in `BASE_AGENT_PROMPT`, and nobody had swept for
+it.** `create_deep_agent()` **appends** `BASE_AGENT_PROMPT` *after* your system prompt
+(`graph.py`: `final_system_prompt = system_prompt + "\n\n" + base_prompt`), so it also wins
+on recency. It opens with "The user can see your responses and tool outputs **in real
+time**" and closes with a `## Progress Updates` section: "For longer tasks, provide brief
+progress updates at reasonable intervals". No harness profile suppresses it — the registered
+ones are `claude-opus-4-7` / `sonnet-4-6` / `haiku-4-5`, so `claude-opus-4-8` gets an empty
+profile.
+
+Measured on a real REPL run: the agent printed **three paragraphs of stale narration** above
+its answer ("Let me first check memory", "Memory is empty", "Both subagents returned solid,
+cited findings"), one of which restated a `⌕ /memories/ · empty` line the user had already
+watched scroll past. `SYSTEM_PROMPT`'s closing section now names and overrides it, and
+`test_system_prompt_overrides_the_injected_narration_guidance` asserts *both* halves — so it
+tells you which one broke if deepagents ever drops the section (our override becomes dead
+weight) or someone trims ours (the narration returns).
+
+**Note the trap in the reasoning, not just the bug.** When the streaming feed was being
+planned, this fix was deferred on the argument that "streaming makes the narration guidance
+*correct*, so the override shouldn't land". That was wrong: what streams is the **tool
+feed**; the prose still arrives in one block from `render_turn` at the end. The rule is the
+one this file keeps relearning — **measure it, don't reason about it**. Prompt-injection by
+the harness is now 3 for 3 at beating an explicit instruction here (prompt caching,
+`write_todos`, narration); assume there is a fourth and grep before you argue.
+
 **A tempting hypothesis that the data killed.** In the 5-run study, every run that planned
 failed to persist and vice versa — a perfect anti-correlation suggesting the prompt's five
 steps compete for one budget. At n=10 it evaporated: **9 of 10 runs did both.** Had we

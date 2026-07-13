@@ -15,12 +15,14 @@ from typing import Any
 from unittest import mock
 
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.graph import BASE_AGENT_PROMPT
 from deepagents.middleware.filesystem import supports_execution
 
 from deep_research import agent as agent_module
 from deep_research.agent import (
     GATED_TOOLS,
     MEMORY_NAMESPACE,
+    SYSTEM_PROMPT,
     build_backend,
     open_agent,
 )
@@ -59,6 +61,34 @@ def test_execute_is_latent_because_the_backend_cannot_run_it() -> None:
     # it should: at that moment `execute` becomes real, the latent gate starts firing,
     # and the prompt needs its sentence back. Read it as a tripwire, not a wish.
     assert not supports_execution(build_backend())
+
+
+def test_system_prompt_overrides_the_injected_narration_guidance() -> None:
+    # `create_deep_agent()` APPENDS `BASE_AGENT_PROMPT` after our system prompt, and it
+    # opens by telling the model "the user can see your responses and tool outputs in real
+    # time" and closes with a "## Progress Updates" section asking for "brief progress
+    # updates at reasonable intervals". Being appended, it also wins on recency.
+    #
+    # Both claims are false here. The user watches a live feed of TOOL activity; the
+    # agent's prose does not stream at all — `cli.render_turn` prints it in one block when
+    # the turn ends. Measured on a real run: three paragraphs of stale narration ("Let me
+    # first check memory", "Memory is empty", "Both subagents returned solid findings")
+    # printed *above* the answer, one of them restating a `⌕ /memories/ · empty` line the
+    # user had already watched scroll by.
+    #
+    # This is the SECOND time deepagents' injected prompt has beaten SYSTEM_PROMPT — the
+    # first was `TodoListMiddleware`'s "skip the todo list" guidance, which cost 15 runs to
+    # characterise. Both halves are asserted, so this test tells you *which* thing broke:
+    # if deepagents drops the section our override becomes dead weight, and if someone
+    # trims SYSTEM_PROMPT the narration comes straight back.
+    assert "Progress Updates" in BASE_AGENT_PROMPT, (
+        "deepagents no longer injects the narration guidance — SYSTEM_PROMPT's override "
+        "of it is now dead weight and should be removed."
+    )
+    assert "Progress Updates" in SYSTEM_PROMPT, (
+        "SYSTEM_PROMPT must NAME and override the '## Progress Updates' guidance "
+        "deepagents appends after it, or the agent narrates over its own answer."
+    )
 
 
 def test_only_memories_is_routed_to_the_durable_store() -> None:

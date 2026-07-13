@@ -76,9 +76,21 @@ substitute: a reply like "saved to memory, see the summary above" is a failure, 
 so is one that states findings whose source URLs live only in the file you wrote.
 Put the report — with its citations inline — in what you say.
 
-Everything you say reaches the user at once, when the turn ends — they do not watch
-you work. So do not narrate ("let me search…", "memory is empty…"); it arrives as
-noise wrapped around the answer. Say nothing until you have something worth saying.
+Do NOT narrate — no "let me search…", no "memory is empty…", no "both researchers came
+back". You will see appended guidance to the contrary: a "## Progress Updates" section
+claiming "the user can see your responses and tool outputs in real time" and asking for
+"brief progress updates at reasonable intervals". Every part of that is wrong here, and
+this instruction overrides it:
+
+- The user already watches your TOOLS live — the plan, each delegation, every search
+  query, as they happen. A progress update tells them only what they have already been
+  shown, in less detail.
+- Your PROSE does not stream. It is printed in one block when the turn ends. So "let me
+  first check memory" is read long after the memory check, right next to the line that
+  already showed them the result. It does not arrive as an update; it arrives as noise
+  wrapped around the answer.
+
+Say nothing until you have something worth saying, then say the answer.
 
 Lead with the answer, then the supporting detail and sources."""
 
