@@ -8,6 +8,7 @@ defensive branches that real messages don't normally exercise.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -78,11 +79,36 @@ class TestRenderTurn:
         # reach the printed line.
         assert render_turn({"messages": [AIMessage(content="  answer\n")]}) == "answer"
 
-    def test_falls_back_to_last_message_when_no_ai(self) -> None:
-        assert (
-            render_turn({"messages": [HumanMessage(content="only human")]})
-            == "only human"
+    def test_a_turn_with_no_assistant_prose_renders_nothing(self) -> None:
+        # This used to fall back to `messages[-1]` and return "only human" — the user's
+        # own question, echoed back under an `agent >` header. Harmless while
+        # `render_turn` was only called on completed turns; not harmless now that
+        # `_print_unfinished_turn` calls it on turns abandoned at an approval prompt,
+        # where a bare human message is exactly what the checkpoint holds. It would
+        # also have handed `evals/harness.py` the question itself as the agent's
+        # `response`, for the judges to grade as an answer.
+        assert render_turn({"messages": [HumanMessage(content="only human")]}) == ""
+
+    def test_a_raw_tool_payload_is_never_shown_as_the_agents_words(self) -> None:
+        # The other half of removing the fallback, and the more dangerous half. Ctrl-C
+        # during the multi-minute search phase leaves a `tavily_search` ToolMessage as
+        # the last thing in the checkpoint — several KB of serialized result dicts. The
+        # old `messages[-1]` fallback would print that verbatim under an `agent >`
+        # header, and would hand it to the eval judges as the agent's `response`.
+        #
+        # An earlier version of this very test pinned the opposite behavior using an
+        # 11-character tool output, which made the dump look perfectly benign.
+        payload = json.dumps(
+            {
+                "query": "opus pricing",
+                "results": [{"url": "https://x.test", "content": "…"}],
+            }
         )
+        messages = [
+            HumanMessage(content="q"),
+            ToolMessage(content=payload, tool_call_id="1", name="tavily_search"),
+        ]
+        assert render_turn({"messages": messages}) == ""
 
     def test_empty_message_list_returns_empty_string(self) -> None:
         assert render_turn({"messages": []}) == ""

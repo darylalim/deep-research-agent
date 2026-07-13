@@ -15,6 +15,7 @@ from typing import Any
 from unittest import mock
 
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.middleware.filesystem import supports_execution
 
 from deep_research import agent as agent_module
 from deep_research.agent import (
@@ -32,6 +33,11 @@ def test_mutating_and_shell_tools_are_gated() -> None:
     # 252-260); a value of `False` — or a config missing `allowed_decisions` —
     # silently un-gates while the key stays present. Assert the value, not just
     # the key, so a value flip can't defeat approval unnoticed.
+    #
+    # Note what this does NOT prove: that the gate can ever *fire*. An entry here is
+    # inert unless the tool actually reaches the model, which for `execute` it does
+    # not — see the next test. This one is the real gate for `write_file`/`edit_file`
+    # and a statement of intent for `execute`.
     for tool_name in ("write_file", "edit_file", "execute"):
         assert tool_name in GATED_TOOLS, f"{tool_name} is not gated"
         config = GATED_TOOLS[tool_name]
@@ -39,6 +45,20 @@ def test_mutating_and_shell_tools_are_gated() -> None:
             isinstance(config, dict) and config.get("allowed_decisions")
         )
         assert gated, f"{tool_name} is present but its value does not enable gating"
+
+
+def test_execute_is_latent_because_the_backend_cannot_run_it() -> None:
+    # Why `GATED_TOOLS["execute"]` is a no-op today, pinned so nobody has to
+    # rediscover it: `FilesystemMiddleware.wrap_model_call` filters `execute` out of
+    # `request.tools` on EVERY model call unless the backend supports execution, and
+    # for a `CompositeBackend` that is decided by its `.default` — ours is a
+    # `StateBackend`. The model is never offered the tool, so the interrupt cannot
+    # fire, so SYSTEM_PROMPT must not promise a pause for it (it no longer does).
+    #
+    # This goes red the day someone gives the backend a sandbox. That is exactly when
+    # it should: at that moment `execute` becomes real, the latent gate starts firing,
+    # and the prompt needs its sentence back. Read it as a tripwire, not a wish.
+    assert not supports_execution(build_backend())
 
 
 def test_only_memories_is_routed_to_the_durable_store() -> None:

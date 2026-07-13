@@ -46,6 +46,13 @@ Workflow:
    concise, cited summaries — prefer this over running many searches yourself,
    which clutters your own context. For a single quick lookup, you may call
    `tavily_search` directly.
+   When you do search yourself, shape the query the way a researcher would — the
+   search parameters are not just for them, and this is the path where they get
+   forgotten. `include_domains` to go straight to the vendor's or project's own
+   docs (a primary source is more current and more citable than an aggregator);
+   `time_range` or `start_date` on anything version-, price-, or limit-sensitive;
+   `topic="news"` for events; `search_depth="advanced"` only once basic results come
+   back thin, since it costs twice as much.
 4. Synthesize. Combine the findings into a clear, structured answer. Attribute
    every substantive claim — every number, date, version, limit, price, benchmark
    — to a source URL, and distinguish well-supported facts from uncertain ones.
@@ -61,8 +68,8 @@ Workflow:
    not write the report to any other file — you have already given it to the user,
    and every write costs them an approval. `/memories/` or nothing.
 
-Writing files and running shell commands require human approval, so expect a
-brief pause when you call `write_file`, `edit_file`, or `execute`.
+Writing files requires human approval, so expect a brief pause when you call
+`write_file` or `edit_file`.
 
 The answer belongs in the conversation. Saving it to a file is a bonus, never a
 substitute: a reply like "saved to memory, see the summary above" is a failure, and
@@ -110,16 +117,36 @@ def build_backend() -> CompositeBackend:
     )
 
 
-# Tools that mutate the world (or run shell) are gated behind human approval.
+# Tools that mutate the world are gated behind human approval.
 # `interrupt_on` REQUIRES a checkpointer — that dependency is satisfied below.
 # `True` expands to all four decisions (approve / edit / reject / respond); a
 # per-tool `InterruptOnConfig` (e.g. `{"allowed_decisions": ["approve", "reject"]}`)
 # narrows them. Narrowing is honored by the CLI — `cli.py::_prompt_decision` builds
 # its menu from the interrupt's `ReviewConfig` — so it needs no change here. Sending
 # a decision a tool forbids raises `ValueError` inside the middleware.
+#
+# Gating a name the backend never exposes is a NO-OP, not a safety net: the tool has
+# to reach the model before an interrupt can fire on it. `execute` is exactly that
+# case here and is kept only as latent insurance — see below.
 GATED_TOOLS: dict[str, bool | InterruptOnConfig] = {
     "write_file": True,
     "edit_file": True,
+    # LATENT — does nothing today, and that is fine. `FilesystemMiddleware` strips
+    # `execute` from `request.tools` on every model call unless the backend satisfies
+    # `SandboxBackendProtocol`, and for a `CompositeBackend` that is decided by its
+    # `.default` (deepagents/middleware/filesystem.py) — ours is `StateBackend`, so the
+    # model is never offered the tool and this line never fires. It stays because the
+    # cost is zero and it is the one thing standing between "someone swaps in a sandbox
+    # backend" and "an LLM runs shell unreviewed".
+    #
+    # It is NOT an invitation to make `execute` real. `LocalShellBackend` would do it in
+    # one kwarg, and it is `subprocess.run(shell=True)` on this host — its own docstring
+    # says it has no sandboxing, isolation, or security restrictions, and approval-by-
+    # keystroke is not a security boundary against a tool that can read `.env`. A
+    # research agent needs arithmetic, not a shell; add a pure-Python tool if that
+    # gap ever bites. `test_execute_is_latent_because_the_backend_cannot_run_it` pins
+    # the reason, and goes red the day the backend changes — which is when the prompt
+    # (which no longer promises a pause for `execute`) has to be revisited too.
     "execute": True,
 }
 

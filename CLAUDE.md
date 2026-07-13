@@ -134,9 +134,32 @@ tool call at *invoke* time.
 which pauses the graph for human approval. **This REQUIRES a checkpointer** — the
 pending interrupt is persisted there. The two are wired together in the same
 `create_deep_agent()` call; don't add interrupts without a checkpointer, and note
-that gating a *new* tool is just adding its name to `GATED_TOOLS` (a `True` expands
+that gating a *new* tool is adding its name to `GATED_TOOLS` (a `True` expands
 to all four decisions — `approve`, `edit`, `reject`, `respond`; an
 `InterruptOnConfig` narrows them).
+
+**But a name in `GATED_TOOLS` that the backend never exposes is a no-op, not a safety
+net** — the tool has to reach the model before an interrupt can fire on it, and
+`execute` is exactly that case. `FilesystemMiddleware.wrap_model_call` strips `execute`
+from `request.tools` on *every* model call unless the backend satisfies
+`SandboxBackendProtocol`, and for a `CompositeBackend` that is decided by its
+`.default` — ours is `StateBackend`. So the entry is **latent**: kept because it costs
+nothing and is what stands between a future sandbox backend and unreviewed shell, but
+it has never fired, and `SYSTEM_PROMPT` no longer promises a pause for it.
+`test_execute_is_latent_because_the_backend_cannot_run_it` pins the reason and goes red
+the day the backend changes — which is when the prompt needs its sentence back.
+
+**Do not "fix" this by wiring `LocalShellBackend`.** It is one kwarg away and it is
+`subprocess.run(shell=True)` on the host; its own docstring says it has no sandboxing,
+isolation, or security restrictions. A keystroke at an approval prompt is not a security
+boundary against a tool that can read `.env`. A research agent needs arithmetic, not a
+shell — add a pure-Python tool if that gap ever bites.
+
+The gate's *end-to-end* enforcement lives in the evals, not here:
+`mutations_require_approval` (`evals/evaluators.py`) compares every mutation the agent
+proposed against every tool that actually interrupted. `test_agent_wiring.py` only proves
+the dict *says* `True`; measured, flipping `GATED_TOOLS["write_file"]` to `False` left
+all six other code metrics and both judges green.
 
 ### 3. The HITL resume loop is split across `agent.py` and `cli.py`
 
@@ -403,7 +426,9 @@ doesn't configure X" is not evidence that X is unconfigured — grep the install
   (orchestrator) or a subagent's `tools` in `subagents.py`.
 - **New subagent** → return another `SubAgent` dict from `subagents.py`, add to
   `subagents=[...]` in `agent.py`.
-- **Gate a tool** → add its name to `GATED_TOOLS` in `agent.py`.
+- **Gate a tool** → add its name to `GATED_TOOLS` in `agent.py`. Check the model is
+  actually *offered* that tool, though — gating a name the backend never exposes is a
+  no-op (see `execute`, above).
 - **Production persistence** → swap `SqliteStore`/`SqliteSaver` for the Postgres
   equivalents in `open_agent()`; the `CompositeBackend` routing is unchanged.
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
