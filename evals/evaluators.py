@@ -195,14 +195,36 @@ def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
 
 class _CitationGrade(TypedDict):
     reasoning: Annotated[str, ..., "One or two sentences justifying the verdict."]
+    substantive_claims: Annotated[
+        int,
+        ...,
+        "How many substantive factual claims the answer makes in total (cited or not).",
+    ]
     uncited_claims: Annotated[
         list[str],
         ...,
-        "Substantive factual claims made without an attributed source URL.",
+        "Those claims, if any, with no source attributed to them.",
     ]
-    all_cited: Annotated[
-        bool, ..., "True only if every substantive factual claim carries a source URL."
-    ]
+
+
+def _citation_score(substantive_claims: int, uncited: int) -> float:
+    """The share of substantive claims that carry a source.
+
+    A *proportion*, deliberately, where this used to be an all-or-nothing bool — and
+    the difference is not a matter of taste. "Every claim is cited" is a conjunction
+    over every claim in the report: at 95% per-claim compliance, a 30-claim report
+    passes 0.95**30 ≈ 21% of the time, and at 90% it passes 4%. So the boolean was
+    destined to read 0 on any answer long enough to be worth writing — it scored a
+    report missing one citation exactly the same as one citing nothing at all, which
+    left it with no gradient and no way to show that a fix had helped. Measured: it
+    returned 0 on 4 of 5 sweep examples while `response_cites_sources` passed 5 of 5.
+
+    Vacuously perfect when there is nothing to attribute; an answer that asserts
+    nothing is `answers_the_question`'s problem, not this one's.
+    """
+    if substantive_claims <= 0:
+        return 1.0
+    return max(0.0, (substantive_claims - uncited) / substantive_claims)
 
 
 class _AnswerGrade(TypedDict):
@@ -215,14 +237,16 @@ class _AnswerGrade(TypedDict):
 
 
 def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
-    """Judge: is every substantive claim attributed to a source?
+    """Judge: what share of the answer's substantive claims carry a source?
 
     Claim-level, where `response_cites_sources` is only URL-presence: an answer can
-    carry one link and still assert six unsourced facts around it.
+    carry one link and still assert six unsourced facts around it. Scored as a
+    proportion — see `_citation_score` for why that is load-bearing rather than
+    cosmetic.
     """
     prose = _outputs(run).get("response", "")
     if not prose.strip():
-        return {"score": 0, "comment": "the agent produced no prose"}
+        return {"score": 0.0, "comment": "the agent produced no prose"}
 
     judge = JUDGE.with_structured_output(
         _CitationGrade, method="json_schema", strict=True
@@ -232,20 +256,33 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
             {
                 "role": "user",
                 "content": (
-                    "A research agent was asked to attribute every substantive claim to a "
-                    "source URL. Grade its answer strictly. Opinions, hedges, and framing "
-                    "do not need a source; factual assertions do.\n\n"
+                    "Grade how well a research agent attributed its claims to sources.\n\n"
+                    "A SUBSTANTIVE CLAIM is a specific, checkable assertion — a number, "
+                    "date, version, limit, price, benchmark, or capability. Framing, "
+                    "hedges, opinions, and summary sentences are not claims and need no "
+                    "source.\n\n"
+                    "A claim COUNTS AS CITED if a source is identifiable for it: a link, a "
+                    "bare domain, or a named publication, either alongside the claim or on "
+                    "the section/table/row it belongs to. Judge attribution, NOT "
+                    "formatting — `docs.tavily.com/pricing` is a citation even though it is "
+                    "not a clickable link, and a table whose row cites its source covers "
+                    "the figures in that row.\n\n"
+                    "Count every substantive claim, then list only those with no "
+                    "identifiable source.\n\n"
                     f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
                     f"ANSWER:\n{prose}"
                 ),
             }
         ]
     )
+    total = grade.get("substantive_claims") or 0
     uncited = grade.get("uncited_claims") or []
+    score = _citation_score(total, len(uncited))
+    cited = total - len(uncited)
     return {
-        "score": int(bool(grade.get("all_cited"))),
-        "comment": f"{grade.get('reasoning', '')}"
-        + (f" Uncited: {uncited}" if uncited else ""),
+        "score": score,
+        "comment": f"{cited}/{total} claims cited ({score:.0%}). "
+        + (f"Uncited: {uncited[:8]}" if uncited else "all attributed."),
     }
 
 

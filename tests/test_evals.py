@@ -22,6 +22,7 @@ from langgraph.types import Interrupt
 from deep_research.cli import render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
 from evals.evaluators import (
+    _citation_score,
     checks_memory_first,
     delegates_breadth,
     persists_findings,
@@ -291,6 +292,28 @@ def test_harness_refuses_to_wipe_the_agents_live_state_dir():
     ensure_isolated_state_dir(
         LIVE_STATE_DIR.parent / "somewhere-else"
     )  # does not raise
+
+
+def test_citation_score_is_a_proportion_not_a_conjunction():
+    """Why `claims_are_cited` must not go back to being a bool.
+
+    "Every claim is cited" is a conjunction over every claim in the report, so it
+    reads 0 on any answer long enough to be worth writing, and it scores a report
+    missing ONE citation identically to one that cites nothing at all — no gradient,
+    no way to tell that a fix helped. Measured before the change: 0 on 4 of 5 sweep
+    examples, while `response_cites_sources` passed all 5.
+    """
+    # The case a boolean cannot see: 29 of 30 claims cited is nearly perfect, and the
+    # old metric scored it exactly the same as citing nothing.
+    assert _citation_score(30, 1) == pytest.approx(0.967, abs=0.001)
+    assert _citation_score(30, 30) == 0.0
+    assert _citation_score(30, 1) > _citation_score(30, 15) > _citation_score(30, 29)
+
+    assert _citation_score(4, 0) == 1.0
+    # Vacuously perfect: an answer that asserts nothing is answers_the_question's problem.
+    assert _citation_score(0, 0) == 1.0
+    # A judge that miscounts must not produce a negative score.
+    assert _citation_score(3, 5) == 0.0
 
 
 def test_reset_state_deletes_only_the_databases_it_owns():
