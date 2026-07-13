@@ -299,11 +299,19 @@ imagined to prevent.
 
 **Raise `max_tokens` and set `streaming=True` together, or neither.** Verified that
 streaming adds only `stream: true` to the payload, so the Opus 4.8 no-sampling-params rule
-is untouched, and prompt caching still reports `cache_read` (it moves to the
-`message_delta`). Two tests in `test_config.py` pin this: `_should_stream()` must be True,
-and the request payload must carry no sampling param. Note `streaming=False` passed
+is untouched. Two tests in `test_config.py` pin this: `_should_stream()` must be True, and
+the request payload must carry no sampling param. Note `streaming=False` passed
 *explicitly* would hard-disable streaming via `_streaming_disabled()`, so don't "be safe"
 by spelling out the default.
+
+**Prompt caching under streaming is measured, not assumed.** Anthropic reports usage in the
+`message_delta` when streaming, so `cache_read` arrives by a different route — and
+`test_live.py::test_prompt_caching_actually_serves_the_prefix_from_cache` (which asserts
+`cache_read > 0` after two real turns) **passes with `streaming=True`**. Run it after any
+change to `build_model()`: a silently-cold cache roughly doubles the input cost of every
+turn with no visible symptom. That test calls `agent.invoke()`, not the streaming CLI, which
+is also the cleanest demonstration that the model's wire format is independent of the graph's
+`stream_mode` — and that tool calls reassemble correctly from partial JSON deltas.
 
 ## Prompt caching is already on — don't wire it again
 
