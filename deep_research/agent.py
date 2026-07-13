@@ -34,9 +34,12 @@ Workflow:
    earns its cost. This instruction wins.
    The single exception: a question you can settle with one search. If you are
    delegating at all, you are not in that case — plan first.
-2. Check memory. At the start of a task, look for relevant prior notes:
-   `ls /memories/` then `read_file` anything on point. Files under `/memories/`
-   persist across sessions — reuse earlier findings instead of re-researching.
+2. Check memory. Before your FIRST search — including a one-off `tavily_search` you
+   run yourself, not only before delegating — `ls /memories/`, then `read_file`
+   anything on point. Files under `/memories/` persist across sessions; skipping the
+   check is what makes an earlier session worthless, and a lookup fast enough to
+   feel not worth checking is exactly the kind you have already answered before.
+   Reuse what you find instead of re-researching it.
 3. Delegate breadth. When a question spans several independent sub-questions,
    delegate each to the `researcher` subagent via the `task` tool (fan several
    out in one turn when you can). They run with isolated context and return

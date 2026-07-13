@@ -370,6 +370,18 @@ step 4 now says citation applies to what you gathered yourself, not only to what
 handed you. Measured A/B on the same dataset with the same judge: **77% → 98% mean
 coverage**, and that direct-search answer went 25% → 100%.
 
+**The orchestrator's own `tavily_search` path is a standing blind spot — check any new
+workflow rule against it.** Two of the five `SYSTEM_PROMPT` steps turned out to apply only
+when the agent delegated. Citation was one (25% on the answer it researched itself, vs
+83-100% when a subagent did). Checking `/memories/` was the other, and it was total:
+measured **0 of 5** direct lookups ran `ls` first — the trajectory was a bare
+`['tavily_search']` every time. The mechanism is structural, not random: `RESEARCHER_PROMPT`
+independently disciplines everything a subagent touches, so the delegated path gets a second
+enforcement the direct path never sees, and a rule stated once in `SYSTEM_PROMPT` quietly
+covers only half the agent's behaviour. Naming the direct path explicitly in step 2 took it
+to **5 of 5**. When you add a rule the orchestrator must follow, say whether it holds for a
+quick lookup it runs itself — the answer is almost always yes, and it will not infer it.
+
 **`answers_the_question` needed the identical treatment, so treat this as the pattern, not
 an anecdote.** As a bare bool it failed an answer carrying complete per-tier RPM/ITPM/OTPM
 tables, because that answer *opened* with a caveat that exact figures move and the reader's
