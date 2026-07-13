@@ -320,17 +320,24 @@ prints, or the citation metric is fiction. Two consequences: `/report.md` is gon
 approval), and the prompt now tells the agent not to narrate, since its words all arrive
 at once.
 
-**`write_todos` compliance is a threshold effect, not a blanket failure.**
+**`write_todos` compliance is ~80%, and the number needed 15 runs to find.**
 `TodoListMiddleware` injects *its own* system prompt that says, four different ways, to
 skip the todo list for anything under three steps ("it is better to just do the task
 directly and NOT call this tool at all"). `SYSTEM_PROMPT` step 1 now explicitly names and
-overrides that guidance. Measured after the change: **5/5 across the dataset's five
-questions, but only 2/5 when the same *marginal* question (a two-part comparison) is run
-five times.** The agent is not ignoring step 1 — it is judging whether the question earns
-a todo list, and a simple two-parter sits right on its threshold, so it flips. Harder
-questions plan every time. Treat a `plans_with_todos` failure on an easy question as
-signal about the *question*, not proof of a regression — and never "fix" it by weakening
-the evaluator. A deterministic fix would
+overrides that guidance. Measured after the change: 5/5 across the dataset, then **2/5 and
+10/10 on two separate repeat-studies of the *same* question** — identical prompt (verified
+from the traces) and clean cold starts (verified: one human message per run, so no state
+leaked). Pooled, 12/15 ≈ **80%**. Both samples are individually unremarkable at p≈0.8; the
+apparent contradiction is what small n looks like. Do not tune the prompt off a handful of
+runs, and never "fix" a `plans_with_todos` failure by weakening the evaluator.
+
+**A tempting hypothesis that the data killed.** In the 5-run study, every run that planned
+failed to persist and vice versa — a perfect anti-correlation suggesting the prompt's five
+steps compete for one budget. At n=10 it evaporated: **9 of 10 runs did both.** Had we
+"fixed" the prompt architecture off n=5, we would have redesigned around noise. (Note the
+n=10 study cannot formally *test* the association — planning hit 10/10, so the 2×2 has an
+empty row and no power. The refutation comes from the nine counterexamples, not from the
+p-value, which is vacuous.) A deterministic fix would
 mean monkeypatching `deepagents.graph.TodoListMiddleware` to replace its prompt (the class
 takes `system_prompt=`, but deepagents constructs it internally as `TodoListMiddleware()`,
 and passing your own via `middleware=[...]` registers a *second* `write_todos` tool —
