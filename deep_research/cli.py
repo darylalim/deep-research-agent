@@ -64,12 +64,37 @@ def _text_of(message: Any) -> str:
     return str(content)
 
 
-def _last_ai_text(result: dict[str, Any]) -> str:
-    """Return the text of the final assistant message in a result state."""
+def render_turn(result: dict[str, Any]) -> str:
+    """Everything the agent said this turn, in order — not only its last message.
+
+    Printing just the final assistant message silently loses the answer. The agent
+    composes its cited report in the *same* message that proposes `write_file`, and
+    then signs off once the tool returns — so `messages[-1]` is the sign-off. Measured
+    on a real run: 33 source URLs in the turn, **zero** in the last message, and a
+    closing line pointing at a "summary above" the user had never been shown.
+
+    Only this turn: everything after the last human message, so a long thread does not
+    reprint its history.
+
+    `evals/harness.py` imports this, deliberately — the eval that grades whether the
+    user was shown any sources must grade exactly what the CLI prints, or the two drift
+    and the metric becomes fiction.
+    """
     messages = result.get("messages", [])
-    for message in reversed(messages):
-        if getattr(message, "type", None) == "ai":
-            return _text_of(message).strip()
+    start = 0
+    for index, message in enumerate(messages):
+        if getattr(message, "type", None) == "human":
+            start = index + 1
+
+    texts = [
+        text
+        for message in messages[start:]
+        if getattr(message, "type", None) == "ai"
+        and (text := _text_of(message).strip())
+    ]
+    if texts:
+        return "\n\n".join(texts)
+    # No assistant prose at all (e.g. an abandoned turn) — show whatever ended it.
     return _text_of(messages[-1]).strip() if messages else ""
 
 
@@ -311,7 +336,7 @@ def main() -> None:
                 print(f"\n! error: {exc}")
                 continue
 
-            print(f"\nagent > {_last_ai_text(result)}")
+            print(f"\nagent > {render_turn(result)}")
 
 
 if __name__ == "__main__":

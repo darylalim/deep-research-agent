@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from deep_research.cli import _last_ai_text, _short, _text_of
+from deep_research.cli import _short, _text_of, render_turn
 
 
 class TestTextOf:
@@ -39,36 +39,56 @@ class TestTextOf:
         assert _text_of("just a string") == "just a string"
 
 
-class TestLastAiText:
-    def test_returns_text_of_final_ai_message(self) -> None:
-        messages = [
-            HumanMessage(content="q"),
-            AIMessage(content="first"),
-            AIMessage(content="last"),
-        ]
-        assert _last_ai_text({"messages": messages}) == "last"
+class TestRenderTurn:
+    def test_shows_the_report_and_not_just_the_sign_off(self) -> None:
+        """The regression this function exists for.
 
-    def test_skips_trailing_non_ai_messages(self) -> None:
-        messages = [AIMessage(content="answer"), HumanMessage(content="follow up")]
-        assert _last_ai_text({"messages": messages}) == "answer"
+        The agent writes its cited report in the same message that proposes the
+        (gated) `write_file`, then signs off after the tool returns. Rendering only
+        `messages[-1]` handed the user the sign-off alone — measured on a real run:
+        33 source URLs in the turn, zero in the last message, and a closing line
+        referring to a "summary above" that was never printed.
+        """
+        messages = [
+            HumanMessage(content="compare X and Y"),
+            AIMessage(
+                content="X is 1,000/mo (https://x.example). Y is 5,000/mo (https://y.example)."
+            ),
+            ToolMessage(content="ok", tool_call_id="1", name="write_file"),
+            AIMessage(content="Findings saved. Summary above covers the comparison."),
+        ]
+        rendered = render_turn({"messages": messages})
+        assert "https://x.example" in rendered  # the sources reach the user…
+        assert "Findings saved." in rendered  # …and so does the sign-off
+        assert rendered.index("https://x.example") < rendered.index("Findings saved.")
+
+    def test_renders_only_the_current_turn(self) -> None:
+        """A thread accumulates messages; reprinting the whole history every turn
+        would be worse than the bug being fixed."""
+        messages = [
+            HumanMessage(content="first question"),
+            AIMessage(content="old answer"),
+            HumanMessage(content="second question"),
+            AIMessage(content="new answer"),
+        ]
+        assert render_turn({"messages": messages}) == "new answer"
 
     def test_strips_surrounding_whitespace(self) -> None:
-        # The .strip() is the function's real value-add: model output routinely
-        # carries leading/trailing newlines that must not reach the printed line.
-        messages = [AIMessage(content="  answer\n")]
-        assert _last_ai_text({"messages": messages}) == "answer"
+        # Model output routinely carries leading/trailing newlines that must not
+        # reach the printed line.
+        assert render_turn({"messages": [AIMessage(content="  answer\n")]}) == "answer"
 
     def test_falls_back_to_last_message_when_no_ai(self) -> None:
         assert (
-            _last_ai_text({"messages": [HumanMessage(content="only human")]})
+            render_turn({"messages": [HumanMessage(content="only human")]})
             == "only human"
         )
 
     def test_empty_message_list_returns_empty_string(self) -> None:
-        assert _last_ai_text({"messages": []}) == ""
+        assert render_turn({"messages": []}) == ""
 
     def test_missing_messages_key_returns_empty_string(self) -> None:
-        assert _last_ai_text({}) == ""
+        assert render_turn({}) == ""
 
 
 class TestShort:
