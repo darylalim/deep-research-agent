@@ -10,12 +10,19 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from langchain.agents.middleware.human_in_the_loop import HumanInTheLoopMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, Interrupt
 
 from deep_research import cli as cli_module
@@ -528,7 +535,7 @@ class _FakeAgent:
         *,
         raises: Exception | None = None,
         messages: list[Any] | None = None,
-        chunks: list[tuple[tuple[str, ...], dict[str, Any]]] | None = None,
+        rounds: list[list[tuple[tuple[str, ...], dict[str, Any]]]] | None = None,
     ):
         self._raises = raises
         self.messages = (
@@ -536,14 +543,40 @@ class _FakeAgent:
             if messages is None
             else messages
         )
-        # Default: one gated write, emitted from a subagent — hence duplicated.
-        self._chunks = (
+        # ROUNDS, not one fixed chunk list. The fake used to re-yield the same chunks on
+        # every `stream()` call, INCLUDING the resume — so a turn could never be driven
+        # past an approval (it would just interrupt again, forever), which left the
+        # id-keyed `Command(resume=...)` and the final answer print with no coverage at
+        # all, and let `test_main_asks_once_for_a_subagents_write` pass with the dedupe
+        # deleted. A real agent's resume stream yields *different* chunks; so does this.
+        #
+        # Round 1 by default: one gated write, proposed inside a subagent — so its
+        # interrupt is emitted TWICE with the same `Interrupt.id` (subagent namespace,
+        # then bubbled to the root), exactly as LangGraph does under `subgraphs=True`.
+        # Round 2: the approval goes through and the turn finishes.
+        self._rounds = (
             [
-                (SUBAGENT_NS, {"__interrupt__": (PENDING_WRITE,)}),
-                ((), {"__interrupt__": (PENDING_WRITE,)}),
+                [
+                    (SUBAGENT_NS, {"__interrupt__": (PENDING_WRITE,)}),
+                    ((), {"__interrupt__": (PENDING_WRITE,)}),
+                ],
+                [
+                    (
+                        (),
+                        {
+                            "tools": {
+                                "messages": [
+                                    ToolMessage(
+                                        "ok", tool_call_id="w1", name="write_file"
+                                    )
+                                ]
+                            }
+                        },
+                    )
+                ],
             ]
-            if chunks is None
-            else chunks
+            if rounds is None
+            else rounds
         )
         self.invocations: list[Any] = []
 
@@ -559,10 +592,14 @@ class _FakeAgent:
         # (without which the searches are invisible — the entire reason to stream).
         assert stream_mode == "updates"
         assert subgraphs is True
+        round_index = len(self.invocations)
         self.invocations.append(payload)
         if self._raises is not None:
             raise self._raises
-        yield from self._chunks
+        # Past the scripted rounds the turn is simply over — an empty stream, which is
+        # how `_stream_turn` reports "no interrupts left" and how the loop terminates.
+        if round_index < len(self._rounds):
+            yield from self._rounds[round_index]
 
     def get_state(self, config: Any) -> SimpleNamespace:
         return SimpleNamespace(values={"messages": self.messages})
@@ -709,11 +746,105 @@ class TestDuplicateInterrupts:
     def test_main_asks_once_for_a_subagents_write(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # End to end through the real turn loop: the fake agent emits the duplicate the
-        # way LangGraph does, and the human is asked exactly once.
+        # End to end through the real turn loop: the fake emits the duplicate the way
+        # LangGraph does, and the human is asked exactly once.
+        #
+        # The APPROVAL is what makes this bite. An earlier version scripted a
+        # KeyboardInterrupt at the first prompt — which meant the second, duplicate
+        # interrupt was never reached, so the test passed identically with the dedupe
+        # DELETED. A guard that cannot fail is not a guard. Approve instead, and let the
+        # turn run to completion.
         agent = _FakeAgent()
-        _drive(monkeypatch, agent, "what does opus cost?", KeyboardInterrupt(), "/exit")
-        assert capsys.readouterr().out.count("Approval required — write_file") == 1
+        _drive(monkeypatch, agent, "what does opus cost?", "a", "/exit")
+        out = capsys.readouterr().out
+
+        assert out.count("Approval required — write_file") == 1
+        # …and the turn actually completed: one initial stream + one resume.
+        assert len(agent.invocations) == 2
+        assert isinstance(agent.invocations[1], Command)
+        assert REPORT in out
+
+    def test_the_resume_is_keyed_by_interrupt_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The id-keyed `Command(resume={id: {"decisions": [...]}})` had NO coverage: the
+        # old fake re-yielded the same chunks forever, so no test could drive `main()`
+        # past an approval. LangGraph raises `RuntimeError("When there are multiple
+        # pending interrupts, you must specify the interrupt id when resuming")` on a flat
+        # resume value, so this shape is load-bearing.
+        agent = _FakeAgent()
+        _drive(monkeypatch, agent, "what does opus cost?", "a", "/exit")
+
+        resume = agent.invocations[1].resume
+        assert resume == {"i1": {"decisions": [{"type": "approve"}]}}
+
+    def test_a_rejected_write_is_not_reported_as_a_tool_failure(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `HumanInTheLoopMiddleware` answers a REJECTED call with a synthetic ToolMessage
+        # carrying `status="error"` — and if the human gave a reason, that reason becomes
+        # its content. So the feed cannot tell a rejection from a crash, and printed
+        # "! write_file failed: too risky" at the person who had just typed `r`, reporting
+        # their own honoured decision as a bug in the agent.
+        rejection = ToolMessage(
+            "User rejected the tool call for `write_file` with id w1.",
+            tool_call_id="w1",
+            name="write_file",
+            status="error",
+        )
+        agent = _FakeAgent(
+            rounds=[
+                [
+                    (SUBAGENT_NS, {"__interrupt__": (PENDING_WRITE,)}),
+                    ((), {"__interrupt__": (PENDING_WRITE,)}),
+                ],
+                [((), {"tools": {"messages": [rejection]}})],
+            ]
+        )
+        # reject, with a reason
+        _drive(monkeypatch, agent, "what does opus cost?", "r", "too risky", "/exit")
+        out = capsys.readouterr().out
+
+        assert "write_file failed" not in out
+        assert "✗ write_file — rejected, as you asked" in out
+
+
+class TestCommandDispatch:
+    def test_a_mistyped_command_does_not_run_the_real_one(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        # Dispatch used to be `user_input.startswith("/export")`, which also swallows
+        # `/exports` and `/exported` — silently writing a default-named file for what is
+        # plainly a typo. A mistyped command should SAY so, not act. (`/thread` had the
+        # same shape.) The turn loop must also not fire: a `/`-prefixed typo is a command,
+        # not a research question, and researching it would cost real money.
+        #
+        # `chdir` into tmp_path is not hygiene theatre. `/export` with no argument writes
+        # `research-<thread>-<utc>.md` into the CWD — so when this fix regresses, this
+        # test drops a file in the repo root. It did exactly that while the fix was being
+        # verified, and `git add -A` then committed it. A test that proves a bug by
+        # littering the working tree is a test that will eventually litter someone's repo.
+        monkeypatch.chdir(tmp_path)
+
+        agent = _FakeAgent()
+        _drive(monkeypatch, agent, "/exports", "/threadx", "/exit")
+        out = capsys.readouterr().out
+
+        assert "unknown command '/exports'" in out
+        assert "unknown command '/threadx'" in out
+        assert agent.invocations == [], "a mistyped command started a research turn"
+        assert list(tmp_path.glob("research-*.md")) == [], "a typo wrote an export file"
+
+    def test_the_real_commands_still_work(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _drive(monkeypatch, _FakeAgent(), "/thread other", "/thread", "/exit")
+        out = capsys.readouterr().out
+        assert "switched to thread 'other'" in out
+        assert "current thread: 'other'" in out
 
 
 class TestActivityFeed:
@@ -962,6 +1093,43 @@ class TestActivityFeed:
             ),
         )
         assert "! tavily_search failed" in capsys.readouterr().out
+
+    def test_a_thread_rewrite_does_not_replay_the_previous_turns_feed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `PatchToolCallsMiddleware.before_agent` answers dangling tool calls by returning
+        # `{"messages": [RemoveMessage(REMOVE_ALL_MESSAGES), *THE ENTIRE THREAD]}`. It
+        # fires on exactly the turn AFTER one you abandoned at an approval prompt — and
+        # the feed is per-turn, so its seen-set has never heard of those calls. Without a
+        # guard, that turn opens by replaying the previous turn's whole feed: its plan,
+        # its delegations, every search it ran.
+        feed = ActivityFeed()
+        feed.absorb(
+            (),
+            {
+                "PatchToolCallsMiddleware.before_agent": {
+                    "messages": [
+                        RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                        HumanMessage("the previous question"),
+                        AIMessage(
+                            content="",
+                            id="old-ai",
+                            tool_calls=[
+                                {
+                                    "name": "task",
+                                    "args": {
+                                        "description": "last turn's sub-question",
+                                        "subagent_type": "researcher",
+                                    },
+                                    "id": "old-t1",
+                                }
+                            ],
+                        ),
+                    ]
+                }
+            },
+        )
+        assert capsys.readouterr().out == ""
 
     def test_it_returns_the_interrupts_it_sees(self) -> None:
         # The feed is also the interrupt collector, exactly like harness.TurnRecorder —

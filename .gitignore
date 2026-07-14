@@ -7,6 +7,11 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.coverage
+
+# What `/export` writes by default (cli.py: `research-<thread>-<utc>.md`). These are the
+# user's reports, not source — and they land in the CWD, which is usually the repo root.
+research-*.md
 
 # uv / virtualenv
 .venv/

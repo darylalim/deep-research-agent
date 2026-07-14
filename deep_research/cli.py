@@ -439,13 +439,16 @@ class ActivityFeed:
 
     **It prints each event once, keyed on the TOOL CALL id.** On resume,
     `HumanInTheLoopMiddleware.after_model` re-emits the AIMessage that proposed the gated
-    call, and the re-streamed superstep re-emits the *cached writes* of tasks that
-    already finished — so without deduping, every approval replays lines the user just
-    watched scroll past. The key is the call id (`tool_call["id"]`, and `tool_call_id` on
-    the result) rather than the *message* id, because a tool call executes exactly once,
-    while `BaseMessage.id` is optional — a re-emitted `ToolMessage` need not carry one,
-    and keying on it silently lets the duplicate through. (Observed: the completion line
-    for a finished researcher printed twice, once per approval round.)
+    call, and the re-streamed superstep re-emits the *cached writes* of the siblings that
+    already succeeded (`_reapply_writes_to_succeeded_nodes`) — so without deduping, an
+    approval replays lines the user just watched scroll past.
+
+    The key is the call id (`tool_call["id"]`, and `tool_call_id` on the result) rather
+    than the *message* id, because a tool call executes exactly once while
+    `BaseMessage.id` is optional and unstable: a replayed `ToolMessage` arrives with
+    `id=None` on the first pass and a **fresh uuid** on the resume, so a message-id
+    seen-set matches neither and lets every duplicate through. The same defect was found
+    (and fixed) in `harness.TurnRecorder`, where it was double-counting delegations.
 
     **It does not pretend to know which researcher is which.** A subagent's namespace is
     `('tools:<pregel-task-uuid>',)`, and that uuid is not the `task` tool-call id — so
@@ -460,6 +463,24 @@ class ActivityFeed:
         self._printed: set[str] = set()  # event keys already on screen
         self._task_descriptions: dict[str, str] = {}  # task tool_call id -> description
         self._ls_paths: dict[str, str] = {}  # ls tool_call id -> the path it listed
+        self._declined: set[str] = set()  # tool names the human rejected this turn
+
+    def note_declined(self, names: set[str]) -> None:
+        """Tell the feed which tools the human just rejected.
+
+        Needed because a rejection is indistinguishable from a crash by the time it
+        reaches the stream: `HumanInTheLoopMiddleware` answers a rejected call with a
+        synthetic `ToolMessage` carrying **`status="error"`** — and if the human supplied
+        a reason, that reason *becomes* the content. So the feed would print
+        `! write_file failed: too risky` at the person who just typed `r`, reporting
+        their own honoured decision as a bug in the agent.
+
+        Name-level, not call-level, because an `ActionRequest` carries no tool-call id.
+        The imprecision only bites if one turn both rejects a `write_file` and has a
+        *different* `write_file` genuinely fail — in which case the failure is reported as
+        a rejection. Rare, and it errs toward the truthful half.
+        """
+        self._declined |= names
 
     def absorb(self, namespace: tuple[str, ...], chunk: Any) -> list[Any]:
         """Fold in one `(namespace, update)` chunk; return any interrupts it carried.
@@ -479,6 +500,19 @@ class ActivityFeed:
                 continue
             if not isinstance(update, dict):
                 continue
+            messages = update.get("messages", []) or []
+            if any(getattr(m, "type", None) == "remove" for m in messages):
+                # A THREAD REWRITE, not new activity — skip the whole update.
+                # `PatchToolCallsMiddleware.before_agent` answers dangling tool calls by
+                # returning `{"messages": [RemoveMessage(REMOVE_ALL_MESSAGES), *the entire
+                # thread]}`. It fires on exactly the turn *after* one you abandoned at an
+                # approval prompt — so without this guard, that turn opens by replaying
+                # the previous turn's whole feed: its plan, its delegations, every search.
+                # (The feed is per-turn, so its seen-set has never heard of those calls.)
+                #
+                # Keyed on the RemoveMessage rather than the node name, so any middleware
+                # that rewrites the message list wholesale is covered, not just this one.
+                continue
             if (todos := update.get("todos")) and is_orchestrator:
                 # ORCHESTRATOR ONLY. deepagents gives every declarative subagent its own
                 # `TodoListMiddleware`, so a `researcher` really can call `write_todos` —
@@ -489,7 +523,7 @@ class ActivityFeed:
                 # `orchestrator_trajectory` vs `trajectory`; the display layer has to make
                 # the same distinction, for the same reason.
                 self._render_plan(todos)
-            for message in update.get("messages", []) or []:
+            for message in messages:
                 self._render_message(namespace, message)
         return interrupts
 
@@ -559,7 +593,12 @@ class ActivityFeed:
         # returning an empty list, so a fruitless search arrives as an error, and a
         # silent feed would make it look like the search simply never happened.
         if getattr(message, "status", None) == "error":
-            print(f"  ! {name} failed: {_one_line(_text_of(message), 100)}")
+            if name in self._declined:
+                # Not a failure — the human rejected it, and the middleware reports that
+                # to the model as an `status="error"` ToolMessage. See `note_declined`.
+                print(f"  ✗ {name} — rejected, as you asked")
+            else:
+                print(f"  ! {name} failed: {_one_line(_text_of(message), 100)}")
             return
 
         if name == "ls" and is_orchestrator:
@@ -627,6 +666,34 @@ def _stream_turn(
     ):
         pending.extend(feed.absorb(namespace, chunk))
     return pending
+
+
+def _declined_tools(
+    interrupts: list[Any], by_interrupt: dict[str, list[dict[str, Any]]]
+) -> set[str]:
+    """The tool names the human just rejected.
+
+    `_collect_decisions` returns one decision per `action_request`, in order, within each
+    interrupt — so zipping the two back together recovers which *tool* each decision was
+    about. Deduped by interrupt id for the same reason `_collect_decisions` is: a
+    subagent's interrupt arrives twice.
+    """
+    declined: set[str] = set()
+    seen: set[str] = set()
+    for interrupt in interrupts:
+        interrupt_id = getattr(interrupt, "id", None)
+        if interrupt_id is None or interrupt_id in seen:
+            continue
+        seen.add(interrupt_id)
+        value = getattr(interrupt, "value", None)
+        if not isinstance(value, dict):
+            continue
+        requests = value.get("action_requests", [])
+        decisions = by_interrupt.get(interrupt_id, [])
+        for request, decision in zip(requests, decisions, strict=False):
+            if decision.get("type") == "reject":
+                declined.add(request.get("name", "?"))
+    return declined
 
 
 def _print_unfinished_turn(agent: Any, config: dict[str, Any]) -> None:
@@ -735,28 +802,35 @@ def main() -> None:
 
             if not user_input:
                 continue
-            if user_input in ("/exit", "/quit"):
+            # Match the command EXACTLY, never as a prefix. `startswith("/export")` also
+            # swallows `/exports` and `/exported`, silently writing a default-named file
+            # for what is plainly a typo — and a mistyped command should say so, not act.
+            command, _, argument = user_input.partition(" ")
+            argument = argument.strip()
+
+            if command in ("/exit", "/quit"):
                 print("bye.")
                 return
-            if user_input == "/help":
+            if command == "/help":
                 print(HELP)
                 continue
-            if user_input.startswith("/thread"):
-                parts = user_input.split(maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    thread_id = parts[1].strip()
+            if command == "/thread":
+                if argument:
+                    thread_id = argument
                     print(f"(switched to thread '{thread_id}')")
                 else:
                     print(f"(current thread: '{thread_id}')")
                 continue
-            if user_input.startswith("/export"):
-                parts = user_input.split(maxsplit=1)
+            if command == "/export":
                 _export(
                     agent,
                     {"configurable": {"thread_id": thread_id}},
                     thread_id,
-                    parts[1].strip() if len(parts) == 2 else "",
+                    argument,
                 )
+                continue
+            if command.startswith("/"):
+                print(f"(unknown command '{command}' — try /help)")
                 continue
 
             config = {"configurable": {"thread_id": thread_id}}
@@ -774,6 +848,9 @@ def main() -> None:
                         # Nothing reviewable — resuming would just re-interrupt.
                         print("\n! paused with no reviewable action; abandoning turn.")
                         break
+                    # A rejected call comes back as a ToolMessage with `status="error"`,
+                    # so the feed cannot tell it from a crash. Tell it.
+                    feed.note_declined(_declined_tools(pending, by_interrupt))
                     # Keyed by interrupt id: a turn can hold several interrupts at once
                     # (concurrent researchers), and LangGraph rejects a resume that
                     # doesn't say which interrupt each value belongs to.

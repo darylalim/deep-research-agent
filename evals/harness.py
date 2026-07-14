@@ -101,7 +101,22 @@ class TurnRecorder:
         self.proposed_writes: list[str] = []  # orchestrator write_file/edit_file paths
         self.proposed_mutations: list[str] = []  # …the tool names, from ANY namespace
         self.gated: list[str] = []  # tools that required approval
-        self._seen: set[str] = set()
+        self._seen: set[str] = set()  # event keys already folded in
+
+    def _first_time(self, key: str) -> bool:
+        """True the first time this event is seen, False every time after.
+
+        Keyed on TOOL-CALL ids, never on `BaseMessage.id`. A tool call executes exactly
+        once, whereas a message id is optional (`BaseMessage.id` defaults to `None`) and
+        is not stable across a re-emission: a superstep replayed after an approval
+        re-emits its succeeded siblings' cached writes as *fresh* `ToolMessage` objects —
+        measured, `id=None` on the first pass and a brand-new uuid on the resume — so a
+        message-id seen-set never matches and lets every one of them through.
+        """
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        return True
 
     def absorb(self, namespace: tuple[str, ...], chunk: Any) -> list[Any]:
         """Fold one `(namespace, update)` chunk in; return any interrupts it carried."""
@@ -113,6 +128,21 @@ class TurnRecorder:
             if node == "__interrupt__":
                 interrupts.extend(update)
                 for pending in update:
+                    # DEDUPE BY INTERRUPT ID, or the safety metric is defeated. With
+                    # `subgraphs=True` an interrupt raised inside a subagent is emitted
+                    # TWICE — once at the subagent's namespace, once bubbled to the root —
+                    # with the same `Interrupt.id` (this is why `cli._collect_decisions`
+                    # dedupes before prompting). Counting both inflates `gated`, and since
+                    # `mutations_require_approval` compares MULTISETS, the surplus entry
+                    # silently absorbs a *genuinely ungated* mutation of the same name:
+                    # two proposed `write_file`s, one interrupt emitted twice, and a file
+                    # written unreviewed scores a clean 1. Measured. That is the exact
+                    # partial-gate hole the multiset comparison exists to close.
+                    interrupt_id = getattr(pending, "id", None)
+                    if interrupt_id is not None and not self._first_time(
+                        f"interrupt:{interrupt_id}"
+                    ):
+                        continue
                     value = getattr(pending, "value", None) or {}
                     self.gated.extend(
                         request.get("name", "?")
@@ -126,15 +156,6 @@ class TurnRecorder:
         return interrupts
 
     def _absorb_message(self, namespace: tuple[str, ...], message: Any) -> None:
-        # On resume, HumanInTheLoopMiddleware re-emits the AIMessage that proposed
-        # the gated call — so the same message arrives twice. Dedupe by id, or the
-        # approved write would be counted as two proposals.
-        message_id = getattr(message, "id", None)
-        if message_id:
-            if message_id in self._seen:
-                return
-            self._seen.add(message_id)
-
         # An empty namespace is the orchestrator; anything else is inside a subagent's
         # subgraph (measured: `('tools:<uuid>',)`). Keeping the two apart is not
         # bookkeeping — it is correctness. deepagents gives every declarative subagent
@@ -152,6 +173,18 @@ class TurnRecorder:
         if kind == "tool":
             # A ToolMessage exists only for a tool that actually ran, and carries the
             # tool's name — this is the trajectory, for free.
+            #
+            # Deduped on `tool_call_id`, because a resumed superstep re-emits the cached
+            # writes of the siblings that already succeeded. Two researchers fan out, one
+            # of them proposes a gated `write_file`, and the *other's* finished `task`
+            # ToolMessage is replayed on every approval round — as a fresh object with a
+            # fresh id. So the old message-id dedupe never matched, and `task` was counted
+            # twice for one delegation: `delegates_breadth` would pass an example needing
+            # three delegations on two real ones, and `searched_the_web`'s count inflates
+            # the same way.
+            call_id = getattr(message, "tool_call_id", None)
+            if call_id and not self._first_time(f"result:{call_id}"):
+                return
             name = getattr(message, "name", None) or "?"
             self.trajectory.append(name)
             (
@@ -163,6 +196,11 @@ class TurnRecorder:
             for call in getattr(message, "tool_calls", None) or []:
                 name = call.get("name")
                 if name not in MUTATING_TOOLS:
+                    continue
+                # Same key, same reason: on resume `HumanInTheLoopMiddleware.after_model`
+                # re-emits the AIMessage that proposed the gated call, and one approved
+                # write must not be recorded as two proposals.
+                if not self._first_time(f"call:{call.get('id')}"):
                     continue
                 # Every proposed mutation, wherever it was proposed. Deliberately NOT
                 # orchestrator-only: subagents inherit `interrupt_on`, so "nothing is

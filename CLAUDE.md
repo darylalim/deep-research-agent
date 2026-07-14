@@ -184,8 +184,38 @@ drives them:
   occurrence asks the human to approve one researcher's `write_file` twice and (since the
   resume mapping is keyed by id) silently keeps only the second answer. The old blocking
   `invoke()` never saw this because it streams with `subgraphs=False`, so the child emitted
-  nothing — the duplication appears the moment you stream. `evals/harness._approve_all` is
-  immune only by accident: it writes into a dict keyed by id without asking anyone anything.
+  nothing — the duplication appears the moment you stream.
+
+  **`evals/harness.TurnRecorder` must dedupe it too, and for a worse reason.** `_approve_all`
+  is immune by accident (a dict keyed by id), but `TurnRecorder.gated` appended one entry per
+  *occurrence* — and because `mutations_require_approval` compares **multisets**, that surplus
+  entry silently absorbs a genuinely *ungated* mutation of the same name. Measured: two
+  proposed `write_file`s, one real interrupt emitted twice, a file written unreviewed —
+  **score 1**. The safety metric, defeated by the thing it was written to catch. Both sides of
+  the comparison have to count real events, not emissions.
+
+- **Dedupe on TOOL-CALL ids, never on `BaseMessage.id`.** Both `cli.ActivityFeed` and
+  `harness.TurnRecorder` learned this the hard way. A resumed superstep re-emits the *cached
+  writes* of siblings that already succeeded (`_reapply_writes_to_succeeded_nodes`), and those
+  arrive as **fresh** `ToolMessage` objects — measured: `id=None` on the first pass, a
+  brand-new uuid on the resume. A message-id seen-set matches neither, so every replayed
+  result gets through: the feed reprinted a finished researcher's line once per approval
+  round, and `TurnRecorder` counted one delegation as two, which would let
+  `delegates_breadth` pass an example demanding more than actually happened. A tool call
+  executes exactly once; its id is the honest key.
+
+- **A rejection reaches the stream as `status="error"`.** `HumanInTheLoopMiddleware` answers a
+  rejected call with a synthetic `ToolMessage` whose status is `"error"` and whose content is
+  *the human's own reason*, if they gave one. So nothing downstream can tell a rejection from
+  a crash — the feed printed `! write_file failed: too risky` at the person who had just typed
+  `r`. `main` passes the decisions it collected to `ActivityFeed.note_declined`; a feed that
+  guesses from the message content cannot be right.
+
+- **A thread rewrite is not new activity.** `PatchToolCallsMiddleware.before_agent` answers
+  dangling tool calls by returning `{"messages": [RemoveMessage(REMOVE_ALL_MESSAGES), *the
+  entire thread]}` — and it fires on exactly the turn *after* one abandoned at an approval
+  prompt. Anything that renders stream messages must skip an update carrying a `RemoveMessage`,
+  or that turn opens by replaying the previous turn's whole feed.
 - The middleware bundles all of *one agent's* pending tool calls into a single
   interrupt whose value carries **two parallel lists**: `action_requests` (what the
   agent wants to do — name/args/description, and *not* what may be decided about it)
