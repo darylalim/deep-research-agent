@@ -16,7 +16,8 @@ genuinely small support modules.
 
 ```bash
 uv sync                          # install deps + the project itself (editable) into ./.venv
-uv run python -m deep_research   # run the interactive REPL (the only entry point)
+uv run python -m deep_research   # run the interactive REPL (the CLI front door)
+uv run --group serve langgraph dev  # serve the SAME agent over HTTP for Studio / deep-agents-ui
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
@@ -47,7 +48,9 @@ uv run ty check                  # type check (Astral's ty)
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
   gate, the Opus 4.8 no-sampling invariant, the `/memories/` route and its store
-  namespace, and deepagents 0.7.0 backend readiness), not the agent's LLM output —
+  namespace, deepagents 0.7.0 backend readiness, and the `langgraph dev`
+  served-graph assembly — it must build with **no** local checkpointer/store yet
+  keep the same gate), not the agent's LLM output —
   that half lives in `evals/` (see *Evaluating it*, below). Tests
   use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
   marker is registered and **deselected by default** (`addopts = -m 'not live'`);
@@ -283,6 +286,64 @@ If you change what's gated, or how decisions are shaped, both `_collect_decision
 The compiled agent holds open sqlite connections (checkpointer + store), so it's
 only valid inside the `with open_agent() as agent:` block. Run the entire session
 inside it (as `cli.main` does); don't return the agent out of the block.
+
+### The second front door: serving over HTTP (`graph.py` + `langgraph.json`)
+
+`open_agent()` is the CLI's way in; `graph.py` is the other one — the module
+`langgraph dev` (and `langgraph up` / LangGraph Platform, and the `deep-agents-ui`
+web app) loads. Both delegate to one shared builder, `agent.build_agent(*,
+checkpointer=None, store=None)`, which owns the entire assembly — model, tools,
+subagent, system prompt, HITL gate, `/memories/` routing, name — so the two front
+doors genuinely **cannot** drift: add a tool or subagent in `agent.py` and both gain
+it in one edit. The single deliberate difference is persistence: `graph.py` calls
+`build_agent()` with **no `checkpointer=` and no `store=`**. On the server the topology inverts — the
+*server* owns persistence and injects both at runtime — so a compiled-in
+checkpointer is redundant at best and overridden at worst. Omitting it is also what
+keeps `interrupt_on` legal here: `create_deep_agent(interrupt_on=...)` compiles with
+no checkpointer (the requirement is enforced at *invoke* time, which the server
+satisfies), so the HITL gate fires server-side exactly as for the CLI —
+`deep-agents-ui`'s tool-approval UI renders the same `action_requests` /
+`review_configs` payload `cli.py::_collect_decisions` parses. Verified live: the
+served graph's node list contains `HumanInTheLoopMiddleware.after_model`.
+
+`build_backend()` is reused **unchanged**, and that is the load-bearing part.
+`StoreBackend` resolves the store from the runtime via `get_store()` (deepagents
+`backends/store.py`), not from a constructor arg — so `/memories/` transparently
+reads the *server's* store instead of the CLI's `SqliteStore`: same route, same
+`MEMORY_NAMESPACE`, different concrete backend. **Consequence:** notes the CLI wrote
+to `.deep_research/memories.sqlite` are *not* visible to a served instance; it is a
+different physical store under the same namespace key.
+
+**`langgraph.json` must reference the graph as a MODULE path, never a file path:**
+`"deep_research.graph:graph"`, not `"./deep_research/graph.py:graph"`. The loader
+(`langgraph_api/graph.py`) branches on one character — a value containing `/` is
+imported by file path (`spec_from_file_location` → a standalone module with no
+package parent → `from .agent import …` dies with "attempted relative import with no
+known parent package"); no `/` means a dotted-module import
+(`importlib.import_module` → proper package → relative imports work). The project is
+installed editable, so the dotted form resolves and lets `graph.py` keep the same
+relative imports as every other module. Measured, not guessed: the file-path form
+was tried and crashed the server on startup.
+
+And it points at the module-level *compiled* `graph`, not the `build_graph`
+**factory** (`deep_research.graph:build_graph`): `langgraph_api` re-invokes a graph
+factory on **every run** (`invoke_factory`), which would rebuild the model, tools,
+and subagent per request; a compiled graph is built once at import and reused. The
+cost is that importing `graph.py` constructs the agent — which is why the tests
+import it *inside* the test body, so a build break fails those tests rather than
+erroring the whole file at collection.
+
+`langgraph dev` needs the `inmem` extra (`langgraph-cli[inmem]`), kept in its own
+**`serve` dependency-group** — out of the default set, so the lint/test CI jobs'
+bare `uv sync` stays lean — and run with `uv run --group serve langgraph dev`. It
+writes throwaway pickled state to `.langgraph_api/` (gitignored). Three tests in
+`test_agent_wiring.py` pin the wiring: `test_served_graph_assembles_offline` (it
+compiles), `test_served_graph_delegates_to_the_shared_builder` (it routes through
+`build_agent`, not a re-inlined `create_deep_agent`), and
+`test_shared_builder_gates_and_routes_without_persistence` (no checkpointer/store,
+yet the SAME `GATED_TOOLS` / `SYSTEM_PROMPT` / `backend` **objects** *and* a
+non-empty tool/subagent set — identity checks, so a divergent second assembly goes
+red).
 
 ## Orchestrator ↔ subagent model
 
@@ -568,6 +629,13 @@ doesn't configure X" is not evidence that X is unconfigured — grep the install
   no-op (see `execute`, above).
 - **Production persistence** → swap `SqliteStore`/`SqliteSaver` for the Postgres
   equivalents in `open_agent()`; the `CompositeBackend` routing is unchanged.
+- **Serve it over HTTP / drive it from a web UI** → `uv run --group serve langgraph
+  dev` loads `deep_research.graph:graph` (see *The second front door*, above). Point
+  `deep-agents-ui` or LangGraph Studio at `http://127.0.0.1:2024`, assistant id
+  `research`. `graph.py` delegates to `agent.build_agent()` with no checkpointer/store
+  — the server provides them, so don't add them back; keep `langgraph.json`'s graph
+  value a module path (not a file path) pointing at the compiled `graph` (not the
+  `build_graph` factory).
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
   `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`. All three are resolved into
   module-level constants at *import* time, so they must be set before

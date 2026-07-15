@@ -11,6 +11,8 @@ catches that class of failure cheaply.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from unittest import mock
 
@@ -26,6 +28,26 @@ from deep_research.agent import (
     build_backend,
     open_agent,
 )
+
+
+@contextmanager
+def _capture_calls(module: Any, attr: str) -> Iterator[list[dict[str, Any]]]:
+    """Replace `module.attr` with a pass-through spy; yield each call's kwargs.
+
+    The assembly tests all need the same thing — swap a constructor
+    (`create_deep_agent`, `build_agent`) for a spy that records how it was called and
+    still delegates to the real one, so the wiring is exercised for real — so the
+    scaffolding lives here once instead of being re-inlined per test.
+    """
+    calls: list[dict[str, Any]] = []
+    real = getattr(module, attr)
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    with mock.patch.object(module, attr, spy):
+        yield calls
 
 
 def test_mutating_and_shell_tools_are_gated() -> None:
@@ -138,21 +160,15 @@ def test_open_agent_passes_a_backend_instance_not_a_factory() -> None:
     # never is. What actually matters is the object handed to `create_deep_agent`,
     # so capture that instead: a plain function passed here still type-checks and
     # still passes every other test, but is exactly the deprecated form.
-    captured: dict[str, Any] = {}
-    real_create_deep_agent = agent_module.create_deep_agent
-
-    def spy(*args: Any, **kwargs: Any) -> Any:
-        captured.update(kwargs)
-        return real_create_deep_agent(*args, **kwargs)
-
-    with mock.patch.object(agent_module, "create_deep_agent", spy), open_agent():
+    with _capture_calls(agent_module, "create_deep_agent") as calls, open_agent():
         pass
 
-    assert "backend" in captured
-    assert not callable(captured["backend"]), (
+    assert len(calls) == 1
+    assert "backend" in calls[0]
+    assert not callable(calls[0]["backend"]), (
         "backend= must be an instance, not a factory"
     )
-    assert isinstance(captured["backend"], CompositeBackend)
+    assert isinstance(calls[0]["backend"], CompositeBackend)
 
 
 def test_open_agent_assembles_offline() -> None:
@@ -161,3 +177,64 @@ def test_open_agent_assembles_offline() -> None:
         # It's a compiled LangGraph — it must expose the invoke entry point the
         # CLI drives.
         assert hasattr(agent, "invoke")
+
+
+def test_served_graph_assembles_offline() -> None:
+    # The `langgraph dev` / Platform front door (`deep_research/graph.py`), served to
+    # deep-agents-ui / LangGraph Studio. `graph.py` builds its module-level `graph`
+    # (the compiled object `langgraph.json` loads) at import, so assert on THAT rather
+    # than rebuilding it. It must be a compiled LangGraph the SDK can drive, and must
+    # compile *despite* `interrupt_on` being set with no checkpointer (enforced at
+    # invoke time, which the server satisfies).
+    #
+    # Imported inside the test, not at module top: `graph.py` constructs a full agent
+    # at import, so keeping that import here means a build break fails only this test
+    # rather than erroring the whole file at collection.
+    from deep_research.graph import graph
+
+    assert graph is not None
+    assert hasattr(graph, "invoke")
+
+
+def test_shared_builder_gates_and_routes_without_persistence() -> None:
+    # `build_agent` is what BOTH front doors call, so pin its invariants once, in the
+    # served configuration (no checkpointer/store): do NOT pass a checkpointer or
+    # store (the server owns persistence and injects its own), yet keep the gate, the
+    # /memories/ routing, and the prompt. Spy on the `create_deep_agent` that
+    # `build_agent` invokes, exactly as
+    # `test_open_agent_passes_a_backend_instance_not_a_factory` does.
+    with _capture_calls(agent_module, "create_deep_agent") as calls:
+        agent_module.build_agent()  # served-style: no persistence passed
+    captured = calls[0]
+
+    # Persistence is the server's job; neither may be passed.
+    assert captured.get("checkpointer") is None, "must not pass a checkpointer"
+    assert captured.get("store") is None, "must not pass a store"
+    # The gate, the /memories/ routing, and the prompt are the SAME objects the CLI
+    # uses (identity checks — a copy would defeat the point).
+    assert captured.get("interrupt_on") is GATED_TOOLS
+    assert captured.get("system_prompt") is SYSTEM_PROMPT
+    assert isinstance(captured.get("backend"), CompositeBackend)
+    # ...and so are the tools and subagents — the fields that actually diverge if a
+    # second assembly is ever introduced, which the old served-graph test never
+    # checked. Assert they are present, not silently empty.
+    assert captured.get("tools"), "served agent lost its web-search tool"
+    assert captured.get("subagents"), "served agent lost its researcher subagent"
+
+
+def test_served_graph_delegates_to_the_shared_builder() -> None:
+    # The anti-drift guard, made structural: `graph.py` must ROUTE THROUGH
+    # `agent.build_agent` — the single source of truth — not re-inline
+    # `create_deep_agent`, so tools/subagents/prompt/gate can never differ from the
+    # CLI. Assert the delegation, and that the served call passes no persistence.
+    #
+    # `graph` imported inside the test for the same reason as
+    # `test_served_graph_assembles_offline` — isolate import-time construction.
+    from deep_research import graph as graph_module
+
+    with _capture_calls(graph_module, "build_agent") as calls:
+        graph_module.build_graph()
+
+    assert len(calls) == 1, "build_graph must call the shared builder exactly once"
+    assert calls[0].get("checkpointer") is None
+    assert calls[0].get("store") is None

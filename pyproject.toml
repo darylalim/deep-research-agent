@@ -38,6 +38,17 @@ dev = [
     "ruff",
     "ty>=0.0.58",
 ]
+# The `langgraph dev` server (the Studio / deep-agents-ui front door — see
+# `deep_research/graph.py`). Its OWN group, deliberately NOT in the default set, so
+# the lint/test CI jobs' bare `uv sync` stays lean and never pulls the server stack
+# (langgraph-api, uvicorn, opentelemetry, …) it does not use. Run it with
+# `uv run --group serve langgraph dev`, which installs the group on demand.
+# Capped at the minor: langgraph-cli is 0.x, so a minor bump is its breaking
+# boundary, and an unbounded `>=` could pull a langgraph-api requiring langgraph>=2,
+# which cannot resolve against this project's `langgraph>=1.0,<2.0` runtime cap.
+serve = [
+    "langgraph-cli[inmem]>=0.4.31,<0.5",
+]
 
 # The distribution name (deep-research-agent) differs from the import package
 # (deep_research), so point hatchling at the right directory for the wheel.

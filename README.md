@@ -77,6 +77,23 @@ Because state is persistent, quitting and re-running `python -m deep_research`
 resumes the `main` thread exactly where you left off — including a pending
 approval.
 
+## Serve it over HTTP (optional)
+
+The same agent can run behind the LangGraph API server instead of the terminal, so
+you can drive it from [LangGraph Studio](https://smith.langchain.com/studio) or the
+[deep-agents-ui](https://github.com/langchain-ai/deep-agents-ui) web app:
+
+```bash
+uv run --group serve langgraph dev   # serves http://127.0.0.1:2024, opens Studio
+```
+
+Then point the UI at deployment URL `http://127.0.0.1:2024`, assistant id `research`.
+`deep_research/graph.py` builds the *same* agent as the CLI (same tools, subagent,
+prompt, and human-in-the-loop gate — both share `agent.build_agent`), but lets the
+server own persistence, so its `/memories/` store is separate from the CLI's
+`.deep_research/`. The `serve` dependency-group stays out of the default install to
+keep CI lean; `uv run --group serve` pulls it in on demand.
+
 ## How it fits together
 
 ```
@@ -126,9 +143,11 @@ deep_research/
 ├── config.py       # env loading, model, state paths, key checks
 ├── tools.py        # Tavily web-search tool
 ├── subagents.py    # the `researcher` subagent
-├── agent.py        # open_agent(): assembles everything with disk-backed persistence
+├── agent.py        # build_agent() assembles the agent; open_agent() adds disk persistence
+├── graph.py        # langgraph dev / Studio / web-UI entry point (server owns persistence)
 ├── cli.py          # interactive REPL + human-in-the-loop resume loop
 └── __main__.py     # `python -m deep_research`
+langgraph.json      # registers the `research` graph for `langgraph dev`
 ```
 
 ## Extending it

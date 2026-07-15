@@ -19,6 +19,11 @@ research-*.md
 # Local agent state (checkpoints + persistent memory)
 .deep_research/
 
+# `langgraph dev` scratch state — the API server's local, pickled-to-disk
+# checkpointer/store (the platform-provided persistence graph.py deliberately does
+# NOT wire itself). Regenerated on every `langgraph dev`; never source.
+.langgraph_api/
+
 # Claude Code: `.claude/settings.json` and `.claude/hooks/` ARE committed (they
 # encode project facts, not preferences). Personal overrides are not.
 .claude/settings.local.json

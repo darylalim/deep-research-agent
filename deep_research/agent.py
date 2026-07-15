@@ -163,6 +163,34 @@ GATED_TOOLS: dict[str, bool | InterruptOnConfig] = {
 }
 
 
+def build_agent(*, checkpointer: Any = None, store: Any = None) -> Any:
+    """Assemble the deep research agent — the single source of truth for its wiring.
+
+    Both front doors call this. `open_agent()` (the CLI) passes its own disk-backed
+    `checkpointer` and `store`; `graph.py` (the `langgraph dev` / Studio / web-UI
+    server) passes NEITHER, because the API server injects its own at runtime — and
+    omitting the checkpointer is also what keeps `interrupt_on` legal there (the
+    requirement is enforced at invoke time, which the server satisfies).
+
+    Everything that defines *what the agent is* — model, tools, subagent, system
+    prompt, HITL gate, `/memories/` routing, name — lives here exactly once, so the
+    two front doors cannot drift: add a tool or subagent and both entry points gain
+    it in one edit. Persistence is the ONLY thing that legitimately differs between
+    them, which is why it is the only parameter.
+    """
+    return create_deep_agent(
+        model=build_model(),
+        tools=[build_web_search()],
+        system_prompt=SYSTEM_PROMPT,
+        subagents=[build_research_subagent()],
+        backend=build_backend(),
+        interrupt_on=GATED_TOOLS,
+        checkpointer=checkpointer,
+        store=store,
+        name="deep-research-agent",
+    )
+
+
 @contextmanager
 def open_agent() -> Iterator[Any]:
     """Yield a fully wired deep research agent with disk-backed persistence.
@@ -178,15 +206,6 @@ def open_agent() -> Iterator[Any]:
         SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer,
         SqliteStore.from_conn_string(str(MEMORY_DB)) as store,
     ):
-        agent = create_deep_agent(
-            model=build_model(),
-            tools=[build_web_search()],
-            system_prompt=SYSTEM_PROMPT,
-            subagents=[build_research_subagent()],
-            backend=build_backend(),
-            interrupt_on=GATED_TOOLS,
-            checkpointer=checkpointer,  # thread state + pending interrupts (durable)
-            store=store,  # `/memories/` long-term store (durable)
-            name="deep-research-agent",
-        )
-        yield agent
+        # Disk-backed persistence is the ONLY thing the CLI adds over the served
+        # graph; everything else lives in the shared `build_agent`.
+        yield build_agent(checkpointer=checkpointer, store=store)
