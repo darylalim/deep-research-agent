@@ -37,7 +37,13 @@ uv run ty check                  # type check (Astral's ty)
   wire any new hook the same way. It formats and autofixes with ruff, reports
   whatever ruff *can't* autofix, and — for edits under `deep_research/` or `tests/` —
   runs the offline suite (~1s, no keys, no network). A non-zero exit blocks with the
-  failure in stderr. Both steps live in one script, in that order, deliberately:
+  failure in stderr. **Two consequences for how you edit here:** `ruff check --fix`
+  deletes an import whose first *use* lands in a *later* edit, so add an import and its
+  first use in the SAME edit (splitting them silently drops the import); and since
+  pytest reruns on every `.py` edit, sequence a multi-edit refactor so each step leaves
+  the suite green (e.g. rewrite the last user of a symbol before deleting the symbol),
+  or the hook blocks mid-refactor. Both steps live in one script, in that order,
+  deliberately:
   `ruff check --fix` rewrites the file, so a pytest run racing it in a parallel hook
   could read a half-rewritten tree. The same settings file `deny`s reads *and* edits
   of `.env` and `.deep_research/**` (live agent state: checkpoints, memories,
@@ -324,6 +330,9 @@ known parent package"); no `/` means a dotted-module import
 installed editable, so the dotted form resolves and lets `graph.py` keep the same
 relative imports as every other module. Measured, not guessed: the file-path form
 was tried and crashed the server on startup.
+(The offline suite only pins *assembly*, never serving — so verify a `graph.py` /
+`langgraph.json` change live: `uv run --group serve langgraph dev`, then curl
+`/assistants/search`, expecting graph_id `research`.)
 
 And it points at the module-level *compiled* `graph`, not the `build_graph`
 **factory** (`deep_research.graph:build_graph`): `langgraph_api` re-invokes a graph
