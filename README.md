@@ -161,3 +161,9 @@ langgraph.json      # registers the `research` graph for `langgraph dev`
   to restrict the available decisions per tool.
 - **Go to production memory** — swap `SqliteStore` for `PostgresStore` (and
   `SqliteSaver` for a Postgres checkpointer) in `agent.py`.
+
+## License
+
+[MIT](LICENSE) — the same license as the upstream stack this builds on
+(`deepagents`, `langchain`, `langgraph`). Use, fork, and vendor the wiring
+patterns freely.

@@ -3,6 +3,13 @@ name = "deep-research-agent"
 version = "0.1.0"
 description = "A persistent, subagent-orchestrating research agent built on Deep Agents (LangChain + LangGraph)."
 readme = "README.md"
+# PEP 639 form: an SPDX expression, not the legacy `{text = ...}` table or a
+# `License ::` classifier (both deprecated). `license-files` makes hatchling copy
+# LICENSE into the wheel's `.dist-info/licenses/`, so the grant travels with the
+# artifact and not just with the repo. MIT matches the whole upstream stack —
+# deepagents, langchain, and langgraph are all MIT.
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11,<4.0"
 dependencies = [
     # Deep Agents harness (bundles langgraph transitively).
