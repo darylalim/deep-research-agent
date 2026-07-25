@@ -1,6 +1,11 @@
 [project]
 name = "deep-research-agent"
-version = "0.1.0"
+# Read from `deep_research/__init__.py` — see `[tool.hatch.version]` below. The
+# version used to be duplicated here AND there, and now that releases are tagged
+# there would be a third copy (the git tag) to keep in step. One source, two
+# readers: `deep_research.__version__` at runtime and `importlib.metadata` for the
+# installed distribution.
+dynamic = ["version"]
 description = "A persistent, subagent-orchestrating research agent built on Deep Agents (LangChain + LangGraph)."
 readme = "README.md"
 # PEP 639 form: an SPDX expression, not the legacy `{text = ...}` table or a
@@ -56,6 +61,14 @@ dev = [
 serve = [
     "langgraph-cli[inmem]>=0.4.31,<0.5",
 ]
+
+# The single source of the project's version: hatchling greps this file for a
+# `__version__ = "..."` assignment at build time and uses it for `[project].version`,
+# which is declared `dynamic` above. Bump `deep_research/__init__.py` and the wheel,
+# `importlib.metadata.version("deep-research-agent")`, and `deep_research.__version__`
+# all move together — then tag `v<that value>`.
+[tool.hatch.version]
+path = "deep_research/__init__.py"
 
 # The distribution name (deep-research-agent) differs from the import package
 # (deep_research), so point hatchling at the right directory for the wheel.
