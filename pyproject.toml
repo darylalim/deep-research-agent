@@ -61,6 +61,23 @@ dev = [
 serve = [
     "langgraph-cli[inmem]>=0.4.31,<0.5",
 ]
+# The browser front door (`streamlit run streamlit_app.py` → `deep_research/webui.py`).
+# Its own group like `serve`, and out of the default set for the same reason: a bare
+# `uv sync` should not drag pandas, pyarrow and numpy into an install that only wants the
+# agent. Run it with `uv run --group ui streamlit run streamlit_app.py`.
+#
+# **Unlike `serve`, CI installs this one** (`.github/workflows/ci.yml` syncs
+# `--group ui` in both jobs). The difference is first-party code: nothing in this repo
+# imports langgraph-cli, so there is nothing for lint/ty/pytest to check in `serve` —
+# whereas `webui.py` and `streamlit_app.py` are ours, and without the group `ty` fails
+# them with `unresolved-import` and `tests/test_webui.py` skips itself.
+#
+# Capped at the major: streamlit is 1.x and stable there. The >=1.57 floor is what ships
+# the bundled agent-skill docs under `streamlit/.agents/`, and `st.code(height=...)` /
+# `st.chat_input(submit_mode=...)`, both of which `webui.py` uses.
+ui = [
+    "streamlit>=1.57,<2.0",
+]
 
 # The single source of the project's version: hatchling greps this file for a
 # `__version__ = "..."` assignment at build time and uses it for `[project].version`,

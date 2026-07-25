@@ -103,6 +103,15 @@ Lead with the answer, then the supporting detail and sources."""
 # *value* must not change, or every note already in `memories.sqlite` is orphaned.
 MEMORY_NAMESPACE = ("filesystem",)
 
+# The virtual path prefix `CompositeBackend` routes to the durable Store. A constant
+# rather than a literal because two readers need it and they must not drift: the route
+# below, and `webui.memory_files`, which turns a Store key back into the path the agent
+# actually writes to. `CompositeBackend` **strips this prefix before delegating**
+# (`backends/composite.py`: "strip the route prefix and ensure the result starts with
+# `/`"), so a note the agent wrote to `/memories/x.md` is stored under the key `/x.md` —
+# and a memory browser that displays raw keys shows the user a path that does not exist.
+MEMORY_ROUTE = "/memories/"
+
 
 def build_backend() -> CompositeBackend:
     """Route persistence: default files are thread-scoped (ephemeral, but
@@ -124,7 +133,7 @@ def build_backend() -> CompositeBackend:
     return CompositeBackend(
         default=StateBackend(),
         routes={
-            "/memories/": StoreBackend(namespace=lambda _runtime: MEMORY_NAMESPACE)
+            MEMORY_ROUTE: StoreBackend(namespace=lambda _runtime: MEMORY_NAMESPACE)
         },
     )
 

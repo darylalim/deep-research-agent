@@ -1,0 +1,48 @@
+# Theme for `streamlit run streamlit_app.py`.
+#
+# BOTH `[theme.light]` and `[theme.dark]` are defined on purpose: a config with only a
+# bare `[theme]` section locks the app to a single mode and removes the light/dark
+# toggle from the settings menu. This app's output is long-form prose — cited research
+# reports people read for minutes at a time — so which mode that is has to stay the
+# reader's call, not ours.
+#
+# Shared, mode-independent settings live in `[theme]`; only colours differ per mode.
+
+[theme]
+# Slightly larger than Streamlit's default, and a generous heading ramp: the main
+# content here is a report, not a dashboard.
+baseFontSize = 15
+headingFontSizes = ["30px", "23px", "19px", "16px", "15px", "14px"]
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+baseRadius = "8px"
+buttonRadius = "8px"
+linkUnderline = true
+# Approval previews and memory files render in `st.code`, so the monospace face is
+# load-bearing rather than decorative — a reviewer has to actually read a diff in it.
+codeFontSize = "0.85rem"
+
+[theme.light]
+primaryColor = "#4338ca"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f4f5"
+codeBackgroundColor = "#f4f4f5"
+textColor = "#18181b"
+linkColor = "#4338ca"
+borderColor = "#e4e4e7"
+
+[theme.dark]
+primaryColor = "#818cf8"
+backgroundColor = "#18181b"
+secondaryBackgroundColor = "#27272a"
+codeBackgroundColor = "#27272a"
+textColor = "#fafafa"
+linkColor = "#a5b4fc"
+borderColor = "#3f3f46"
+
+[theme.light.sidebar]
+backgroundColor = "#fafafa"
+borderColor = "#e4e4e7"
+
+[theme.dark.sidebar]
+backgroundColor = "#0f0f11"
+borderColor = "#27272a"

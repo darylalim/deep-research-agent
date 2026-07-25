@@ -24,6 +24,13 @@ research-*.md
 # NOT wire itself). Regenerated on every `langgraph dev`; never source.
 .langgraph_api/
 
+# Streamlit: `.streamlit/config.toml` IS committed (it is the app's theme, a project
+# fact). `secrets.toml` is never committed — this project reads credentials from `.env`
+# via `config.py`'s `load_dotenv()`, so nothing here needs the file, but Streamlit's own
+# convention is to put API keys in it and the ignore has to exist BEFORE someone follows
+# that convention rather than after.
+.streamlit/secrets.toml
+
 # Claude Code: `.claude/settings.json` and `.claude/hooks/` ARE committed (they
 # encode project facts, not preferences). Personal overrides are not.
 .claude/settings.local.json

@@ -20,8 +20,13 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      # `--group ui`, unlike `serve`, because that group has FIRST-PARTY code behind it
+      # (`deep_research/webui.py`, `streamlit_app.py`). `uv sync` is an exact sync, so a
+      # bare one uninstalls the group and `ty` then fails those files with
+      # `unresolved-import: streamlit`. `serve` stays out because no module in this repo
+      # imports langgraph-cli — there is nothing there for lint or ty to check.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --group ui
       - name: Ruff lint
         run: uv run ruff check
       - name: Ruff format check
@@ -43,8 +48,12 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
+      # `--group ui` so `tests/test_webui.py` actually RUNS here rather than skipping.
+      # It guards its import with `pytest.importorskip("streamlit")`, which keeps a
+      # partial install working locally — but a suite that silently skips in CI is a
+      # suite that is not protecting anything.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --group ui
       # Runs the offline suite only; `live` tests are deselected by default, so
       # no ANTHROPIC_API_KEY / TAVILY_API_KEY secrets are needed here.
       - name: Run tests

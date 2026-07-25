@@ -16,6 +16,7 @@ import ast
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,55 @@ from langgraph.types import Command
 
 from .agent import open_agent
 from .config import MEMORY_DB, MODEL_NAME, missing_keys
+
+
+@dataclass(frozen=True)
+class FeedEvent:
+    """One thing the agent did, as data rather than as a printed line.
+
+    `ActivityFeed` decides *what happened* — the subtle half, and the one this
+    module's docstrings spend pages on: dedupe on tool-call ids, skip thread
+    rewrites, orchestrator-only plan and `ls`. `ActivityFeed._emit` decides how it
+    *looks*. Splitting the two is what lets a second front end reuse the decisions
+    instead of reimplementing them — `deep_research/webui.py` subclasses the feed
+    and overrides `_emit` alone.
+
+    That reuse is not a nicety. This absorb-and-dedupe logic already exists twice
+    (here and in `evals/harness.TurnRecorder`), and the SAME call-id dedupe bug was
+    found and fixed in both, separately. A third hand-written copy in the web UI
+    would be a third place for it to come back — so there isn't one.
+
+    `items` is a tuple, not a list, so the whole event stays hashable and frozen:
+    the web UI keeps a per-turn list of these in `st.session_state` and re-renders
+    it on every rerun, which is only safe while an event cannot be mutated after
+    the fact.
+    """
+
+    kind: str
+    text: str = ""
+    detail: str = ""
+    items: tuple[str, ...] = ()
+    is_orchestrator: bool = True
+
+
+# Every `kind` the feed can emit — the contract between `ActivityFeed` and its renderers.
+# Both `ActivityFeed._emit` (terminal) and `webui.render_event` (browser) are if/elif
+# chains that silently draw NOTHING for a kind they do not recognize, so adding a kind and
+# wiring only one of them would blank that line in the other with no error anywhere.
+# `test_webui.py::test_every_feed_kind_is_rendered_by_both_front_ends` asserts both cover
+# this tuple, which is what turns that silence into a red test.
+FEED_KINDS: tuple[str, ...] = (
+    "plan",
+    "delegate",
+    "search",
+    "read",
+    "listed",
+    "done",
+    "rejected",
+    "failed",
+    "refusal",
+)
+
 
 BANNER = f"""\
 ╭──────────────────────────────────────────────────────────────╮
@@ -178,6 +228,40 @@ def render_turn(result: dict[str, Any]) -> str:
     return "\n\n".join(texts)
 
 
+def thread_sections(state: dict[str, Any]) -> list[tuple[str, str]]:
+    """The thread as ordered `(speaker, text)` sections, speaker being `human` or `ai`.
+
+    The grouping half of `render_thread`, split out because the web UI needs the same
+    sections as *chat bubbles* rather than as markdown headings. One definition of
+    "how a thread divides into turns", two renderers — the same split as `FeedEvent`,
+    and for the same reason: the rules below are load-bearing and were paid for once
+    already.
+
+    Assistant **prose only**, and deliberately not the last message. The agent composes
+    its cited report in the same message that proposes `write_file` and then signs off
+    once the tool returns, so `messages[-1]` is "findings saved, see the summary above"
+    with none of the 33 source URLs the turn actually produced — the exact regression
+    this repo has already paid for once. Tool payloads are skipped for the same reason
+    `ActivityFeed` never prints them.
+
+    Consecutive messages from one speaker are ONE section. That report-then-sign-off
+    pair is two `ai` messages saying one thing; splitting them would render one answer
+    as two.
+    """
+    sections: list[tuple[str, list[str]]] = []
+    for message in state.get("messages", []):
+        kind = getattr(message, "type", None)
+        if kind not in ("human", "ai"):
+            continue
+        if not (text := _text_of(message).strip()):
+            continue  # e.g. an assistant message that only carried a tool call
+        if sections and sections[-1][0] == kind:
+            sections[-1][1].append(text)
+        else:
+            sections.append((kind, [text]))
+    return [(kind, "\n\n".join(texts)) for kind, texts in sections]
+
+
 def render_thread(state: dict[str, Any]) -> str:
     """The whole conversation as markdown — every question with its cited answer.
 
@@ -204,25 +288,32 @@ def render_thread(state: dict[str, Any]) -> str:
     `RemoveMessage(id=REMOVE_ALL_MESSAGES)`. Wire that one via `middleware=[...]` and
     every long thread's export silently truncates, with no error and no failing test.
     """
-    sections: list[tuple[str, list[str]]] = []
-    for message in state.get("messages", []):
-        kind = getattr(message, "type", None)
-        if kind not in ("human", "ai"):
-            continue
-        if not (text := _text_of(message).strip()):
-            continue  # e.g. an assistant message that only carried a tool call
-        # Consecutive messages from the same speaker are ONE section. The agent's turn is
-        # routinely two messages — the cited report (sent alongside the `write_file` call)
-        # and then a sign-off once the tool returns — and splitting them into two `##
-        # agent` headings would make one answer look like two.
-        if sections and sections[-1][0] == kind:
-            sections[-1][1].append(text)
-        else:
-            sections.append((kind, [text]))
     return "\n\n".join(
-        f"## {'you' if kind == 'human' else 'agent'}\n\n" + "\n\n".join(texts)
-        for kind, texts in sections
+        f"## {'you' if kind == 'human' else 'agent'}\n\n{text}"
+        for kind, text in thread_sections(state)
     )
+
+
+def export_markdown(state: dict[str, Any], thread_id: str, stamp: str) -> str:
+    """The thread as a self-contained markdown document, or `""` if there is none yet.
+
+    Shared by `/export` in the REPL and the download button in the web UI so the two
+    hand the user the same bytes. `stamp` is passed in rather than read here: the
+    caller also puts it in the filename, and a header and filename disagreeing about
+    when a report was taken is the kind of small lie that makes an archive useless.
+
+    "Exported", not "answered" — the messages carry no timestamps, and the only
+    per-turn clock lives in the checkpointer's snapshots. A date we did not measure is
+    a date we invented.
+    """
+    text = render_thread(state)
+    if not text:
+        return ""
+    header = (
+        f"# Deep research — thread `{thread_id}`\n\n"
+        f"*Model: `{MODEL_NAME}`. Exported {stamp}.*\n"
+    )
+    return f"{header}\n{text}\n"
 
 
 def _short(value: Any, limit: int = 300) -> str:
@@ -425,6 +516,54 @@ def _prompt_decision(
         return {"type": "edit", "edited_action": {"name": name, "args": new_args}}
 
 
+def pending_reviews(interrupts: list[Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every DISTINCT pending interrupt, as ordered `(interrupt_id, HITLRequest)` pairs.
+
+    **The same interrupt is emitted TWICE.** With `subgraphs=True`, an interrupt raised
+    inside a subagent is emitted at the subagent's namespace *and* again, bubbled, at the
+    root — same `Interrupt.id`, two chunks. Honouring both would ask the human to approve
+    one researcher's `write_file` twice and, since every resume mapping is keyed by id,
+    silently keep only the second answer. Approval fatigue is exactly how a gate stops
+    being a gate.
+
+    Deduping lives here, in one place, because three callers now need it and each one
+    that rolls its own is a chance to get it wrong: `_collect_decisions` (the prompting
+    invariant is "one prompt per pending action"), `_declined_tools`, and
+    `webui.StreamlitFeed`'s approval form. `evals/harness._approve_all` is immune only by
+    accident — it writes into a dict keyed by id without asking anyone anything, so a
+    duplicate is idempotent — and `harness.TurnRecorder` was NOT immune, which cost this
+    project a silently defeated safety metric.
+
+    An interrupt with no id, or whose value is not the mapping the middleware documents,
+    is dropped rather than guessed at.
+    """
+    seen: set[str] = set()
+    reviews: list[tuple[str, dict[str, Any]]] = []
+    for interrupt in interrupts:
+        interrupt_id = getattr(interrupt, "id", None)
+        value = getattr(interrupt, "value", None)
+        if interrupt_id is None or interrupt_id in seen or not isinstance(value, dict):
+            continue
+        seen.add(interrupt_id)
+        reviews.append((interrupt_id, value))
+    return reviews
+
+
+def allowed_decisions_by_tool(value: dict[str, Any]) -> dict[str, list[str]]:
+    """Which decisions each tool in this interrupt permits, keyed by tool name.
+
+    Looked up by **name** rather than by position. The middleware happens to append
+    `action_requests` and `review_configs` in lockstep today, but it documents the latter
+    as the policy "for all possible actions" — so a name lookup stays correct if it is
+    ever deduplicated, and a positional one would silently offer the wrong menu.
+    """
+    return {
+        config["action_name"]: config["allowed_decisions"]
+        for config in value.get("review_configs", [])
+        if config.get("action_name") and config.get("allowed_decisions")
+    }
+
+
 def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]:
     """Collect decisions for every pending action, grouped by interrupt id.
 
@@ -444,36 +583,13 @@ def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]
     of interrupt id → that interrupt's resume value. The mapping form is also
     correct for the ordinary single-interrupt case, so there is one code path.
 
-    `review_configs` is looked up by name rather than by position: the middleware
-    happens to append the two lists in lockstep today, but it documents the field
-    as the policy "for all possible actions", so a name lookup stays correct if
-    it is ever deduplicated.
+    The duplicate-emission problem this used to handle inline now lives in
+    `pending_reviews`, and the `review_configs` name lookup in
+    `allowed_decisions_by_tool` — both because the web UI needs the identical rules.
     """
     by_interrupt: dict[str, list[dict[str, Any]]] = {}
-    for interrupt in interrupts:
-        value = getattr(interrupt, "value", interrupt)
-        interrupt_id = getattr(interrupt, "id", None)
-        if not isinstance(value, dict) or interrupt_id is None:
-            continue
-        if interrupt_id in by_interrupt:
-            # THE SAME INTERRUPT, TWICE. With `subgraphs=True` an interrupt raised inside
-            # a subagent is emitted at the subagent's namespace AND again, bubbled, at
-            # the root — same `Interrupt.id`, two chunks. Prompting per occurrence would
-            # ask the human to approve one researcher's `write_file` twice, and (since
-            # this dict is keyed by id) silently keep only the second answer. Approval
-            # fatigue is exactly how a gate stops being a gate.
-            #
-            # Deduped HERE, in the function that does the prompting, rather than in the
-            # caller — the invariant is "one prompt per pending action", and it should
-            # hold however this is called. `evals/harness._approve_all` is immune to the
-            # same duplication only by accident: it writes into a dict keyed by id
-            # without asking anyone anything, so a duplicate is idempotent.
-            continue
-        allowed_by_tool = {
-            config["action_name"]: config["allowed_decisions"]
-            for config in value.get("review_configs", [])
-            if config.get("action_name") and config.get("allowed_decisions")
-        }
+    for interrupt_id, value in pending_reviews(interrupts):
+        allowed_by_tool = allowed_decisions_by_tool(value)
         decisions = [
             _prompt_decision(request, allowed_by_tool.get(request.get("name")))
             for request in value.get("action_requests", [])
@@ -596,6 +712,46 @@ class ActivityFeed:
         self._printed.add(key)
         return True
 
+    def _emit(self, event: FeedEvent) -> None:
+        """Render one event to the terminal — the ONLY method a front end overrides.
+
+        Everything above this line decided *whether* an event happened and what it
+        says; this decides what it looks like. `webui.StreamlitFeed` replaces this
+        method and inherits every rule in `absorb`, which is the point (see
+        `FeedEvent`).
+
+        The strings are load-bearing in one narrow sense: `TestActivityFeed` asserts
+        on them verbatim, so a subclass that renders differently is fine but an edit
+        that reworders *these* is a test change too.
+        """
+        if event.kind == "plan":
+            count = len(event.items)
+            print(f"\n  ✎ plan · {count} item{'s' if count != 1 else ''}")
+            for index, item in enumerate(event.items, 1):
+                print(f"      {index}. {item}")
+        elif event.kind == "refusal":
+            print(f"  ! researcher · {event.text}")
+        elif event.kind == "delegate":
+            print(f"  → researcher · {_one_line(event.text, 90)}")
+        elif event.kind == "search":
+            # Subagent searches are indented under the delegation they belong to.
+            indent = "  " if event.is_orchestrator else "      "
+            print(f'{indent}⌕ "{_one_line(event.text, 80)}"')
+        elif event.kind == "read":
+            print(f"  ▸ reading {event.text}")
+        elif event.kind == "rejected":
+            print(f"  ✗ {event.text} — rejected, as you asked")
+        elif event.kind == "failed":
+            print(f"  ! {event.text} failed: {_one_line(event.detail, 100)}")
+        elif event.kind == "listed":
+            print(f"  ⌕ {event.text} · {event.detail}")
+        elif event.kind == "done":
+            print(
+                f"  ✓ researcher · {_one_line(event.text, 90)}"
+                if event.text
+                else "  ✓ researcher"
+            )
+
     def _render_plan(self, todos: list[Any]) -> None:
         # `write_todos` returns a Command that updates the `todos` channel, so the whole
         # list arrives in the chunk — no need to parse the tool call.
@@ -604,9 +760,7 @@ class ActivityFeed:
         # but a plan the agent genuinely revised is a different list, and worth showing.
         if not items or not self._once(f"plan:{items}"):
             return
-        print(f"\n  ✎ plan · {len(items)} item{'s' if len(items) != 1 else ''}")
-        for index, item in enumerate(items, 1):
-            print(f"      {index}. {item}")
+        self._emit(FeedEvent("plan", items=tuple(items)))
 
     def _render_message(self, namespace: tuple[str, ...], message: Any) -> None:
         is_orchestrator = not namespace
@@ -644,7 +798,7 @@ class ActivityFeed:
         """
         note = _refusal_note(message)
         if note and self._once(f"refusal:{namespace}"):
-            print(f"  ! researcher · {note}")
+            self._emit(FeedEvent("refusal", text=note))
 
     def _render_call(self, call: dict[str, Any], is_orchestrator: bool) -> None:
         name = call.get("name")
@@ -657,15 +811,20 @@ class ActivityFeed:
             # the orchestrator wrote, and it becomes the researcher's only message.
             description = args.get("description", "?")
             self._task_descriptions[call.get("id", "")] = description
-            print(f"  → researcher · {_one_line(description, 90)}")
+            self._emit(FeedEvent("delegate", text=description))
         elif name == "tavily_search":
             # Announced at CALL time, not on the result: the query is the informative
             # part and this keeps the feed live. It also means never touching the
             # ToolMessage body, which for a search is multiple KB of serialized results.
-            indent = "  " if is_orchestrator else "      "
-            print(f'{indent}⌕ "{_one_line(args.get("query", "?"), 80)}"')
+            self._emit(
+                FeedEvent(
+                    "search",
+                    text=args.get("query", "?"),
+                    is_orchestrator=is_orchestrator,
+                )
+            )
         elif name == "read_file" and is_orchestrator:
-            print(f"  ▸ reading {args.get('file_path', '?')}")
+            self._emit(FeedEvent("read", text=args.get("file_path", "?")))
         elif name == "ls" and is_orchestrator:
             # Remember what it listed, so the result line can name it. `ls` takes an
             # arbitrary `path`; hardcoding "/memories/" would be a guess, and it is the
@@ -686,9 +845,11 @@ class ActivityFeed:
             if name in self._declined:
                 # Not a failure — the human rejected it, and the middleware reports that
                 # to the model as an `status="error"` ToolMessage. See `note_declined`.
-                print(f"  ✗ {name} — rejected, as you asked")
+                self._emit(FeedEvent("rejected", text=str(name)))
             else:
-                print(f"  ! {name} failed: {_one_line(_text_of(message), 100)}")
+                self._emit(
+                    FeedEvent("failed", text=str(name), detail=_text_of(message))
+                )
             return
 
         if name == "ls" and is_orchestrator:
@@ -712,18 +873,14 @@ class ActivityFeed:
                 count = f"{len(entries)} file(s)" if entries else "empty"
             else:
                 count = "?"
-            print(f"  ⌕ {path} · {count}")
+            self._emit(FeedEvent("listed", text=path, detail=count))
         elif name == "task":
             # The one honest way to name a researcher: recover the sub-question from the
             # `task` call this result answers. Its stream namespace cannot be bound back
             # to that call without assuming dispatch order matches emission order under
             # concurrency, so we don't pretend to.
             description = self._task_descriptions.get(call_id)
-            print(
-                f"  ✓ researcher · {_one_line(description, 90)}"
-                if description
-                else "  ✓ researcher"
-            )
+            self._emit(FeedEvent("done", text=description or ""))
 
 
 def _one_line(text: Any, limit: int) -> str:
@@ -765,19 +922,11 @@ def _declined_tools(
 
     `_collect_decisions` returns one decision per `action_request`, in order, within each
     interrupt — so zipping the two back together recovers which *tool* each decision was
-    about. Deduped by interrupt id for the same reason `_collect_decisions` is: a
-    subagent's interrupt arrives twice.
+    about. `pending_reviews` supplies the same deduplication it does, for the same
+    reason: a subagent's interrupt arrives twice.
     """
     declined: set[str] = set()
-    seen: set[str] = set()
-    for interrupt in interrupts:
-        interrupt_id = getattr(interrupt, "id", None)
-        if interrupt_id is None or interrupt_id in seen:
-            continue
-        seen.add(interrupt_id)
-        value = getattr(interrupt, "value", None)
-        if not isinstance(value, dict):
-            continue
+    for interrupt_id, value in pending_reviews(interrupts):
         requests = value.get("action_requests", [])
         decisions = by_interrupt.get(interrupt_id, [])
         for request, decision in zip(requests, decisions, strict=False):
@@ -834,13 +983,13 @@ def _export(agent: Any, config: dict[str, Any], thread_id: str, target: str) -> 
     convenient path would put subagent-internal text into the user's file and drift the
     export away from both the terminal output and the eval's graded `response`.
     """
-    text = render_thread(agent.get_state(config).values)
-    if not text:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    document = export_markdown(agent.get_state(config).values, thread_id, stamp)
+    if not document:
         print("! nothing to export — this thread has no answers yet.")
         return
 
     named = bool(target)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     # `expanduser`, because `/export ~/report.md` is the obvious thing to type and no
     # shell expanded it for us — the path arrived as the literal string `~/report.md`.
     # Without this it fails with a bare ENOENT (or, if a stray `~` directory exists in
@@ -852,18 +1001,11 @@ def _export(agent: Any, config: dict[str, Any], thread_id: str, target: str) -> 
         print(f"! {path} already exists — pass an explicit path to overwrite.")
         return
 
-    header = (
-        f"# Deep research — thread `{thread_id}`\n\n"
-        f"*Model: `{MODEL_NAME}`. Exported {stamp}.*\n"
-        # "Exported", not "answered": the messages carry no timestamps, and the only
-        # per-turn clock lives in the checkpointer's snapshots. A date we did not
-        # measure is a date we invented.
-    )
     try:
         # Explicit encoding, always: the default is locale-dependent, and a real report
         # is full of em-dashes. Failing on the one machine the user cannot debug is not
         # a hypothetical. Caught here, not by main's turn-scoped `except`.
-        path.write_text(f"{header}\n{text}\n", encoding="utf-8")
+        path.write_text(document, encoding="utf-8")
     except OSError as exc:
         print(f"! export failed: {exc}")
         return

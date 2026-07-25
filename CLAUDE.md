@@ -7,10 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
 (currently v0.6.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
-`agent.py` (~130 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
-(~320 lines, the largest module here) — the human-in-the-loop interrupt/resume
-protocol that wiring implies. `config.py`, `tools.py`, and `subagents.py` are
-genuinely small support modules.
+`agent.py` (~220 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
+(~1130 lines, by far the largest module here) — the human-in-the-loop
+interrupt/resume protocol that wiring implies, plus every rule about what a user may
+be shown. `webui.py` (~390) and `streamlit_app.py` (~260) are the browser front end,
+and they are mostly *reuse* of `cli.py` rather than new logic. `config.py`, `tools.py`,
+and `subagents.py` are genuinely small support modules.
+
+**Three front doors, one builder.** `python -m deep_research` (terminal),
+`streamlit run streamlit_app.py` (browser), and `langgraph dev` (HTTP server) all
+assemble the agent through `agent.build_agent()`, so a tool or subagent added there
+appears in all three in one edit. They differ only in persistence and presentation.
 
 ## Commands
 
@@ -18,6 +25,7 @@ genuinely small support modules.
 uv sync                          # install deps + the project itself (editable) into ./.venv
 uv run python -m deep_research   # run the interactive REPL (the CLI front door)
 uv run --group serve langgraph dev  # serve the SAME agent over HTTP for Studio / deep-agents-ui
+uv run --group ui streamlit run streamlit_app.py   # the SAME agent in a browser (port 8501)
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
@@ -55,9 +63,11 @@ uv run ty check                  # type check (Astral's ty)
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
   gate, the Opus 5 no-sampling / thinking-not-disabled invariants, the `/memories/`
   route and its store
-  namespace, deepagents 0.7.0 backend readiness, and the `langgraph dev`
+  namespace, deepagents 0.7.0 backend readiness, the `langgraph dev`
   served-graph assembly — it must build with **no** local checkpointer/store yet
-  keep the same gate), not the agent's LLM output —
+  keep the same gate — and, in `test_webui.py`, that the browser front end still
+  *reuses* `cli.py`'s rules rather than having drifted into its own copy of them),
+  not the agent's LLM output —
   that half lives in `evals/` (see *Evaluating it*, below). Tests
   use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
   marker is registered and **deselected by default** (`addopts = -m 'not live'`);
@@ -354,6 +364,107 @@ compiles), `test_served_graph_delegates_to_the_shared_builder` (it routes throug
 yet the SAME `GATED_TOOLS` / `SYSTEM_PROMPT` / `backend` **objects** *and* a
 non-empty tool/subagent set — identity checks, so a divergent second assembly goes
 red).
+
+### The third front door: the browser (`streamlit_app.py` + `webui.py`)
+
+`uv run --group ui streamlit run streamlit_app.py`. Same agent, same
+`.deep_research/` databases, same threads as the REPL — a thread started in one
+continues in the other, because both go through `open_agent()`. It adds no behaviour;
+it is a second *renderer*, and the discipline that keeps it that way is worth stating
+plainly: **every rule about what a user may be shown is imported from `cli.py`, never
+restated.**
+
+**The `FeedEvent` / `_emit` seam is the load-bearing part, and it exists because of a
+measured history.** `ActivityFeed.absorb`'s logic — dedupe on tool-call ids, skip
+updates carrying a `RemoveMessage`, orchestrator-only plan and `ls`, never a word of a
+researcher's prose — already existed **twice** in this repo (here and in
+`evals/harness.TurnRecorder`), and the *same* call-id dedupe bug was found and fixed in
+both, separately. A third hand-written copy for the web was not an option. So
+`ActivityFeed` now decides *what happened* and emits a `FeedEvent`; `_emit` decides how
+it looks. The terminal strings are unchanged (`TestActivityFeed` asserts them verbatim),
+and `webui.StreamlitFeed` overrides `_emit` **alone**.
+
+Consequence for editing: a new feed line is a new `FeedEvent` kind plus a branch in
+**both** renderers. Both are if/elif chains that draw *nothing* for an unknown kind — no
+exception, no failing test, just a line that silently stops appearing in one front end.
+`cli.FEED_KINDS` is the canonical list and
+`test_webui.py::test_every_feed_kind_is_rendered_by_both_front_ends` checks both against
+it, parametrized per kind.
+
+**A turn is a state machine spread across reruns.** Streamlit re-executes the script
+top to bottom on every interaction, but a research turn pauses mid-flight for approval,
+so the turn cannot live in one pass. Four `st.session_state` keys carry it — `payload`
+(the next thing to send: a question or a `Command(resume=…)`), `question`, `feed`, and
+`pending` — and together they unroll `cli.main`'s `while pending := _stream_turn(...)`
+loop across reruns instead of iterations. `_stream_turn` itself is **imported, not
+reimplemented**, so the drain-then-prompt rule holds identically: an interrupt chunk does
+not end the stream, and pausing mid-iteration would freeze the Pregel loop and cancel a
+running researcher's already-paid-for searches.
+
+Two things follow that are easy to get wrong:
+
+- **The feed object lives in session state, not the container.** `StreamlitFeed._emit`
+  writes to whatever container is *ambient* and stores no reference, so it survives
+  reruns; but its seen-set and its event list must persist for the whole turn, or an
+  approval replays lines the user already watched appear. `replay()` redraws them,
+  because a rerun discards everything previously drawn — and the **approval screen
+  replays them too**. Found live: an approval is a rerun, so the `st.status` box is
+  gone by the time the form appears, and the first build asked the reviewer to allow a
+  `write_file` having just lost sight of every search that produced it. The gate is
+  only worth having if the person at it can see what led there.
+- **The answer still comes from the checkpoint.** The transcript is
+  `thread_sections(agent.get_state(config).values)` — the shared half of `render_thread`,
+  which `/export` and `evals/harness.py` also use. Building bubbles from stream chunks
+  would leak subagent prose into the UI and make the citation metrics fiction. Same rule
+  as the REPL, and the stream being right there in hand is exactly why it needs saying.
+
+**Deliberate divergences from the CLI, all in the safer direction.** `decision_controls`
+has **no default selection** — the REPL defaults to approve because bare Enter has to
+mean something, and a UI has no such affordance, so an explicit click costs nothing and
+removes the one path by which a gate degrades into a rubber stamp. Approval previews are
+**not elided** at `PREVIEW_LINES`: `st.code` scrolls, and an elided review is one that
+gets rubber-stamped. Choosing *edit* prefills the real arguments, because a reviewer who
+must retype the whole args dict will approve as-is instead. The CLI's "typo is not
+consent" rule is preserved — unparsable JSON yields no decision and disables submit.
+
+**`MEMORY_ROUTE` exists because `CompositeBackend` strips the route prefix before
+delegating.** A note the agent wrote to `/memories/pricing.md` is stored under the Store
+key `/pricing.md`, so a memory browser displaying raw keys shows a path that does not
+exist — in the one view whose whole subject is where findings are kept. `agent.py` now
+exports the prefix as a constant used by both the route itself and `webui.memory_files`,
+so they cannot drift.
+
+**`st.cache_resource` must retain the `ExitStack`, not just the agent.** `open_agent()`
+is a `@contextmanager` holding two live sqlite connections inside a `with closing(...)`;
+the stack owns the only reference to that generator. Return the agent alone and the stack
+is garbage collected, the generator finalized, and the agent left holding two *closed*
+connections — surfacing much later as an unrelated-looking sqlite error. Both backends
+are opened `check_same_thread=False` with a `threading.Lock`, so sharing one agent across
+Streamlit's per-session script threads is fine; two concurrent turns on the same
+`thread_id` are not, which is why the page disables input while a turn is in flight.
+
+**CI installs the `ui` group; it does not install `serve`.** Not an inconsistency — the
+difference is first-party code. Nothing in this repo imports `langgraph-cli`, so there is
+nothing in `serve` for lint/ty/pytest to check. `webui.py` and `streamlit_app.py` are
+ours, and `uv sync` is an *exact* sync, so a bare one uninstalls streamlit and `ty` then
+fails both files with `unresolved-import`. `tests/test_webui.py` also guards its import
+with `pytest.importorskip("streamlit")` — that keeps a partial local install working, but
+a suite that silently skips in CI protects nothing, hence the group.
+
+**Widget behaviour is tested with `streamlit.testing.v1.AppTest`**, which runs a script
+headless and exposes the elements it produced (`AppTest.from_string`, then
+`.button_group[0].set_value("approve").run()`). It is the only way to assert the thing
+that actually matters about the approval UI. Two lessons from writing those tests, both
+found by breaking the source to check the test bit:
+
+- **Assert `not script.exception`.** Dropping the dedupe in `pending_reviews` still
+  passed a "one set of controls" assertion, because the duplicate render raises
+  `StreamlitDuplicateElementKey` (both occurrences compute the widget key `i1:0:type`)
+  and never adds its element. The page was broken and the count was still one.
+- **An aggregate assertion over things that are not one-to-one cannot detect a single
+  omission.** The kind-coverage test began as `len(markdown) >= len(FEED_KINDS)` across
+  all kinds at once; `plan` draws two elements, so the totals had exactly one element of
+  slack and it absorbed exactly one deleted branch. Parametrizing per kind fixed it.
 
 ## Orchestrator ↔ subagent model
 
@@ -755,6 +866,14 @@ doesn't configure X" is not evidence that X is unconfigured — grep the install
   — the server provides them, so don't add them back; keep `langgraph.json`'s graph
   value a module path (not a file path) pointing at the compiled `graph` (not the
   `build_graph` factory).
+- **Change what the browser shows** → `deep_research/webui.py` for rendering and the
+  approval widgets, `streamlit_app.py` for the page's sequence and the rerun state
+  machine. A new feed line needs a `FeedEvent` kind in `cli.FEED_KINDS` **and** a branch
+  in both `ActivityFeed._emit` and `webui.render_event` (see *The third front door*).
+  Theme lives in `.streamlit/config.toml`, which defines **both** `[theme.light]` and
+  `[theme.dark]` on purpose: a bare `[theme]` locks the app to one mode and removes the
+  toggle, and this app's output is long-form prose whose reading mode is the reader's
+  call. Don't reach for CSS injection — native elements and that file first.
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
   `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`. All three are resolved into
   module-level constants at *import* time, so they must be set before

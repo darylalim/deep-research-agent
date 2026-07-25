@@ -16,6 +16,7 @@ files or running commands.
 | **Persistent memory** | `SqliteStore` behind a `/memories/` route (cross-session) | `deep_research/agent.py` |
 | **Durable thread state + interrupts** | `SqliteSaver` checkpointer (survives restarts) | `deep_research/agent.py` |
 | **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `execute` | `deep_research/agent.py` + `cli.py` |
+| **Browser UI** | Streamlit chat with a live work log and in-page approvals | `streamlit_app.py` + `deep_research/webui.py` |
 | **Observability** | LangSmith tracing via env vars | `.env` |
 
 ### The persistence model (two layers)
@@ -76,6 +77,33 @@ In-session commands: `/help`, `/thread <id>` (switch conversations), `/exit`.
 Because state is persistent, quitting and re-running `python -m deep_research`
 resumes the `main` thread exactly where you left off — including a pending
 approval.
+
+## Run it in the browser (optional)
+
+```bash
+uv run --group ui streamlit run streamlit_app.py   # http://localhost:8501
+```
+
+The same agent, same threads, same `.deep_research/` databases — the REPL and the
+browser are two views of one conversation, so a thread you start in one continues in
+the other. What the browser adds is room the terminal doesn't have:
+
+- **A per-answer work log.** The plan, each delegated sub-question and every search
+  query, collapsed into an expander under the answer it produced.
+- **Readable approvals.** A `write_file` shows its full contents in a scrolling code
+  block — the terminal elides at 40 lines, and an elided review is one that gets
+  rubber-stamped. Choosing *edit* prefills the real arguments so narrowing a path is an
+  edit rather than a retype.
+- **A memory browser.** Everything under `/memories/`, read straight from the Store.
+- **Export** as a markdown download — the same bytes `/export` writes.
+
+Nothing about *what the agent is* lives here: `streamlit_app.py` is a page script, and
+`deep_research/webui.py` imports its display rules from `cli.py` rather than restating
+them (`StreamlitFeed` subclasses `ActivityFeed` and overrides rendering only). Add a
+tool or subagent in `agent.py` and all three front doors gain it.
+
+The `ui` dependency group is kept out of the default install, so `uv run --group ui`
+pulls it in on demand.
 
 ## Serve it over HTTP (optional)
 
@@ -146,7 +174,10 @@ deep_research/
 ├── agent.py        # build_agent() assembles the agent; open_agent() adds disk persistence
 ├── graph.py        # langgraph dev / Studio / web-UI entry point (server owns persistence)
 ├── cli.py          # interactive REPL + human-in-the-loop resume loop
+├── webui.py        # Streamlit rendering + approval widgets (reuses cli.py's rules)
 └── __main__.py     # `python -m deep_research`
+streamlit_app.py    # `streamlit run streamlit_app.py` — the browser front door
+.streamlit/         # theme (light AND dark, so the mode stays the reader's choice)
 langgraph.json      # registers the `research` graph for `langgraph dev`
 ```
 
@@ -161,6 +192,12 @@ langgraph.json      # registers the `research` graph for `langgraph dev`
   to restrict the available decisions per tool.
 - **Go to production memory** — swap `SqliteStore` for `PostgresStore` (and
   `SqliteSaver` for a Postgres checkpointer) in `agent.py`.
+- **Change what the browser UI shows** — `deep_research/webui.py`. A new kind of feed
+  line means a new `FeedEvent` kind emitted by `cli.ActivityFeed` *plus* a branch in
+  both `ActivityFeed._emit` (terminal) and `webui.render_event` (browser). Both are
+  if/elif chains that draw nothing for a kind they don't know, so `cli.FEED_KINDS` is
+  the list they are checked against and `tests/test_webui.py` goes red if either is
+  missed.
 
 ## License
 
