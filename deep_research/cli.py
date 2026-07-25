@@ -72,6 +72,74 @@ def _text_of(message: Any) -> str:
     return str(content)
 
 
+def _this_turn(messages: list[Any]) -> list[Any]:
+    """Everything after the last human message — one turn's worth of the thread.
+
+    Factored out so `render_turn` and `_turn_refusal` slice the thread the *same* way.
+    They must: the refusal note and the answer are printed side by side, and a note
+    scoped to a different span than the prose it annotates would report last turn's
+    refusal above this turn's answer.
+    """
+    start = 0
+    for index, message in enumerate(messages):
+        if getattr(message, "type", None) == "human":
+            start = index + 1
+    return list(messages[start:])
+
+
+def _refusal_note(message: Any) -> str | None:
+    """A printable phrase if this assistant message is a classifier refusal, else None.
+
+    Opus 5 can end a generation with `stop_reason="refusal"`: **HTTP 200, no exception,
+    and empty content.** So it costs tokens, raises nothing, and arrives here looking
+    exactly like a turn where the model had nothing to say — `render_turn` finds no
+    prose and the REPL printed `(the agent said nothing)`. That is true and useless; it
+    reads as a bug in this code rather than a decision by the model, and the user has no
+    reason to suspect rephrasing would help.
+
+    **Branch on `stop_reason`, never on `stop_details`.** `langchain_anthropic` copies
+    `stop_reason` into `response_metadata` and drops `stop_details` entirely — grep it:
+    `chat_models.py` names `stop_reason` three times and `stop_details` not once. So the
+    refusal *category* is not available at this layer and must not be invented; the
+    branch below is defensive, for the day langchain starts passing the field through.
+    Saying "the model declined" is honest; naming a category we never received is not.
+
+    That defensive branch reads **`category`**, which is the field the SDK actually
+    defines — `anthropic/types/refusal_stop_details.py`: `RefusalStopDetails` is
+    `{type: "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|None,
+    explanation: str|None}`. Getting that key wrong is invisible precisely *because* the
+    branch is dead, so read it off the installed SDK rather than guessing from the
+    surrounding key names. `explanation` is deliberately unused: the SDK documents it as
+    "not guaranteed to be stable", and an unstable string is not something to put in front
+    of a user as the reason their question was refused.
+    """
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict) or metadata.get("stop_reason") != "refusal":
+        return None
+    details = metadata.get("stop_details")
+    category = details.get("category") if isinstance(details, dict) else None
+    return (
+        f"the model declined this request ({category})"
+        if isinstance(category, str) and category
+        else "the model declined this request"
+    )
+
+
+def _turn_refusal(result: dict[str, Any]) -> str | None:
+    """The refusal note for this turn, if any assistant message this turn carried one.
+
+    The first one, not all of them: a turn that refuses twice refused for one reason,
+    and two identical lines above the answer is noise. Read from the checkpoint rather
+    than the stream, for the same reason `render_turn` is — `main` has the final state
+    in hand there, and a mid-stream refusal that the orchestrator then recovered from
+    would still be recorded in it.
+    """
+    for message in _this_turn(result.get("messages", [])):
+        if getattr(message, "type", None) == "ai" and (note := _refusal_note(message)):
+            return note
+    return None
+
+
 def render_turn(result: dict[str, Any]) -> str:
     """Everything the agent said this turn, in order — not only its last message.
 
@@ -88,15 +156,9 @@ def render_turn(result: dict[str, Any]) -> str:
     user was shown any sources must grade exactly what the CLI prints, or the two drift
     and the metric becomes fiction.
     """
-    messages = result.get("messages", [])
-    start = 0
-    for index, message in enumerate(messages):
-        if getattr(message, "type", None) == "human":
-            start = index + 1
-
     texts = [
         text
-        for message in messages[start:]
+        for message in _this_turn(result.get("messages", []))
         if getattr(message, "type", None) == "ai"
         and (text := _text_of(message).strip())
     ]
@@ -551,10 +613,38 @@ class ActivityFeed:
         kind = getattr(message, "type", None)
 
         if kind == "ai":
+            if not is_orchestrator:
+                self._render_refusal(namespace, message)
             for call in getattr(message, "tool_calls", None) or []:
                 self._render_call(call, is_orchestrator)
         elif kind == "tool":
             self._render_result(message, is_orchestrator)
+
+    def _render_refusal(self, namespace: tuple[str, ...], message: Any) -> None:
+        """Say so when a *researcher* is stopped by Anthropic's classifiers.
+
+        SUBAGENT ONLY — the caller enforces that. An orchestrator refusal is reported by
+        `main`, from the checkpoint, exactly where the missing answer would have been;
+        printing it here as well would say it twice.
+
+        A researcher's refusal is otherwise completely INVISIBLE. It ends that subagent's
+        turn with empty content, so the `task` result comes back thin and the
+        orchestrator synthesizes around the hole. The user watches a delegation get
+        dispatched, watches it complete, and reads a thinner answer than they asked for,
+        with nothing anywhere saying why.
+
+        Keyed on the NAMESPACE — coarser than this class's call-id rule, deliberately. A
+        refusal carries no tool call, and `BaseMessage.id` is precisely the unreliable
+        key the class docstring warns about (`None` on the first pass, a fresh uuid on
+        the resume), so it is the only stable key available. The cost is that two
+        distinct refusals inside one researcher collapse to one line — the same
+        deliberate imprecision as `note_declined` being name-level rather than
+        call-level, and it errs toward under-reporting a repeat, never toward inventing
+        an event.
+        """
+        note = _refusal_note(message)
+        if note and self._once(f"refusal:{namespace}"):
+            print(f"  ! researcher · {note}")
 
     def _render_call(self, call: dict[str, Any], is_orchestrator: bool) -> None:
         name = call.get("name")
@@ -878,8 +968,20 @@ def main() -> None:
             # renders its graded `response` with this same call for exactly that reason,
             # so building the printed answer any other way makes the citation metrics
             # fiction. The feed shows *actions*; the answer comes from state.
-            answer = render_turn(agent.get_state(config).values)
-            print(f"\nagent > {answer}" if answer else "\n(the agent said nothing)")
+            values = agent.get_state(config).values
+            answer = render_turn(values)
+            # A classifier refusal is a 200 with empty content — no exception, so it
+            # arrives here indistinguishable from a turn where the model had nothing to
+            # say, and the bare `(the agent said nothing)` below reported the agent's own
+            # decision as an apparent bug in this REPL. Printed BEFORE the answer, and
+            # not instead of it: a turn can refuse one branch and still answer, in which
+            # case the note explains why the answer is thinner than the question.
+            if refusal := _turn_refusal(values):
+                print(f"\n! {refusal} — rephrasing or narrowing it usually helps.")
+            if answer:
+                print(f"\nagent > {answer}")
+            elif not refusal:
+                print("\n(the agent said nothing)")
 
 
 if __name__ == "__main__":

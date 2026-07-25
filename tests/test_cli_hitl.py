@@ -1136,3 +1136,121 @@ class TestActivityFeed:
         # one traversal, not two.
         feed = ActivityFeed()
         assert feed.absorb((), {"__interrupt__": (PENDING_WRITE,)}) == [PENDING_WRITE]
+
+
+REFUSAL = AIMessage(content="", response_metadata={"stop_reason": "refusal"})
+
+
+class TestRefusalIsReported:
+    """A classifier refusal must not reach the user as silence.
+
+    `stop_reason="refusal"` is HTTP 200 with empty content: nothing raises, nothing is
+    logged, and the message lands in the checkpoint carrying no prose. `render_turn`
+    then returns `''` and the REPL printed `(the agent said nothing)` — which describes
+    the symptom while hiding the cause, and reads as a bug in this code rather than a
+    decision the model made.
+    """
+
+    def test_a_researchers_refusal_is_surfaced_in_the_feed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Otherwise invisible: the subagent's turn ends with empty content, the `task`
+        # result comes back thin, and the orchestrator synthesizes around the hole. The
+        # user sees a delegation dispatched, a delegation completed, and a shorter answer
+        # than they asked for, with nothing anywhere saying why.
+        feed = ActivityFeed()
+        feed.absorb(SUBAGENT_NS, _updates("model", REFUSAL))
+        assert (
+            "! researcher · the model declined this request" in capsys.readouterr().out
+        )
+
+    def test_the_orchestrators_refusal_is_not_printed_twice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `main` reports it from the checkpoint, right where the missing answer would
+        # have been — so the feed must stay quiet at the root namespace.
+        feed = ActivityFeed()
+        feed.absorb((), _updates("model", REFUSAL))
+        assert capsys.readouterr().out == ""
+
+    def test_one_researcher_refusing_is_reported_once(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Same replay hazard as every other feed line: a resumed superstep re-emits the
+        # cached writes of siblings that already succeeded. The usual call-id key is
+        # unavailable (a refusal carries no tool call) and `BaseMessage.id` is the
+        # unreliable key this class already learned not to trust — `None` on the first
+        # pass, a fresh uuid on the resume — so the namespace is the key.
+        feed = ActivityFeed()
+        feed.absorb(SUBAGENT_NS, _updates("model", REFUSAL))
+        feed.absorb(SUBAGENT_NS, _updates("model", REFUSAL))
+        assert capsys.readouterr().out.count("declined this request") == 1
+
+    def test_two_researchers_refusing_are_both_reported(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The dedupe must not collapse distinct subagents: two researchers fanned out in
+        # one turn are two separate refusals and two separate gaps in the answer.
+        feed = ActivityFeed()
+        feed.absorb(SUBAGENT_NS, _updates("model", REFUSAL))
+        feed.absorb(("tools:0a1b2c3d",), _updates("model", REFUSAL))
+        assert capsys.readouterr().out.count("declined this request") == 2
+
+    def test_an_ordinary_researcher_message_prints_no_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The feed prints ACTIONS, never prose — this must not become the exception that
+        # starts leaking a subagent's words to the user.
+        feed = ActivityFeed()
+        feed.absorb(SUBAGENT_NS, _updates("model", AIMessage("my cited findings")))
+        out = capsys.readouterr().out
+        assert "declined" not in out
+        assert "my cited findings" not in out
+
+    def test_main_explains_the_refusal_instead_of_saying_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # End to end through the real turn loop. The checkpoint holds a refusal and no
+        # prose — precisely the state that used to produce `(the agent said nothing)`.
+        agent = _FakeAgent(
+            messages=[HumanMessage("something disallowed"), REFUSAL], rounds=[[]]
+        )
+        _drive(monkeypatch, agent, "something disallowed", "/exit")
+        out = capsys.readouterr().out
+
+        assert "the model declined this request" in out
+        assert "the agent said nothing" not in out
+
+    def test_a_refused_branch_does_not_suppress_the_answer(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The note is printed BESIDE the answer, not instead of it. A turn that refuses
+        # one branch and answers on another must still show the report — that is the same
+        # "never discard prose the agent already wrote" rule as `_print_unfinished_turn`.
+        agent = _FakeAgent(
+            messages=[HumanMessage("q"), REFUSAL, AIMessage(REPORT)], rounds=[[]]
+        )
+        _drive(monkeypatch, agent, "q", "/exit")
+        out = capsys.readouterr().out
+
+        assert "the model declined this request" in out
+        assert REPORT in out
+
+    def test_an_ordinary_turn_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        agent = _FakeAgent(messages=[HumanMessage("q"), AIMessage(REPORT)], rounds=[[]])
+        _drive(monkeypatch, agent, "q", "/exit")
+        out = capsys.readouterr().out
+
+        assert "declined" not in out
+        assert REPORT in out
+
+    def test_a_genuinely_silent_turn_still_says_so(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The old message is still the right one when there really was nothing to show —
+        # the refusal branch must not swallow it.
+        agent = _FakeAgent(messages=[HumanMessage("q")], rounds=[[]])
+        _drive(monkeypatch, agent, "q", "/exit")
+        assert "(the agent said nothing)" in capsys.readouterr().out

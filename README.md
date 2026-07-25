@@ -98,7 +98,7 @@ keep CI lean; `uv run --group serve` pulls it in on demand.
 
 ```
 create_deep_agent(
-    model         = ChatAnthropic("claude-opus-4-8")   # no temperature — Opus 4.8 rejects it
+    model         = ChatAnthropic("claude-opus-5")     # no temperature — Opus 5 rejects it
     tools         = [tavily_search]                    # orchestrator can search directly
     subagents     = [researcher]                       # …or delegate breadth via `task`
     backend       = CompositeBackend(

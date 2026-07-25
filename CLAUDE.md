@@ -53,7 +53,8 @@ uv run ty check                  # type check (Astral's ty)
 - **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
-  gate, the Opus 4.8 no-sampling invariant, the `/memories/` route and its store
+  gate, the Opus 5 no-sampling / thinking-not-disabled invariants, the `/memories/`
+  route and its store
   namespace, deepagents 0.7.0 backend readiness, and the `langgraph dev`
   served-graph assembly — it must build with **no** local checkpointer/store yet
   keep the same gate), not the agent's LLM output —
@@ -368,16 +369,65 @@ red).
 
 ## Model constraint (real gotcha)
 
-The default model is `claude-opus-4-8`, built in `config.py::build_model()` **with
-no `temperature`/`top_p`/`top_k`** — Opus 4.8 returns a 400 if any sampling param
+The default model is `claude-opus-5`, built in `config.py::build_model()` **with
+no `temperature`/`top_p`/`top_k`** — Opus 5 returns a 400 if any sampling param
 is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
 accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
 has no `model` key — so the rule covers them too.
 
-`max_tokens` defaults to **32000** (`DEEP_RESEARCH_MAX_TOKENS`), and what makes that
-safe is **`streaming=True` on the model**, not anything about the CLI. The two are
-orthogonal and it is easy to conflate them:
+**`thinking={"type": "adaptive", "display": "summarized"}` — and `display` is the
+load-bearing half.** The thinking default *inverted* at Opus 5: omitting the parameter
+meant *no* thinking on Opus 4.8/4.7 and now runs adaptive thinking. So thinking is on
+either way. What is not survivable is Opus 5's default `display="omitted"`.
+
+**Measured against the real API, and it breaks ordinary turns — not just multi-turn
+threads.** Under `display="omitted"` a thinking block comes back as
+`{"signature": ..., "type": "thinking"}` with **no `thinking` text field**, so
+`langchain_anthropic` has nothing to send back when that message is replayed, and the
+next request dies:
+
+```
+400 messages.1.content.0.thinking.thinking: Field required
+```
+
+The reason this is fatal rather than cosmetic: **every tool result replays the assistant
+message that requested the call.** A research turn re-sends its own thinking block the
+instant `tavily_search` returns, so the very first delegation 400s. A/B measured on a
+thinking turn with 3 tool calls: `summarized` → replay OK; `omitted` → the 400 above.
+
+`display` controls visibility only — thinking is billed identically either way, so this
+costs nothing — and it never reaches the user, because `cli._text_of` collects bare
+strings and `{"type": "text"}` blocks, and a thinking block is neither.
+
+**A related shape change worth knowing about `_text_of`.** Once thinking is on, an
+assistant message's `content` is a *mixed* list: `["", {…thinking…}, "the answer"]` —
+the answer arrives as a **bare string element**, not a `{"type": "text"}` dict.
+`_text_of` already handles this (it has an `isinstance(block, str)` branch), which is
+the only reason `render_turn` / `/export` / the eval `response` survived this upgrade
+untouched. Do not "tidy" that branch away.
+
+**Never "save tokens" with `thinking={"type": "disabled"}`.** On Opus 5 that has a
+failure mode aimed squarely at this app: the model sometimes writes a tool call into
+its *visible text* instead of emitting a `tool_use` block. The turn completes normally,
+nothing raises, and the search simply never runs — worst on tool-heavy search
+workloads, which is the entire agent. In an agentic loop that bogus text also stays in
+the thread and skews later turns. (It can leak `<thinking>` tags into the answer too,
+and disabling is separately a 400 above `high` effort.) The supported cost lever is
+`output_config.effort`, not disabling.
+`test_config.py::test_thinking_is_adaptive_and_summarized_never_disabled` pins the whole
+payload shape and goes red on either edit — verified by making them.
+
+The cost of being explicit: this `thinking` shape is a 400 on pre-4.6 models, which want
+the removed `budget_tokens` form, so a `DEEP_RESEARCH_MODEL` override that far back has
+to drop the argument. Right trade — a broken default model beats a constrained override.
+
+`max_tokens` defaults to **64000** (`DEEP_RESEARCH_MAX_TOKENS`) — raised from 32000
+*because* of the above: on Opus 5 the ceiling covers **thinking plus the answer**, and
+this agent's answer is a long cited report. Too tight a ceiling truncates it
+mid-sentence with `stop_reason="max_tokens"` and no exception. What makes a ceiling
+this high safe is **`streaming=True` on the model**, not anything about the CLI. The
+two are orthogonal and it is easy to conflate them:
 
 - `streaming=True` flips the *model's own HTTP request* to SSE (`_should_stream()` →
   `_stream()` → `generate_from_stream()`), while still handing the graph one complete
@@ -398,9 +448,17 @@ would hang the REPL indefinitely, which is strictly worse than the failure the 1
 imagined to prevent.
 
 **Raise `max_tokens` and set `streaming=True` together, or neither.** Verified that
-streaming adds only `stream: true` to the payload, so the Opus 4.8 no-sampling-params rule
-is untouched. Two tests in `test_config.py` pin this: `_should_stream()` must be True, and
-the request payload must carry no sampling param. Note `streaming=False` passed
+streaming adds only `stream: true` to the payload, so the Opus 5 no-sampling-params rule
+is untouched. Four tests in `test_config.py` pin this cluster: `_should_stream()` must be
+True, the request payload must carry no sampling param, that payload's `thinking` key must
+be exactly `{"type": "adaptive", "display": "summarized"}` (this sentence used to say "and
+no `thinking` key" — the Opus 5 upgrade inverted it, and following the stale version would
+reintroduce the `thinking.thinking: Field required` 400 documented 80 lines above), and
+`MAX_TOKENS` must stay at or above 64k — asserted against the *shipped default*, which is
+why `tests/conftest.py` pops `DEEP_RESEARCH_MAX_TOKENS` rather than pinning it (it calls
+`load_dotenv()` first, so a developer's own spend cap in `.env` would otherwise fail an
+offline test they never touched — and the PostToolUse hook would then block every further
+edit). Note `streaming=False` passed
 *explicitly* would hard-disable streaming via `_streaming_disabled()`, so don't "be safe"
 by spelling out the default.
 
@@ -412,6 +470,52 @@ change to `build_model()`: a silently-cold cache roughly doubles the input cost 
 turn with no visible symptom. That test calls `agent.invoke()`, not the streaming CLI, which
 is also the cleanest demonstration that the model's wire format is independent of the graph's
 `stream_mode` — and that tool calls reassemble correctly from partial JSON deltas.
+
+**`stop_reason="refusal"` is the third silent stop, and it used to reach the user as
+`(the agent said nothing)`.** Opus 5 can have a generation stopped by Anthropic's
+classifiers: **HTTP 200, empty content, no exception.** So it bills, raises nothing, and
+lands in the checkpoint as an assistant message with no prose — which `render_turn`
+renders as `''`, and the REPL reported as silence. True, useless, and misattributed: it
+reads as a bug in `cli.py` rather than a decision by the model, and gives the user no
+reason to think rephrasing would help. `cli._refusal_note` / `_turn_refusal` now name it,
+and `ActivityFeed._render_refusal` covers the subagent case (a researcher's refusal is
+otherwise *completely* invisible — its `task` result just comes back thin and the
+orchestrator synthesizes around the hole).
+
+Three things about that code are load-bearing:
+
+- **Branch on `stop_reason`, never on `stop_details`.** Anthropic reports the refusal
+  *category* in `stop_details`, but `langchain_anthropic` never copies it into
+  `response_metadata` — grep `chat_models.py`: `stop_reason` appears three times,
+  `stop_details` not once. So the category is unavailable at this layer and the note must
+  stay category-free. `test_no_category_is_invented_when_langchain_does_not_supply_one`
+  pins that; the `stop_details` branch is defensive, for the day langchain passes it.
+  **Read that branch's key off the installed SDK, not off the surrounding names** —
+  `anthropic/types/refusal_stop_details.py` defines `RefusalStopDetails` as `{type:
+  "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|None,
+  explanation: str|None}`, so the policy name is under **`category`**. It first shipped
+  reading `details["refusal"]`, with a test pinning that same invented shape: because the
+  branch is *dead*, a wrong key and a right one are indistinguishable until the field
+  actually arrives, at which point the category is silently dropped. A dead branch's test
+  has to assert the real upstream contract or it asserts nothing. `explanation` stays
+  unused on purpose — the SDK documents it as "not guaranteed to be stable".
+- **The note prints *beside* the answer, not instead of it.** A turn can refuse one branch
+  and answer on another, and the note is what explains why the answer is thinner than the
+  question. Same rule as `_print_unfinished_turn`: never discard prose the agent wrote.
+- **`_this_turn` is shared with `render_turn` deliberately.** Note and answer print side by
+  side, so a note scoped to a wider span would caption this turn's answer with last turn's
+  refusal.
+
+The feed's dedupe key here is the **namespace**, not a call id — a refusal carries no tool
+call, and `BaseMessage.id` is the unreliable key the rest of this file warns about. Cost:
+two distinct refusals inside one researcher collapse to one line, the same deliberate
+imprecision as `note_declined` being name-level.
+
+Not implemented, deliberately: Anthropic's server-side `fallbacks` beta
+(`betas=["server-side-fallback-2026-07-01"]` + `model_kwargs={"fallbacks": "default"}`),
+which auto-retries a refused generation on another model. It works through `ChatAnthropic`
+(verified live), but silently swapping the model mid-research is a bigger behavior change
+than the problem warrants. Detection first; recovery is a separate decision.
 
 ## Prompt caching is already on — don't wire it again
 
@@ -439,14 +543,17 @@ turn re-writes its prefix. Leave it: the 1h TTL doubles the write multiplier
 
 `test_live.py::test_prompt_caching_actually_serves_the_prefix_from_cache` asserts the
 cache is genuinely *read* (`cache_read` > 0), not merely that the middleware is
-present — a prefix under Anthropic's 4096-token minimum would honor `cache_control`
-and still cache nothing. Measured, the system+tools prefix is **~11.9k tokens**, so
+present — a prefix under Anthropic's minimum cacheable size would honor `cache_control`
+and still cache nothing. That minimum is per-model and **not** monotonic across
+generations (512 tokens on Opus 5, 1024 on Opus 4.8, 4096 on Opus 4.6), so a
+`DEEP_RESEARCH_MODEL` override can move the bar without anything else changing.
+Measured, the system+tools prefix is **~11.9k tokens**, so
 it clears that bar with room to spare. The cache is keyed on the **prefix, not the
 thread**: a brand-new `thread_id` reads a prefix an earlier thread (or an earlier
 *process*) warmed. That is why the test runs two one-turn threads rather than two
 turns on one thread — an opening turn can't hit the sharp edge where invoking fresh
 input on a thread with a *pending HITL interrupt* resumes the model node on a message
-list ending in an assistant message, which Opus 4.8 rejects as prefill (400). `cli.py`
+list ending in an assistant message, which Opus 5 still rejects as prefill (400). `cli.py`
 never trips this because it loops on `__interrupt__` and resumes with `Command(resume=...)`
 instead of sending a new turn.
 
@@ -500,8 +607,9 @@ assumes otherwise:
   `ensure_isolated_state_dir` refuses any path that **is or contains** the live
   `.deep_research/`. If you touch any of these, keep the others.
 - **The judge is Haiku, not the app's Opus.** Grading is cheap classification, and Opus
-  4.8 400s on `temperature` — a judge wants `temperature=0`. Do not reuse
-  `config.build_model()` for it.
+  5 400s on `temperature` — a judge wants `temperature=0`. Do not reuse
+  `config.build_model()` for it. Opus 5 would also *think* on every grade, which is pure
+  cost on a classification call.
 
 The dataset (`evals/dataset.py`) is deliberately **reference-free**: examples carry a
 structural expectation (`min_delegations`) rather than a hand-written gold answer, because
@@ -542,8 +650,10 @@ it.** `create_deep_agent()` **appends** `BASE_AGENT_PROMPT` *after* your system 
 on recency. It opens with "The user can see your responses and tool outputs **in real
 time**" and closes with a `## Progress Updates` section: "For longer tasks, provide brief
 progress updates at reasonable intervals". No harness profile suppresses it — the registered
-ones are `claude-opus-4-7` / `sonnet-4-6` / `haiku-4-5`, so `claude-opus-4-8` gets an empty
-profile.
+ones are `claude-opus-4-7` / `sonnet-4-6` / `haiku-4-5` (plus three `gpt-5.x-codex`), so
+`claude-opus-5` gets an empty profile. Re-measured on the Opus 5 upgrade, since a
+registered profile would have made our override dead weight: still empty, so the override
+in `SYSTEM_PROMPT` is still load-bearing.
 
 Measured on a real REPL run: the agent printed **three paragraphs of stale narration** above
 its answer ("Let me first check memory", "Memory is empty", "Both subagents returned solid,

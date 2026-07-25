@@ -36,10 +36,11 @@ RESEARCH_ACTIONS = ("task", "tavily_search")
 URL = re.compile(r"https?://[^\s)\]>,]+")
 
 
-# The judge is Haiku, not the agent's own Opus 4.8, for two independent reasons:
+# The judge is Haiku, not the agent's own Opus 5, for two independent reasons:
 # grading is a cheap, high-volume classification task that does not need Opus, and
-# Opus 4.8 rejects `temperature` with a 400 — a judge wants `temperature=0`, so the
-# app's own `build_model()` is the wrong constructor to reuse here.
+# Opus 5 rejects `temperature` with a 400 — a judge wants `temperature=0`, so the
+# app's own `build_model()` is the wrong constructor to reuse here. (Opus 5 would
+# also think on every grade, which is pure cost for a classification call.)
 # The `ty: ignore` is the same false positive `config.py::build_model` carries: ty
 # builds the signature from the Pydantic aliases and does not model `populate_by_name`.
 JUDGE = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=1024)  # ty: ignore[unknown-argument, missing-argument]

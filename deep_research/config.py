@@ -16,13 +16,15 @@ from langchain_anthropic import ChatAnthropic
 load_dotenv()
 
 # --- Model -----------------------------------------------------------------
-# Default to Claude Opus 4.8, the current most-capable Opus-tier model.
-# IMPORTANT: Opus 4.8 rejects `temperature` / `top_p` / `top_k` with a 400.
-# `ChatAnthropic` omits those params when they are left unset, so we
-# deliberately construct the model without any sampling parameters.
-MODEL_NAME = os.environ.get("DEEP_RESEARCH_MODEL", "claude-opus-4-8")
-# 32k, and it is `streaming=True` below that makes that safe — see `build_model`.
-MAX_TOKENS = int(os.environ.get("DEEP_RESEARCH_MAX_TOKENS", "32000"))
+# Default to Claude Opus 5, the current most-capable Opus-tier model.
+# IMPORTANT: Opus 5 rejects `temperature` / `top_p` / `top_k` with a 400 — the same
+# rule that held on Opus 4.8, and the reason no sampling parameter is set anywhere
+# in this file. `ChatAnthropic` omits those params when they are left unset.
+MODEL_NAME = os.environ.get("DEEP_RESEARCH_MODEL", "claude-opus-5")
+# 64k, not 32k, because on Opus 5 `max_tokens` now has to cover the model's THINKING
+# as well as its answer — see the `thinking` note in `build_model`. `streaming=True`
+# is what makes a ceiling this high safe.
+MAX_TOKENS = int(os.environ.get("DEEP_RESEARCH_MAX_TOKENS", "64000"))
 
 
 def build_model() -> ChatAnthropic:
@@ -49,10 +51,51 @@ def build_model() -> ChatAnthropic:
     16k pin was imagined to prevent. Raise `max_tokens` and set `streaming=True`
     together, or neither.
 
-    Sampling params stay unset: Opus 4.8 returns a 400 on `temperature`/`top_p`/`top_k`,
+    Sampling params stay unset: Opus 5 returns a 400 on `temperature`/`top_p`/`top_k`,
     and `ChatAnthropic` omits what is unset. Verified that streaming adds only
     `stream: true` to the payload, so it does not disturb that invariant — nor prompt
     caching, which reports `cache_read` in the `message_delta` either way.
+
+    **`thinking` is set explicitly, and `display="summarized"` is load-bearing — it is
+    not a cosmetic choice.** Opus 5 *inverted* the old default: omitting the parameter
+    meant no thinking on Opus 4.8/4.7 and now runs adaptive thinking. So thinking is on
+    either way; what we cannot accept is Opus 5's default `display="omitted"`.
+
+    Measured, against the real API: under `display="omitted"` the thinking block comes
+    back carrying only `{"signature": ..., "type": "thinking"}` — **no `thinking` text
+    field at all** — and `langchain_anthropic` therefore has nothing to send back when
+    that message is replayed. The next request dies with
+
+        400 messages.1.content.1.thinking.thinking: Field required
+
+    This is not a multi-turn-only edge case, which is what makes it fatal here: *every
+    tool call replays the assistant message that requested it* alongside the tool result,
+    so a single research turn re-sends its own thinking block the moment `tavily_search`
+    returns. With `display="summarized"` the block carries real text, survives the round
+    trip, and the replay succeeds — verified end to end.
+
+    `display` controls visibility only: thinking happens and is billed identically either
+    way, so this costs nothing. It also never reaches the user — `cli._text_of` collects
+    bare strings and `{"type": "text"}` blocks, and a thinking block is neither.
+
+    Two more consequences, neither optional:
+
+    - **`MAX_TOKENS` had to go up.** `max_tokens` caps thinking *plus* the answer, so the
+      32k that comfortably held a cited report now has to hold the reasoning too. A tight
+      ceiling truncates mid-report with `stop_reason="max_tokens"` and no exception.
+    - **Do NOT "save tokens" by passing `thinking={"type": "disabled"}`.** On Opus 5 that
+      has a documented failure mode aimed squarely at this app: the model sometimes writes
+      a tool call into its *visible text* instead of emitting a `tool_use` block. The turn
+      succeeds, nothing raises, and the call simply never runs — worst on tool-heavy search
+      workloads, which is the whole agent. (It can also leak `<thinking>` tags into the
+      answer.) Lower `output_config.effort` is the supported cost lever; disabling is not.
+      Disabling is additionally a 400 above `high` effort.
+
+    The cost of being explicit: `thinking` in this shape is a 400 on pre-4.6 models, which
+    expect the removed `budget_tokens` form. Pointing `DEEP_RESEARCH_MODEL` at one of those
+    means dropping this argument too. That is the right trade — a broken default model is
+    worse than a constrained override.
+    `test_config.py::test_thinking_is_adaptive_and_summarized_never_disabled` pins all of it.
 
     The `ty: ignore` silences a false positive: ty builds the signature from the
     Pydantic *aliases* (`model_name`, `max_tokens_to_sample`) and doesn't model
@@ -62,6 +105,13 @@ def build_model() -> ChatAnthropic:
         model=MODEL_NAME,  # ty: ignore[unknown-argument]
         max_tokens=MAX_TOKENS,  # ty: ignore[unknown-argument]
         streaming=True,
+        # `display="summarized"` is REQUIRED, not cosmetic: Opus 5's default
+        # ("omitted") returns thinking blocks with no `thinking` text, which then
+        # cannot be replayed — and every tool result replays the assistant message
+        # that requested it. See the docstring above for the measured 400.
+        # No `ty: ignore` needed here, unlike the two above: `thinking` is a real
+        # field name, not a Pydantic alias, so ty resolves it without help.
+        thinking={"type": "adaptive", "display": "summarized"},
     )
 
 
