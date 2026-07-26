@@ -28,6 +28,14 @@ encodes are not obvious and were paid for once already:
   is built by `thread_sections(agent.get_state(...).values)` — the same slicing
   `/export` and `evals/harness.py` use. The stream carries the *researchers'* prose,
   which the user must never see.
+
+**Script order is load-bearing too, in a smaller way.** The one genuinely slow thing on
+an idle pass is `agent.get_state(config)`, which deserializes the thread's entire
+message list; `export_markdown` and the transcript loop are both built from it. So the
+page's own chrome — title, caption, chat input — is written *before* that read rather
+than after it. Two things follow: the frame paints while the checkpoint loads instead of
+behind it, and submitting a question returns from `st.chat_input` and reruns without
+ever paying for the read whose results that pass would have thrown away.
 """
 
 from __future__ import annotations
@@ -78,6 +86,29 @@ st.session_state.setdefault("notice", None)
 
 busy = st.session_state.payload is not None or bool(st.session_state.pending)
 
+# --- header and input ---------------------------------------------------------------
+# ABOVE the checkpoint read on purpose (see the module docstring). Everything here is
+# cheap and depends on nothing but session state, so it paints while `get_state` runs
+# rather than behind it — and a submitted question reruns from here, skipping a read of
+# the whole message list that this pass would only have discarded. `st.chat_input` is
+# pinned to the bottom of the page by Streamlit, so moving it up the script does not
+# move it up the screen.
+st.title("Deep research agent")
+st.caption(
+    "Plans the work, delegates web searches to a subagent, and synthesizes a cited "
+    "answer. Writing a file pauses for your approval."
+)
+
+prompt = st.chat_input("Ask a research question", disabled=busy, submit_mode="disable")
+if prompt:
+    st.session_state.update(
+        question=prompt,
+        payload={"messages": [{"role": "user", "content": prompt}]},
+        feed=webui.StreamlitFeed(),
+        notice=None,
+    )
+    st.rerun()
+
 # --- sidebar: thread ----------------------------------------------------------------
 with st.sidebar:
     st.subheader("Session", divider="gray")
@@ -107,8 +138,10 @@ elif thread_id != st.session_state.thread_id:
     st.rerun()
 
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
-# ONE read. `get_state` deserializes the thread's whole message list — the largest
-# object in the app — and this used to be called twice more at the end of every turn.
+# ONE read, and the only slow thing on an idle pass — which is why the page's chrome is
+# written above it. `get_state` deserializes the thread's whole message list, the
+# largest object in the app, and this used to be called twice more at the end of every
+# turn.
 state = agent.get_state(config)
 values = state.values
 sections = thread_sections(values)
@@ -152,47 +185,13 @@ with st.sidebar:
         help="Every question in this thread with its cited answer.",
     )
 
-    with st.expander("Durable memory", icon=":material/database:"):
-        try:
-            # Cached: an expander runs its body whether or not it is open, so the
-            # uncached read pulled every note out of sqlite on each rerun to fill a
-            # panel nobody had opened.
-            saved = webui.cached_memory_files(agent)
-        except Exception as exc:  # noqa: BLE001 — a sidebar read must not kill the page
-            st.caption(f"Could not read memory: {exc}")
-            saved = []
-        if saved:
-            chosen = st.selectbox(
-                "File",
-                [path for path, _ in saved],
-                label_visibility="collapsed",
-                disabled=busy,
-            )
-            st.code(dict(saved)[chosen], language=None, height=240, wrap_lines=True)
-        else:
-            st.caption(
-                "Nothing saved yet. Findings the agent writes to `/memories/` persist "
-                "across every thread and session."
-            )
+    # A fragment, so browsing saved notes redraws that expander instead of rerunning
+    # the whole page — including the `get_state` read above and every chat bubble
+    # below. See `webui.memory_browser` for why it still honours `busy`.
+    webui.memory_browser(agent, busy=busy)
+
     st.caption(f"Model · `{MODEL_NAME}`")
     st.caption(f"Memory · `{MEMORY_DB.name}`")
-
-# --- header and input ---------------------------------------------------------------
-st.title("Deep research agent")
-st.caption(
-    "Plans the work, delegates web searches to a subagent, and synthesizes a cited "
-    "answer. Writing a file pauses for your approval."
-)
-
-prompt = st.chat_input("Ask a research question", disabled=busy, submit_mode="disable")
-if prompt:
-    st.session_state.update(
-        question=prompt,
-        payload={"messages": [{"role": "user", "content": prompt}]},
-        feed=webui.StreamlitFeed(),
-        notice=None,
-    )
-    st.rerun()
 
 # --- transcript, from the checkpoint -------------------------------------------------
 for _index, (_kind, _text) in enumerate(sections):
@@ -214,20 +213,33 @@ if webui.should_render_question(st.session_state.question, sections):
 if st.session_state.notice:
     st.info(st.session_state.notice)
 
-# --- approvals ------------------------------------------------------------------------
-if st.session_state.pending:
-    if not webui.reviewable_actions(st.session_state.pending):
-        # Paused on something with no action requests. Resuming would just re-interrupt,
-        # so say so and drop the turn rather than looping. Same call `cli.main` makes.
-        st.session_state.update(
-            pending=[],
-            payload=None,
-            question=None,
-            feed=None,
-            notice="The turn paused with no reviewable action, so it was abandoned.",
-        )
-        st.rerun()
 
+# --- approvals ------------------------------------------------------------------------
+@st.fragment
+def approval_panel() -> None:
+    """The approval screen, scoped so deciding does not rerun the page.
+
+    **A fragment because of what the controls cost, not what they do.** Choosing a
+    decision, typing a rejection reason, or editing the JSON arguments each triggered a
+    full rerun: the `get_state` read above, `export_markdown` over the whole thread, and
+    every chat bubble redrawn — to change one widget, on the screen where the reviewer
+    most needs to concentrate. Scoped here, those interactions redraw this panel alone.
+
+    **`st.form` is the obvious alternative and it is wrong.** A form suppresses reruns
+    until submit, and `webui.decision_controls` *depends* on them: the reason box, the
+    prefilled JSON editor, and the "not valid JSON" error only exist because picking a
+    decision reruns and re-renders. Batching the inputs would delete the validation that
+    `webui.py` calls the only security boundary the app has.
+
+    Both exits call a bare `st.rerun()`, which is app-scoped even from inside a fragment
+    — required, because each one hands control back to the page's turn loop, and only a
+    full rerun re-enters the streaming block below with the new `payload`.
+
+    The `st.chat_message` wrapper is created *inside* the fragment rather than around the
+    call. A fragment may write into a container made outside it, but only one that was
+    already written to during a full run — owning the container removes that condition
+    entirely.
+    """
     with st.chat_message("assistant"):
         # The work this turn already did, above the thing it is asking permission for.
         # Not decoration: an approval is a rerun, and a rerun discards everything the
@@ -276,6 +288,22 @@ if st.session_state.pending:
                 ),
             )
             st.rerun()
+
+
+if st.session_state.pending:
+    if not webui.reviewable_actions(st.session_state.pending):
+        # Paused on something with no action requests. Resuming would just re-interrupt,
+        # so say so and drop the turn rather than looping. Same call `cli.main` makes.
+        st.session_state.update(
+            pending=[],
+            payload=None,
+            question=None,
+            feed=None,
+            notice="The turn paused with no reviewable action, so it was abandoned.",
+        )
+        st.rerun()
+
+    approval_panel()
     st.stop()
 
 # --- run or resume the turn ------------------------------------------------------------

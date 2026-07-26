@@ -418,6 +418,56 @@ Two things follow that are easy to get wrong:
   would leak subagent prose into the UI and make the citation metrics fiction. Same rule
   as the REPL, and the stream being right there in hand is exactly why it needs saying.
 
+**Two `@st.fragment`s, and they are defined by what they stop the page doing.** Every
+widget interaction reruns the whole script — and this script re-reads the checkpoint
+(`agent.get_state`, the largest object in the app), rebuilds the export document from
+it, and redraws every chat bubble. None of that has anything to do with picking a
+different note out of the sidebar, or with choosing a decision. `webui.memory_browser`
+and `streamlit_app.approval_panel` scope those interactions to themselves. The approval
+one is the one that matters: a decision click, a rejection reason, and every committed
+edit of the JSON arguments each cost a full rerun — on the screen where the reviewer most
+needs to concentrate.
+
+Five things about that are load-bearing:
+
+- **`webui.approval_form` stays a plain function.** `test_webui.py` drives it directly
+  from a three-line `AppTest.from_string` script — ten tests do, via its `_form` helper —
+  so decorating it would drag all ten inside a fragment for no benefit. The fragment is a
+  thin wrapper in the *page*, which is also the correct module: it mutates the page's
+  session-state machine, and `webui.py` deliberately knows nothing about that.
+- **Both exits call a bare `st.rerun()`, which is app-scoped even from inside a
+  fragment.** Required, because only a full rerun re-enters the streaming block with the
+  new `payload`. `scope="fragment"` raises `StreamlitAPIException` during a full run;
+  omitting the rerun is worse — the panel simply redraws itself forever, no exception, a
+  reviewer clicking Send and watching nothing happen.
+  `test_submitting_a_decision_resumes_the_turn` pins the handoff, and was verified red
+  both ways. Nothing else covered it: `test_webui.py` proves the decisions *mapping* and
+  stops there, and the other page tests seed `payload` directly, never travelling the
+  submit path.
+- **`st.form` is the obvious alternative and it is wrong.** A form suppresses reruns
+  until submit, and `decision_controls` *depends* on them — the reason box, the prefilled
+  JSON editor, and the "not valid JSON" error all exist only because picking a decision
+  reruns. Batching the inputs would delete the validation `webui.py` calls the only
+  security boundary the app has. The performance-shaped fix removes the safety property.
+- **`approval_panel` creates its own `st.chat_message`** rather than being called inside
+  one. A fragment may write into a container created outside it, but only one that was
+  already written to during a full run; owning the container removes that condition.
+- **The memory browser is deliberately NOT `st.expander(..., on_change="rerun")`**, which
+  is Streamlit's preferred fix for a collapsed expander still computing its body. It
+  renders the selectbox only while the panel is open, and two tests reach for
+  `sidebar.selectbox[0]` to prove `busy` reaches that widget at all — the pair recorded
+  below as having once passed for the wrong reason. `cached_memory_files` already reduces
+  the closed-panel cost to a dict lookup, which is most of what the guard would buy.
+
+**Script order is load-bearing too, in a smaller way.** The one genuinely slow thing on
+an idle pass is `agent.get_state(config)`; `export_markdown` and the transcript loop are
+both built from it. So the page's chrome — title, caption, `st.chat_input` — is written
+*above* that read. Two effects, and the second is the real one: the frame paints while
+the checkpoint loads instead of behind it, and a submitted question returns from
+`st.chat_input` and reruns **without ever paying for a read whose results that pass would
+have discarded**. `st.chat_input` is pinned to the bottom of the page by Streamlit, so
+moving it up the script does not move it up the screen.
+
 **Deliberate divergences from the CLI, all in the safer direction.** `decision_controls`
 has **no default selection** — the REPL defaults to approve because bare Enter has to
 mean something, and a UI has no such affordance, so an explicit click costs nothing and
@@ -511,6 +561,16 @@ credentials and an isolated `DEEP_RESEARCH_STATE_DIR` as top-level code, so
 `missing_keys()` passes and the sqlite files land in a temp dir. `tests/test_webui.py`
 covers rendering and the widgets; `tests/test_streamlit_page.py` covers the rerun state
 machine those sit inside.
+
+**Do not over-trust it on the fragments.** Measured: interacting with a widget *inside* a
+fragment makes `AppTest` re-run the whole app rather than simulating a fragment-scoped
+rerun. That is convenient — every pre-existing assertion kept working when the memory
+browser and approval panel moved into fragments, and `sidebar.selectbox[0]` /
+`button_group` / the abandon button are all still reachable, which is real signal since
+each would `IndexError` if the fragment had not rendered. But it means the suite proves
+the fragments *render* and that their exits *escalate*, and can prove nothing at all
+about the isolation they exist for. That rests on Streamlit's documented contract. Do
+not write a test that appears to assert it.
 
 One thing NOT to attempt there: raising a `BaseException` inside the script to simulate
 a mid-turn abort. It kills Streamlit's script thread outright, so `AppTest.run()` waits

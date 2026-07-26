@@ -526,3 +526,58 @@ def cached_memory_files(_agent: Any) -> list[tuple[str, str]]:
 def refresh_memory_files() -> None:
     """Drop the memory cache, so a just-approved write shows up at once."""
     cached_memory_files.clear()
+
+
+@st.fragment
+def memory_browser(agent: Any, *, busy: bool) -> None:
+    """The `/memories/` browser — a fragment for what it stops the page from doing.
+
+    Every widget interaction in a Streamlit app reruns the whole script, and this
+    page's script re-reads the checkpoint (`agent.get_state` — the largest object in
+    the app, per its own comment), rebuilds the export document from it, and redraws
+    every chat bubble in the thread. Picking a different note out of the sidebar
+    depends on none of that. As a fragment, that click redraws this expander and
+    nothing else.
+
+    `busy` is still honoured, and the reason is worth stating because the fragment
+    makes it look redundant. A fragment-scoped rerun cannot tear down `agent.stream`
+    the way `RerunException` from a full rerun does — but a fragment is *also*
+    re-executed on every full rerun, and leaving a live control on screen during a turn
+    is precisely the shape of bug this page has already paid for once. The control stays
+    disabled.
+
+    **Deliberately not `st.expander(..., on_change="rerun")`**, which is the reference's
+    preferred fix for a collapsed expander still computing its body. It renders the
+    selectbox only while the panel is open, and two tests reach for
+    `sidebar.selectbox[0]` to prove `busy` reaches this widget at all
+    (`test_input_is_disabled_while_an_approval_is_pending` and its idle positive
+    control) — tests CLAUDE.md records as having once passed for the wrong reason, so
+    weakening them is not a trade worth making. `cached_memory_files` already reduces
+    the closed-panel cost to a dict lookup, which is most of what the guard would buy.
+    """
+    with st.expander("Durable memory", icon=":material/database:"):
+        try:
+            # Cached: an expander runs its body whether or not it is open, so the
+            # uncached read pulled every note out of sqlite on each rerun to fill a
+            # panel nobody had opened.
+            saved = cached_memory_files(agent)
+        except Exception as exc:  # noqa: BLE001 — a sidebar read must not kill the page
+            st.caption(f"Could not read memory: {exc}")
+            saved = []
+        if saved:
+            # Keyed so the selection survives the options list changing under it — a
+            # turn that writes a note calls `refresh_memory_files()`, and an unkeyed
+            # widget's identity includes its options, so it would reset on that rerun.
+            chosen = st.selectbox(
+                "File",
+                [path for path, _ in saved],
+                label_visibility="collapsed",
+                disabled=busy,
+                key="memory_file",
+            )
+            st.code(dict(saved)[chosen], language=None, height=240, wrap_lines=True)
+        else:
+            st.caption(
+                "Nothing saved yet. Findings the agent writes to `/memories/` persist "
+                "across every thread and session."
+            )

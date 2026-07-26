@@ -164,6 +164,52 @@ class TestPendingApprovalsSurviveTheSession:
         assert [i.id for i in page.session_state["pending"]] == ["live"]
 
 
+class TestTheApprovalPanelEscalatesToTheTurnLoop:
+    """The approval controls live in an `@st.fragment`, and this is what makes that safe.
+
+    A fragment rerun redraws the fragment and nothing else — which is the entire point on
+    this screen, since a decision click otherwise re-read the checkpoint, rebuilt the
+    export document and redrew every chat bubble. But the *submit* is not a fragment-
+    scoped event: it has to hand control back to the page so the streaming block below
+    re-enters with the new `Command(resume=…)`. A bare `st.rerun()` is app-scoped even
+    from inside a fragment, and that is the only reason the turn resumes at all.
+
+    Nothing else covers this. `test_webui.py` drives `approval_form` in a bare script,
+    so it proves the decisions *mapping* is right and stops there; the page-level tests
+    below seed `payload` directly and never travel the submit path. Get the scope wrong
+    and the panel would simply redraw itself forever — no exception, no failing test, a
+    reviewer clicking Send and watching nothing happen.
+    """
+
+    def test_submitting_a_decision_resumes_the_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resumed: list[Any] = []
+
+        def record(_agent: Any, payload: Any, _config: Any, _feed: Any) -> list[Any]:
+            resumed.append(payload)
+            return []
+
+        monkeypatch.setattr(cli_module, "_stream_turn", record)
+        page = _page(
+            pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
+            feed=webui.StreamlitFeed(),
+        )
+
+        page.button_group[0].set_value("approve").run()
+        send = [b for b in page.button if "Send" in b.label]
+        assert send, "no submit control on the approval panel"
+        send[0].click().run()
+
+        assert len(resumed) == 1, (
+            "the graph was never resumed — the submit rerun did not leave the fragment"
+        )
+        # The shape LangGraph demands, keyed by interrupt id: a flat
+        # `{"decisions": [...]}` raises as soon as a turn holds two interrupts.
+        assert resumed[0].resume == {"i1": {"decisions": [{"type": "approve"}]}}
+        assert page.session_state["pending"] == []
+
+
 class TestTheApprovalScreenIsEscapable:
     def test_a_stuck_approval_can_be_abandoned(self) -> None:
         # `approval_form` keeps submit disabled until every action has a valid decision,
