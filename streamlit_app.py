@@ -212,6 +212,36 @@ with st.sidebar:
 for _index, (_kind, _text) in enumerate(sections):
     with st.chat_message("user" if _kind == "human" else "assistant"):
         if _events := st.session_state.work_logs.get(_index):
+            # A PLAIN expander. The lazy form is not an oversight, and the reason it
+            # is refused is the reason `approval_panel` refuses `st.form`.
+            #
+            # The cost is real: measured, a collapsed `st.expander` still runs its
+            # body and produces every element inside it (15 of 15 in a probe), and
+            # Streamlit sends them whether or not the panel is open — its own
+            # docstring says so. `on_change="rerun"` plus `if exp.open:` produces
+            # none, and is what the best-practices reference prescribes here.
+            #
+            # It is still wrong here, because it converts a passive container into a
+            # rerun-firing widget and THIS LOOP DRAWS ABOVE THE STREAMING BLOCK. These
+            # expanders are on screen while `agent.stream` is live, so a click would
+            # raise `RerunException` inside `_stream_turn` — a BaseException, which is
+            # exactly why the `except Exception` down there cannot catch it — tearing
+            # down the generator and cancelling researchers whose searches are already
+            # paid for. That is the bug this page has paid for twice already (the
+            # export button, then the memory selectbox), and the rule it learned is
+            # that every control which can fire a rerun is `disabled` while `busy`.
+            # `st.expander` has no `disabled` parameter — checked against 1.60's
+            # signature, not remembered — so it cannot be made lazy AND inert. A
+            # performance-shaped fix that deletes a safety property is the same trade
+            # `st.form` offered, and it gets the same answer.
+            #
+            # The cost accepted is bounded rather than unbounded: `work_logs` is
+            # per-session and rebuilt on a thread switch, so a fresh page starts empty
+            # and this grows only with turns completed in THIS session.
+            #
+            # `webui.memory_browser` faces the identical choice and answers it the
+            # other way round; the difference is that it is a `@st.fragment`, where a
+            # rerun is fragment-scoped and cannot reach the stream.
             with st.expander("Work log", icon=":material/manage_search:"):
                 for _event in _events:
                     webui.render_event(_event)

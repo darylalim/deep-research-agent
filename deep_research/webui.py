@@ -582,8 +582,24 @@ def memory_browser(agent: Any, *, busy: bool) -> None:
     `sidebar.selectbox[0]` to prove `busy` reaches this widget at all
     (`test_input_is_disabled_while_an_approval_is_pending` and its idle positive
     control) — tests CLAUDE.md records as having once passed for the wrong reason, so
-    weakening them is not a trade worth making. `cached_memory_files` already reduces
-    the closed-panel cost to a dict lookup, which is most of what the guard would buy.
+    weakening them is not a trade worth making.
+
+    **Those tests are the WHOLE of the argument, and the cost sentence this docstring
+    used to end on was wrong.** It claimed `cached_memory_files` reduces the
+    closed-panel cost to a dict lookup. That is true of the sqlite read and false of
+    what crosses the wire: the cache elides the read, not the elements. `st.code`
+    below produces the selected note's full body on every rerun, and Streamlit sends a
+    closed expander's contents to the frontend anyway — measured, a collapsed expander
+    produced 15 of 15 elements where the lazy form produced none. The magnitude here
+    is unmeasured, so if anyone ever times it and it is not small, the tests are the
+    thing to renegotiate; do not reconstruct a cost defence in their place. This is
+    the same error as the fragments' original speed rationale, one layer down.
+
+    Note the page reaches the OPPOSITE conclusion for the transcript's work-log
+    expanders, and the difference is this decorator, not the cost. A rerun fired from
+    inside a fragment is fragment-scoped, so the lazy form could not tear down
+    `agent.stream` from here; in the page body it could, and `st.expander` accepts no
+    `disabled` to close that window. Safety decides it there; tests decide it here.
 
     Targets `st.sidebar` explicitly rather than inheriting whatever container happens to
     be ambient — the same rule `approval_panel` follows by creating its own
