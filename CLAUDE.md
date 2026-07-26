@@ -8,11 +8,12 @@ A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
 (currently v0.6.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
 `agent.py` (~220 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
-(~1130 lines, by far the largest module here) — the human-in-the-loop
+(~1130 lines, the largest module here) — the human-in-the-loop
 interrupt/resume protocol that wiring implies, plus every rule about what a user may
-be shown. `webui.py` (~390) and `streamlit_app.py` (~260) are the browser front end,
-and they are mostly *reuse* of `cli.py` rather than new logic. `config.py`, `tools.py`,
-and `subagents.py` are genuinely small support modules.
+be shown. `webui.py` (~610) and `streamlit_app.py` (~400) are the browser front end:
+no longer small — `webui.py` is over half of `cli.py` — but still mostly *reuse* of
+`cli.py`'s rules, plus the rerun state machine that reuse has to sit inside.
+`config.py`, `tools.py`, and `subagents.py` are genuinely small support modules.
 
 **Three front doors, one builder.** `python -m deep_research` (terminal),
 `streamlit run streamlit_app.py` (browser), and `langgraph dev` (HTTP server) all

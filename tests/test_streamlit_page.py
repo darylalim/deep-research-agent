@@ -224,6 +224,12 @@ class TestTheApprovalPanelEscalatesToTheTurnLoop:
         assert send, "no submit control on the approval panel"
         send[0].click().run()
 
+        # Not boilerplate, and doubly so inside a fragment: `wrapped_fragment` catches
+        # every non-Rerun/Stop exception, routes it through `handle_user_script_exception`
+        # and re-raises `FragmentHandledException` — so a rendering failure in the panel
+        # becomes a *drawn* exception element rather than a script crash, and the
+        # assertions below could be satisfied by a page showing the reviewer a traceback.
+        assert not page.exception, page.exception
         assert len(resumed) == 1, (
             "the graph was never resumed — the submit rerun did not leave the fragment"
         )

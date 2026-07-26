@@ -581,8 +581,15 @@ def memory_browser(agent: Any, *, busy: bool) -> None:
     control) — tests CLAUDE.md records as having once passed for the wrong reason, so
     weakening them is not a trade worth making. `cached_memory_files` already reduces
     the closed-panel cost to a dict lookup, which is most of what the guard would buy.
+
+    Targets `st.sidebar` explicitly rather than inheriting whatever container happens to
+    be ambient — the same rule `approval_panel` follows by creating its own
+    `st.chat_message`. A fragment may write into a container made outside it, but only
+    one already written to during a full run, and depending on the caller's `with` block
+    for placement means moving that call silently relocates the panel. Call order within
+    the sidebar still decides where it lands; nothing else does.
     """
-    with st.expander("Durable memory", icon=":material/database:"):
+    with st.sidebar.expander("Durable memory", icon=":material/database:"):
         try:
             # Cached: an expander runs its body whether or not it is open, so the
             # uncached read pulled every note out of sqlite on each rerun to fill a

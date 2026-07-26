@@ -29,13 +29,9 @@ encodes are not obvious and were paid for once already:
   `/export` and `evals/harness.py` use. The stream carries the *researchers'* prose,
   which the user must never see.
 
-**Script order is load-bearing too, in a smaller way.** The one genuinely slow thing on
-an idle pass is `agent.get_state(config)`, which deserializes the thread's entire
-message list; `export_markdown` and the transcript loop are both built from it. So the
-page's own chrome — title, caption, chat input — is written *before* that read rather
-than after it. Two things follow: the frame paints while the checkpoint loads instead of
-behind it, and submitting a question returns from `st.chat_input` and reruns without
-ever paying for the read whose results that pass would have thrown away.
+Script order is load-bearing too, in a smaller way: the page's chrome is written *above*
+the `agent.get_state` read rather than below it. The argument is at the header block,
+where it is enacted.
 """
 
 from __future__ import annotations
@@ -92,7 +88,7 @@ st.session_state.setdefault("abandoned", set())
 busy = st.session_state.payload is not None or bool(st.session_state.pending)
 
 # --- header and input ---------------------------------------------------------------
-# ABOVE the checkpoint read on purpose (see the module docstring). Everything here is
+# ABOVE the checkpoint read on purpose. Everything here is
 # cheap and depends on nothing but session state, so it paints while `get_state` runs
 # rather than behind it — and a submitted question reruns from here, skipping a read of
 # the whole message list that this pass would only have discarded. `st.chat_input` is
@@ -143,10 +139,8 @@ elif thread_id != st.session_state.thread_id:
     st.rerun()
 
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
-# ONE read, and the only slow thing on an idle pass — which is why the page's chrome is
-# written above it. `get_state` deserializes the thread's whole message list, the
-# largest object in the app, and this used to be called twice more at the end of every
-# turn.
+# ONE read. `get_state` deserializes the thread's whole message list — the largest
+# object in the app — and this used to be called twice more at the end of every turn.
 state = agent.get_state(config)
 values = state.values
 sections = thread_sections(values)
@@ -192,9 +186,8 @@ with st.sidebar:
         help="Every question in this thread with its cited answer.",
     )
 
-    # A fragment, so browsing saved notes redraws that expander instead of rerunning
-    # the whole page — including the `get_state` read above and every chat bubble
-    # below. See `webui.memory_browser` for why it still honours `busy`.
+    # A fragment: browsing notes redraws this expander, not the page. It targets
+    # `st.sidebar` itself, so this call's position is all that places it.
     webui.memory_browser(agent, busy=busy)
 
     st.caption(f"Model · `{MODEL_NAME}`")
