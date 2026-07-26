@@ -152,7 +152,9 @@ def should_render_question(
     return not any(kind == "human" and asked in text for kind, text in sections)
 
 
-def recover_pending(state: Any) -> list[Any]:
+def recover_pending(
+    state: Any, *, skip: frozenset[str] | set[str] = frozenset()
+) -> list[Any]:
     """Interrupts the graph is still waiting on, read from the CHECKPOINT.
 
     Without this, a pending approval lives only in `st.session_state`, and a refresh, a
@@ -164,11 +166,36 @@ def recover_pending(state: Any) -> list[Any]:
     It is also what makes the README's "a thread you start in one continues in the other"
     true for a thread the REPL left paused at an approval.
 
+    **`skip` is what stops that recovery from being a trap, and it is not optional.**
+    Clearing `st.session_state.pending` does NOT resume the graph — the interrupt is
+    still in the checkpoint — so a page that abandons a turn and then recovers blindly
+    reads the very same interrupt straight back on the next pass. Measured, before this
+    argument existed: "Abandon this turn" left `pending == [Interrupt(id='i1', …)]` with
+    the approval form redrawn directly under its own "Turn abandoned" notice, and an
+    interrupt carrying no `action_requests` drove an unbounded full-rerun loop — 1019
+    reruns in 6 seconds, each paying for `agent.get_state`. The session had no way out,
+    in the one control whose entire job is being the way out.
+
+    Passing the ids the session has deliberately given up on is therefore how the page
+    matches the REPL. `cli.main` abandons a turn by letting its broad `except` drop it
+    and reading the next question, leaving the graph paused; the dangling tool calls are
+    answered on the following turn by `PatchToolCallsMiddleware.before_agent`, which is
+    also what keeps that next question clear of the prefill 400. Skipping the interrupt
+    rather than resuming it reproduces exactly that, and it is the only option that works
+    for the case the escape hatch exists for: a tool whose `allowed_decisions` this UI
+    cannot render may not permit `reject` either, so "resume with a rejection" would
+    raise `ValueError` inside the middleware on precisely the stuck turn it was meant
+    to free.
+
     `StateSnapshot.interrupts` is already the flattened
     `[i for task in tasks_with_writes for i in task.interrupts]` (langgraph
     `pregel/main.py`), so there is no need to walk `.tasks` here.
     """
-    return list(getattr(state, "interrupts", ()) or ())
+    return [
+        interrupt
+        for interrupt in (getattr(state, "interrupts", ()) or ())
+        if getattr(interrupt, "id", None) not in skip
+    ]
 
 
 def render_event(event: FeedEvent) -> None:

@@ -83,6 +83,11 @@ st.session_state.setdefault("pending", [])
 st.session_state.setdefault("work_logs", {})
 st.session_state.setdefault("refusals", {})
 st.session_state.setdefault("notice", None)
+# Interrupt ids this session has deliberately given up on. Clearing `pending` does NOT
+# resume the graph, so without this the recovery below reads the same interrupt straight
+# back on the next pass — which made "Abandon this turn" not abandon, and an interrupt
+# with no reviewable action loop forever. See `webui.recover_pending`.
+st.session_state.setdefault("abandoned", set())
 
 busy = st.session_state.payload is not None or bool(st.session_state.pending)
 
@@ -153,7 +158,9 @@ sections = thread_sections(values)
 # CLAUDE.md documents). Recovered only when this session is not mid-turn — during a turn
 # the live stream is the authority.
 _idle = not st.session_state.pending and st.session_state.payload is None
-if _idle and (recovered := webui.recover_pending(state)):
+if _idle and (
+    recovered := webui.recover_pending(state, skip=st.session_state.abandoned)
+):
     st.session_state.pending = recovered
     # The feed for that turn died with the old session; a fresh one still carries
     # `note_declined` and collects whatever the resumed stream emits.
@@ -277,6 +284,14 @@ def approval_panel() -> None:
         # same input and `cli.main`'s broad `except` abandons the turn; this is the
         # browser's equivalent, and it works for any stuck approval, not just that one.
         if st.button("Abandon this turn", icon=":material/close:"):
+            # Record the ids FIRST, and record them at all because clearing session
+            # state does not resume the graph. Without this the checkpoint still held
+            # the interrupt, `recover_pending` re-seeded `pending` on the very next
+            # pass, and the approval form redrew itself directly beneath its own
+            # "Turn abandoned" notice — the escape hatch not escaping.
+            st.session_state.abandoned.update(
+                interrupt.id for interrupt in st.session_state.pending
+            )
             st.session_state.update(
                 pending=[],
                 payload=None,
@@ -293,7 +308,15 @@ def approval_panel() -> None:
 if st.session_state.pending:
     if not webui.reviewable_actions(st.session_state.pending):
         # Paused on something with no action requests. Resuming would just re-interrupt,
-        # so say so and drop the turn rather than looping. Same call `cli.main` makes.
+        # so say so and drop the turn. Same call `cli.main` makes.
+        #
+        # Recording the ids is what makes "drop" true. Clearing `pending` leaves the
+        # interrupt in the checkpoint, so the recovery above used to re-seed it on the
+        # next pass and land right back here — measured at 1019 reruns in 6 seconds,
+        # each one re-reading the whole message list, with the page never settling.
+        st.session_state.abandoned.update(
+            interrupt.id for interrupt in st.session_state.pending
+        )
         st.session_state.update(
             pending=[],
             payload=None,

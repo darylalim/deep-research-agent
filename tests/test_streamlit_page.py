@@ -121,7 +121,15 @@ class TestPendingApprovalsSurviveTheSession:
         # next question sends fresh input to a thread with a pending interrupt — the
         # prefill 400 CLAUDE.md documents.
         stranded = Interrupt(id="i1", value={"action_requests": [_WRITE]})
-        monkeypatch.setattr(webui, "recover_pending", lambda _state: [stranded])
+        # Honours `skip` like the real thing, so this stays a faithful stand-in for a
+        # checkpoint that still holds the interrupt rather than one that always shouts.
+        monkeypatch.setattr(
+            webui,
+            "recover_pending",
+            lambda _state, *, skip=frozenset(): [
+                i for i in [stranded] if i.id not in skip
+            ],
+        )
 
         page = _page()  # a fresh session: nothing in session_state at all
 
@@ -140,6 +148,19 @@ class TestPendingApprovalsSurviveTheSession:
         assert webui.recover_pending(_Snapshot()) == [one]
         assert webui.recover_pending(object()) == []
 
+    def test_it_skips_interrupts_the_session_has_given_up_on(self) -> None:
+        # Clearing `st.session_state.pending` does not resume the graph, so an abandoned
+        # interrupt is still sitting in the checkpoint. Without `skip`, recovery reads it
+        # straight back and the page never escapes it.
+        one = Interrupt(id="i1", value={"action_requests": [_WRITE]})
+        two = Interrupt(id="i2", value={"action_requests": [_WRITE]})
+
+        class _Snapshot:
+            interrupts = (one, two)
+
+        assert webui.recover_pending(_Snapshot(), skip={"i1"}) == [two]
+        assert webui.recover_pending(_Snapshot(), skip={"i1", "i2"}) == []
+
     def test_a_live_turn_is_not_overridden_by_the_checkpoint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -151,7 +172,9 @@ class TestPendingApprovalsSurviveTheSession:
         monkeypatch.setattr(
             webui,
             "recover_pending",
-            lambda _state: [Interrupt(id="stale", value={"action_requests": [_WRITE]})],
+            lambda _state, *, skip=frozenset(): [
+                Interrupt(id="stale", value={"action_requests": [_WRITE]})
+            ],
         )
         monkeypatch.setattr(cli_module, "_stream_turn", lambda *a, **k: [live])
 
@@ -208,6 +231,69 @@ class TestTheApprovalPanelEscalatesToTheTurnLoop:
         # `{"decisions": [...]}` raises as soon as a turn holds two interrupts.
         assert resumed[0].resume == {"i1": {"decisions": [{"type": "approve"}]}}
         assert page.session_state["pending"] == []
+
+
+class TestGivingUpOnAnInterruptActuallyGivesUp:
+    """Both paths that drop a turn, against a graph that is genuinely still paused.
+
+    Clearing `st.session_state.pending` does not resume anything — the interrupt stays in
+    the checkpoint — so a page that then recovers blindly reads it straight back. Both
+    failures below were real and neither was caught, because the test thread has no live
+    checkpoint: `recover_pending` returned `[]`, the re-seeding never happened, and
+    `test_a_stuck_approval_can_be_abandoned` passed while the button did nothing in
+    production. That is this repo's recurring failure mode — an assertion satisfied by an
+    unrelated condition — so the stub below supplies the missing half.
+
+    It deliberately *implements* `skip` rather than ignoring it: a page that stops
+    passing `skip` gets the default, which filters nothing, and both tests go red.
+    """
+
+    @staticmethod
+    def _still_paused(monkeypatch: pytest.MonkeyPatch, *interrupts: Interrupt) -> None:
+        """Model a checkpoint that still holds `interrupts`, honouring `skip`."""
+        monkeypatch.setattr(
+            webui,
+            "recover_pending",
+            lambda _state, *, skip=frozenset(): [
+                i for i in interrupts if i.id not in skip
+            ],
+        )
+
+    def test_abandoning_escapes_even_though_the_graph_is_still_paused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stranded = Interrupt(id="i1", value={"action_requests": [_WRITE]})
+        self._still_paused(monkeypatch, stranded)
+
+        page = _page()
+        abandon = [b for b in page.button if "Abandon" in b.label]
+        assert abandon, "no escape from the approval screen"
+        abandon[0].click().run()
+
+        assert not page.exception, page.exception
+        assert page.session_state["pending"] == [], (
+            "the approval came straight back — abandoning did not abandon"
+        )
+        assert not page.button_group, "approval controls redrawn after abandoning"
+        # The point of escaping: the session can be used again.
+        assert not page.chat_input[0].disabled, "no way to ask anything else"
+
+    def test_an_interrupt_with_no_reviewable_action_settles(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Broken, this is an unbounded full-rerun loop rather than a wrong value — 1019
+        # reruns in 6 seconds, measured — so the timeout is deliberately short. A failure
+        # here should cost seconds, not the 60s CLAUDE.md records paying once already.
+        self._still_paused(
+            monkeypatch, Interrupt(id="i1", value={"action_requests": []})
+        )
+
+        page = AppTest.from_file(PAGE, default_timeout=8).run()
+
+        assert not page.exception, page.exception
+        assert page.session_state["pending"] == []
+        assert "abandoned" in (page.session_state["notice"] or "").lower()
+        assert not page.chat_input[0].disabled
 
 
 class TestTheApprovalScreenIsEscapable:
