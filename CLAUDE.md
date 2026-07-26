@@ -419,15 +419,28 @@ Two things follow that are easy to get wrong:
   would leak subagent prose into the UI and make the citation metrics fiction. Same rule
   as the REPL, and the stream being right there in hand is exactly why it needs saying.
 
-**Two `@st.fragment`s, and they are defined by what they stop the page doing.** Every
-widget interaction reruns the whole script — and this script re-reads the checkpoint
-(`agent.get_state`, the largest object in the app), rebuilds the export document from
-it, and redraws every chat bubble. None of that has anything to do with picking a
-different note out of the sidebar, or with choosing a decision. `webui.memory_browser`
-and `streamlit_app.approval_panel` scope those interactions to themselves. The approval
-one is the one that matters: a decision click, a rejection reason, and every committed
-edit of the JSON arguments each cost a full rerun — on the screen where the reviewer most
-needs to concentrate.
+**Two `@st.fragment`s, and the reason is UI stability, NOT speed.** Every widget
+interaction reruns the whole script, so a decision click re-read the checkpoint, rebuilt
+the export document, and redrew every chat bubble in the thread. `webui.memory_browser`
+and `streamlit_app.approval_panel` scope those interactions to themselves instead.
+
+**They were first justified on cost, and that justification does not survive
+measurement — this entry is the correction.** Measured on a 40-turn / 80-message thread:
+`agent.get_state` is **0.44 ms**; `export_markdown` is **0.06 ms**, including the
+redundant second `thread_sections` walk it does over a thread the page has already
+sliced; a 40-event `feed.replay()` is **~2 ms**; an 80-element transcript redraw is
+**~4 ms**. A whole full rerun is on the order of **7 ms** of server work. Note where the
+original error came from, because the phrasing is still in this file: the comment calling
+`get_state` "the largest object in the app" is about **size**, and the cost was
+extrapolated from it and never timed. Size is not latency.
+
+What the fragments actually buy is that a fragment rerun does not re-send the page's
+other elements, so the transcript is not torn down and repainted under a reviewer who is
+part-way through reading a diff. That is a real property and it is **also unmeasured** —
+nobody has put a number on the delta traffic or the repaint. Treat it as the claim on the
+table rather than a finding, and do not reconstruct a performance argument out of it.
+The two efficiency notes a review raised here (`feed.replay()` repeating per fragment
+rerun, `export_markdown` computed while `busy`) were both declined on these numbers.
 
 Five things about that are load-bearing:
 
@@ -460,14 +473,17 @@ Five things about that are load-bearing:
   below as having once passed for the wrong reason. `cached_memory_files` already reduces
   the closed-panel cost to a dict lookup, which is most of what the guard would buy.
 
-**Script order is load-bearing too, in a smaller way.** The one genuinely slow thing on
-an idle pass is `agent.get_state(config)`; `export_markdown` and the transcript loop are
-both built from it. So the page's chrome — title, caption, `st.chat_input` — is written
-*above* that read. Two effects, and the second is the real one: the frame paints while
-the checkpoint loads instead of behind it, and a submitted question returns from
-`st.chat_input` and reruns **without ever paying for a read whose results that pass would
-have discarded**. `st.chat_input` is pinned to the bottom of the page by Streamlit, so
-moving it up the script does not move it up the screen.
+**Script order: chrome above the checkpoint read — and it is NOT load-bearing.** The
+page's title, caption and `st.chat_input` are written above `agent.get_state(config)`,
+which follows Streamlit's "render stable UI before slow work" guidance. But by the same
+measurements above, the read it front-runs is 0.44 ms, so treat this as convention, not
+as a fix for anything. It is recorded because it had a cost, not because it had a
+benefit: painting `st.chat_input` before the read opened a window in which the input is
+legitimately *enabled* on the pass that discovers a pause, and Streamlit delivers a
+queued value even to a widget disabled by the time it arrives. That is the bug
+`if prompt and busy:` now guards, and it is the reason to leave the ordering alone rather
+than shuffle it again. (`st.chat_input` is bottom-pinned by Streamlit, so its script
+position never affected where it appears.)
 
 **Deliberate divergences from the CLI, all in the safer direction.** `decision_controls`
 has **no default selection** — the REPL defaults to approve because bare Enter has to

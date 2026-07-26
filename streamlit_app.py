@@ -29,9 +29,9 @@ encodes are not obvious and were paid for once already:
   `/export` and `evals/harness.py` use. The stream carries the *researchers'* prose,
   which the user must never see.
 
-Script order is load-bearing too, in a smaller way: the page's chrome is written *above*
-the `agent.get_state` read rather than below it. The argument is at the header block,
-where it is enacted.
+Script order — the page's chrome is written above the `agent.get_state` read — is
+convention rather than a fix; the read it front-runs measures at 0.44 ms. What it did do
+is open the window the header block's guard now closes.
 """
 
 from __future__ import annotations
@@ -88,12 +88,11 @@ st.session_state.setdefault("abandoned", set())
 busy = st.session_state.payload is not None or bool(st.session_state.pending)
 
 # --- header and input ---------------------------------------------------------------
-# ABOVE the checkpoint read on purpose. Everything here is
-# cheap and depends on nothing but session state, so it paints while `get_state` runs
-# rather than behind it — and a submitted question reruns from here, skipping a read of
-# the whole message list that this pass would only have discarded. `st.chat_input` is
-# pinned to the bottom of the page by Streamlit, so moving it up the script does not
-# move it up the screen.
+# Above the checkpoint read, following Streamlit's "render stable UI before slow work"
+# guidance — but do not mistake that for a fix: the read below measures at 0.44 ms on an
+# 80-message thread, so this ordering buys almost nothing. It is kept because moving it
+# again would churn the guard below for no gain, and because `st.chat_input` is
+# bottom-pinned by Streamlit anyway, so its script position never set where it appears.
 st.title("Deep research agent")
 st.caption(
     "Plans the work, delegates web searches to a subagent, and synthesizes a cited "
@@ -235,11 +234,14 @@ if st.session_state.notice:
 def approval_panel() -> None:
     """The approval screen, scoped so deciding does not rerun the page.
 
-    **A fragment because of what the controls cost, not what they do.** Choosing a
-    decision, typing a rejection reason, or editing the JSON arguments each triggered a
-    full rerun: the `get_state` read above, `export_markdown` over the whole thread, and
-    every chat bubble redrawn — to change one widget, on the screen where the reviewer
-    most needs to concentrate. Scoped here, those interactions redraw this panel alone.
+    **A fragment so the page holds still, not so it goes faster.** Choosing a decision,
+    typing a rejection reason, or editing the JSON arguments each triggered a full rerun,
+    which tore down and repainted the whole transcript under a reviewer part-way through
+    reading a diff. Scoped here, those interactions redraw this panel alone.
+
+    The cost argument this originally carried was wrong and is worth not repeating: a
+    full rerun measures at order 7 ms of server work on a 40-turn thread (`get_state`
+    0.44 ms, `export_markdown` 0.06 ms). CLAUDE.md records the numbers.
 
     **`st.form` is the obvious alternative and it is wrong.** A form suppresses reruns
     until submit, and `webui.decision_controls` *depends* on them: the reason box, the

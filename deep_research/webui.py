@@ -559,12 +559,15 @@ def refresh_memory_files() -> None:
 def memory_browser(agent: Any, *, busy: bool) -> None:
     """The `/memories/` browser — a fragment for what it stops the page from doing.
 
-    Every widget interaction in a Streamlit app reruns the whole script, and this
-    page's script re-reads the checkpoint (`agent.get_state` — the largest object in
-    the app, per its own comment), rebuilds the export document from it, and redraws
-    every chat bubble in the thread. Picking a different note out of the sidebar
-    depends on none of that. As a fragment, that click redraws this expander and
-    nothing else.
+    Every widget interaction in a Streamlit app reruns the whole script, which for this
+    page means re-reading the checkpoint, rebuilding the export document, and redrawing
+    every chat bubble in the thread. Picking a different note out of the sidebar depends
+    on none of that; as a fragment, that click redraws this expander alone.
+
+    **The point is that the page does not repaint, not that it is faster.** Measured on
+    a 40-turn thread, a whole full rerun is order 7 ms of server work (`get_state`
+    0.44 ms) — so read this as keeping the rest of the page *stable*, and do not
+    reconstruct a cost argument for it. See CLAUDE.md for the numbers.
 
     `busy` is still honoured, and the reason is worth stating because the fragment
     makes it look redundant. A fragment-scoped rerun cannot tear down `agent.stream`
