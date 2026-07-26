@@ -440,8 +440,60 @@ the stack owns the only reference to that generator. Return the agent alone and 
 is garbage collected, the generator finalized, and the agent left holding two *closed*
 connections — surfacing much later as an unrelated-looking sqlite error. Both backends
 are opened `check_same_thread=False` with a `threading.Lock`, so sharing one agent across
-Streamlit's per-session script threads is fine; two concurrent turns on the same
-`thread_id` are not, which is why the page disables input while a turn is in flight.
+Streamlit's per-session script threads is fine.
+
+**Two concurrent turns on one `thread_id` are not fine, and per-session state cannot
+prevent them.** This paragraph used to say the page's disabled input handled it, which
+was simply wrong: `busy` lives in `st.session_state`, so it is per browser session, and
+two tabs both defaulting to thread `main` could each start a turn and run two
+`agent.stream()` calls against one checkpoint. `webui.claim_thread` is the actual guard —
+a process-wide set behind a `threading.Lock`, non-blocking (a blocking lock would park a
+script thread for the minutes a turn takes and read as a hung page). It covers the
+*streaming* window only; the claim is released while a turn waits at an approval, since
+holding it across an indefinite human wait would wedge the thread if that person walked
+away. Module-level mutable state is normally a Streamlit bug — the per-user store is
+`st.session_state` — but here the thing being guarded is process-wide too.
+
+Still on the operator: `SqliteStore.from_conn_string` sets no `journal_mode=WAL` (unlike
+`SqliteSaver`, which does), so the REPL and the browser writing `memories.sqlite`
+simultaneously can raise `database is locked`. `claim_thread` guards one process.
+
+**`RerunException` derives from `BaseException`, and that has teeth here.** Streamlit
+aborts a running script at its next `st.*` call — and the feed calls `st.markdown` on
+every line — so *any* live widget clicked mid-turn tears down the `agent.stream`
+generator, cancelling researchers whose searches are already paid for. The page's
+`except Exception` around the stream cannot catch it. Two consequences, both load-bearing:
+every control that could fire a rerun is disabled while `busy` (the chat input, the
+thread field, **the export button and the memory selectbox** — the last two were missed
+first time round), and **the payload is consumed before streaming, not after**. Leaving
+it set meant the next rerun re-entered with the same user message: the question appended
+to the thread twice, `thread_sections` merging the pair into one doubled bubble, and
+every search billed again.
+
+**A pending approval must be recoverable from the checkpoint.** `st.session_state.pending`
+dies with the browser session, but the interrupt does not — so a refresh or a new tab
+stranded the turn: no form, chat input re-enabled, and the next question sending fresh
+input to a thread with a pending interrupt (the prefill 400 documented above).
+`webui.recover_pending` reads `StateSnapshot.interrupts` — already the flattened
+`[i for task in tasks_with_writes for i in task.interrupts]`, so there is no need to walk
+`.tasks`. It runs only when the session is idle; during a turn the live stream is the
+authority, because the checkpoint lags it. This is also what makes "a thread you start in
+one front door continues in the other" true for a thread the REPL left paused.
+
+**The page needs an escape hatch, and `approval_form` is why.** It keeps submit disabled
+until every action has a valid decision — so a tool gated with decisions this UI cannot
+render would disable it forever, while `busy` has already disabled the chat input and the
+thread field and `st.stop()` ends the page. There would be no control left that could
+move the session forward. `cli._prompt_decision` raises `ValueError` for the same input
+and `cli.main`'s broad `except` abandons the turn; the "Abandon this turn" button is the
+browser's equivalent, and it works for any stuck approval rather than just that one.
+
+**`.streamlit/config.toml` sets `server.address = "localhost"`.** Streamlit leaves it
+unset by default, which listens on every interface — observed directly: a plain
+`streamlit run` here advertised a LAN Network URL *and* an External URL. The page has no
+authentication and its visitor can spend the API keys, read every note under
+`/memories/`, and click Approve on a gated `write_file`. Serving it to anyone else means
+putting real auth in front of it, not deleting that line.
 
 **CI installs the `ui` group; it does not install `serve`.** Not an inconsistency — the
 difference is first-party code. Nothing in this repo imports `langgraph-cli`, so there is
@@ -453,9 +505,22 @@ a suite that silently skips in CI protects nothing, hence the group.
 
 **Widget behaviour is tested with `streamlit.testing.v1.AppTest`**, which runs a script
 headless and exposes the elements it produced (`AppTest.from_string`, then
-`.button_group[0].set_value("approve").run()`). It is the only way to assert the thing
-that actually matters about the approval UI. Two lessons from writing those tests, both
-found by breaking the source to check the test bit:
+`.button_group[0].set_value("approve").run()`). `AppTest.from_file("streamlit_app.py")`
+drives the whole page — it works offline because `conftest.py` already sets dummy
+credentials and an isolated `DEEP_RESEARCH_STATE_DIR` as top-level code, so
+`missing_keys()` passes and the sqlite files land in a temp dir. `tests/test_webui.py`
+covers rendering and the widgets; `tests/test_streamlit_page.py` covers the rerun state
+machine those sit inside.
+
+One thing NOT to attempt there: raising a `BaseException` inside the script to simulate
+a mid-turn abort. It kills Streamlit's script thread outright, so `AppTest.run()` waits
+out its full timeout and fails on that rather than on your assertion — measured, at 60s
+for one test. Assert the invariant instead: a stub `_stream_turn` that records
+`st.session_state.payload` at call time pins "consumed before streaming" directly, in
+milliseconds, and holds however the turn is interrupted.
+
+**Three lessons from writing these tests, each found by breaking the source to check the
+test bit — and in every case the test passed while the code was broken:**
 
 - **Assert `not script.exception`.** Dropping the dedupe in `pending_reviews` still
   passed a "one set of controls" assertion, because the duplicate render raises
@@ -465,6 +530,20 @@ found by breaking the source to check the test bit:
   omission.** The kind-coverage test began as `len(markdown) >= len(FEED_KINDS)` across
   all kinds at once; `plan` draws two elements, so the totals had exactly one element of
   slack and it absorbed exactly one deleted branch. Parametrizing per kind fixed it.
+- **Stub away whatever else could satisfy the assertion.** "The export button is disabled
+  during a turn" passed with the busy-gating removed, because the test thread was empty
+  so `disabled=not document` was already True. Same for the memory selectbox, which is
+  not rendered at all unless the store has something in it. The fix is to stub
+  `export_markdown` and `cached_memory_files` so `busy` is the only remaining cause —
+  plus a positive control asserting both are *enabled* when idle, without which every
+  "disabled" assertion could be passing on a widget that is disabled unconditionally.
+
+`FEED_KINDS` is checked in **both** directions: parametrized coverage proves every listed
+kind draws something, and `test_feed_kinds_lists_every_kind_the_renderers_actually_handle`
+parses the two if/elif chains and asserts the tuple has no missing or dead entries. One
+direction alone is nearly worthless — a kind wired into both renderers but absent from
+the tuple is simply never exercised, and the next person to add one and wire only half
+gets exactly the silent blank line the tuple exists to prevent.
 
 ## Orchestrator ↔ subagent model
 

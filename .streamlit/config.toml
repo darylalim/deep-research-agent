@@ -1,4 +1,19 @@
-# Theme for `streamlit run streamlit_app.py`.
+# Config for `streamlit run streamlit_app.py`.
+
+[server]
+# BIND TO LOOPBACK ONLY. Streamlit leaves `address` unset by default, which listens on
+# every interface — observed directly: a plain `streamlit run` here advertised a LAN
+# Network URL *and* an External URL. This app has no authentication and its visitor can
+# spend ANTHROPIC_API_KEY/TAVILY_API_KEY, read every note under `/memories/`, download
+# the whole transcript, and — the one that matters — click Approve on a gated
+# `write_file`, which `webui.decision_controls` calls the only security boundary the app
+# has. A single-user local tool has no reason to be reachable from the network.
+#
+# Deliberately serving it to others (a LAN, a container) means putting real
+# authentication in front of it first, not just deleting this line.
+address = "localhost"
+
+# --- Theme --------------------------------------------------------------------------
 #
 # BOTH `[theme.light]` and `[theme.dark]` are defined on purpose: a config with only a
 # bare `[theme]` section locks the app to a single mode and removes the light/dark

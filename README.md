@@ -86,7 +86,14 @@ uv run --group ui streamlit run streamlit_app.py   # http://localhost:8501
 
 The same agent, same threads, same `.deep_research/` databases — the REPL and the
 browser are two views of one conversation, so a thread you start in one continues in
-the other. What the browser adds is room the terminal doesn't have:
+the other, including one left paused at an approval. Use them one at a time: only the
+checkpointer's sqlite file is in WAL mode, so simultaneous writers can collide.
+
+It binds to `localhost` only (`.streamlit/config.toml`). The page has no authentication
+and its visitor can approve file writes and spend your API keys, so putting it on a
+network means putting real auth in front of it first.
+
+What the browser adds is room the terminal doesn't have:
 
 - **A per-answer work log.** The plan, each delegated sub-question and every search
   query, collapsed into an expander under the answer it produced.

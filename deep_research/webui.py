@@ -31,8 +31,9 @@ duplication this file exists to avoid.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from contextlib import ExitStack
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import streamlit as st
@@ -50,10 +51,54 @@ from .cli import (
     pending_reviews,
 )
 
-# Long argument values get a scrolling code block past this many lines rather than
+# A long argument value gets a scrolling code block past this many lines rather than
 # growing the page without bound.
 _SCROLL_AFTER_LINES = 20
 _SCROLL_HEIGHT_PX = 420
+
+# Thread ids with a turn currently running, PROCESS-wide. Module-level mutable state is
+# normally a bug in a Streamlit app — `st.session_state` is the per-user store and this
+# is shared across every session — but shared is exactly the point here: the thing being
+# guarded (one LangGraph thread's checkpoint) is shared too. See `claim_thread`.
+_ACTIVE_THREADS: set[str] = set()
+_ACTIVE_THREADS_LOCK = threading.Lock()
+
+
+@contextmanager
+def claim_thread(thread_id: str) -> Iterator[bool]:
+    """Take exclusive process-wide use of `thread_id`; yields False if already taken.
+
+    **Per-session state cannot do this job, and assuming it could was a real bug.** The
+    page disables its own input while a turn runs, but `st.session_state` is per browser
+    session, so two tabs — both defaulting to thread `main` — could each start a turn and
+    run two concurrent `agent.stream()` calls against one checkpoint. That is a LangGraph
+    write race, not a sqlite one, so the backends' own locks do not cover it.
+
+    Deliberately non-blocking: the caller is told "no" and says so, rather than waiting.
+    A blocking lock would park a Streamlit script thread for the several minutes a
+    research turn takes, which reads to the second user as a hung page.
+
+    **Scope is the streaming window, not the whole turn.** The claim is released while a
+    turn sits at an approval prompt, because holding it across an indefinite human wait
+    would wedge the thread for the process's lifetime if that person walked away. A
+    second session arriving during that window sees the same pending interrupt anyway,
+    via `recover_pending`, which is the sane outcome rather than a race.
+
+    Note this guards a *process*. Running the REPL and the browser against the same
+    thread at the same time is still on the operator — as is the fact that
+    `SqliteStore.from_conn_string` (unlike `SqliteSaver`) sets no `journal_mode=WAL`, so
+    simultaneous writers on `memories.sqlite` can raise `database is locked`.
+    """
+    with _ACTIVE_THREADS_LOCK:
+        claimed = thread_id not in _ACTIVE_THREADS
+        if claimed:
+            _ACTIVE_THREADS.add(thread_id)
+    try:
+        yield claimed
+    finally:
+        if claimed:
+            with _ACTIVE_THREADS_LOCK:
+                _ACTIVE_THREADS.discard(thread_id)
 
 
 @st.cache_resource(show_spinner="Opening the research agent…")
@@ -71,13 +116,59 @@ def open_cached_agent() -> tuple[Any, ExitStack]:
 
     Both sqlite backends are opened `check_same_thread=False` and guard their cursors
     with a `threading.Lock`, so sharing one agent across Streamlit's per-session script
-    threads is safe. Two *concurrent turns on the same `thread_id`* are still a bad idea
-    — that is a LangGraph checkpoint race, not a sqlite one — so the page disables input
-    while a turn is in flight.
+    threads is safe. Concurrent turns on the SAME `thread_id` are not safe, and the
+    page's own disabled input does not prevent them — `claim_thread` does.
     """
     stack = ExitStack()
     agent = stack.enter_context(open_agent())
     return agent, stack
+
+
+def should_render_question(
+    asking: str | None, sections: Sequence[tuple[str, str]]
+) -> bool:
+    """Whether the in-flight question still needs drawing above the live feed.
+
+    False once the checkpoint carries it. The human message is written on the graph's
+    first superstep, so it is there for every rerun after the first, and drawing it
+    unconditionally would show it twice for the whole length of an approval.
+
+    **Substring, and stripped on both sides** — equality against the raw `st.chat_input`
+    value missed two real cases, each double-drawing the question:
+
+    - `thread_sections` strips every message, so a prompt with a trailing newline never
+      matched its checkpointed form.
+    - `thread_sections` joins consecutive same-speaker messages with `\\n\\n`. When the
+      previous turn produced no assistant prose — exactly what a classifier refusal looks
+      like, and a case this app already handles elsewhere — the old and new questions
+      merge into ONE human section equal to neither.
+
+    Extracted from the page so it can be tested; the failure it guards is invisible in a
+    screenshot until an approval sits on screen with the question drawn twice.
+    """
+    if not asking:
+        return False
+    asked = asking.strip()
+    return not any(kind == "human" and asked in text for kind, text in sections)
+
+
+def recover_pending(state: Any) -> list[Any]:
+    """Interrupts the graph is still waiting on, read from the CHECKPOINT.
+
+    Without this, a pending approval lives only in `st.session_state`, and a refresh, a
+    new tab, or a session expiry strands it: the graph still considers the turn paused,
+    but the page shows no form and re-enables the chat input. The next question then
+    sends fresh input to a thread with a pending interrupt — the prefill 400 CLAUDE.md
+    documents, which `cli.py` never trips only because it never leaves the process.
+
+    It is also what makes the README's "a thread you start in one continues in the other"
+    true for a thread the REPL left paused at an approval.
+
+    `StateSnapshot.interrupts` is already the flattened
+    `[i for task in tasks_with_writes for i in task.interrupts]` (langgraph
+    `pregel/main.py`), so there is no need to walk `.tasks` here.
+    """
+    return list(getattr(state, "interrupts", ()) or ())
 
 
 def render_event(event: FeedEvent) -> None:
@@ -171,7 +262,7 @@ def render_action(request: dict[str, Any]) -> None:
     see the content before it lands in durable, gitignored `/memories/` that git cannot
     restore, and a reviewer who cannot read the diff approves it unread.
 
-    Two deliberate differences from `cli._render_action`, both in the same direction:
+    Three deliberate differences from `cli._render_action`:
 
     - **Nothing is elided.** The terminal caps the preview at `PREVIEW_LINES` because a
       scrollback buffer is a poor place to dump a report; a browser has no such excuse,
@@ -179,6 +270,18 @@ def render_action(request: dict[str, Any]) -> None:
     - **`language=None`**, i.e. plain monospace. Guessing a highlighter from the tool or
       the file extension would reintroduce exactly the per-tool special-casing the CLI
       avoids, and would need updating every time `GATED_TOOLS` grows.
+    - **Every value goes through `st.code`, including short scalars.** Not a style
+      choice — arguments are written by the MODEL, and the earlier version rendered
+      scalars with `st.markdown`, so a `file_path` of `[safe](http://elsewhere)` drew a
+      link instead of the literal string that would be passed to the tool. Formatted
+      markdown is precisely wrong on the one screen whose entire job is showing a
+      reviewer, verbatim, what is about to happen.
+
+      Sending everything down one path also deletes this function's copy of the CLI's
+      long-vs-scalar classification (the `\\n`-or-over-120-chars test and its
+      `splitlines() or [""]`). That duplication was the same drift `pending_reviews` and
+      `allowed_decisions_by_tool` were extracted to prevent, and it sat in the app's only
+      security-relevant screen. There is nothing left here to drift.
     """
     name = request.get("name", "<tool>")
     args = request.get("args", {})
@@ -192,21 +295,18 @@ def render_action(request: dict[str, Any]) -> None:
         return
 
     for key, value in args.items():
-        # A long or multi-line string is the thing the reviewer is here to read; give it
-        # its own block. Everything else is a scalar — a path, a flag — and reads inline.
-        if isinstance(value, str) and ("\n" in value or len(value) > 120):
-            lines = value.splitlines() or [""]
-            st.caption(f"{key} · {len(lines)} line{'s' if len(lines) != 1 else ''}")
-            st.code(
-                value,
-                language=None,
-                wrap_lines=True,
-                height=(
-                    _SCROLL_HEIGHT_PX if len(lines) > _SCROLL_AFTER_LINES else "content"
-                ),
-            )
-        else:
-            st.markdown(f"`{key}` · {_short(value, 200)}")
+        text = value if isinstance(value, str) else _short(value, 200)
+        lines = text.splitlines() or [""]
+        count = f" · {len(lines)} lines" if len(lines) > 1 else ""
+        st.caption(f"{key}{count}")
+        st.code(
+            text,
+            language=None,
+            wrap_lines=True,
+            height=(
+                _SCROLL_HEIGHT_PX if len(lines) > _SCROLL_AFTER_LINES else "content"
+            ),
+        )
 
 
 def decision_controls(
@@ -377,6 +477,12 @@ def memory_files(agent: Any) -> list[tuple[str, str]]:
     whole subject is where findings are kept. `MEMORY_ROUTE` puts it back, and comes from
     the same constant the route itself is built from so the two cannot drift.
 
+    **Paginated, because `store.search` takes a `limit` and silently returns no more
+    than that.** This used to pass `limit=100` and stop, so the 101st note simply
+    vanished from the one view whose subject is where durable findings are kept — with
+    nothing distinguishing "never saved" from "not shown". deepagents' own
+    `StoreBackend.ls` loops the same way (`backends/store.py`).
+
     Handles both stored shapes: deepagents writes `content` as a plain string, and as a
     `list[str]` under its legacy `file_format="v1"`.
     """
@@ -384,11 +490,39 @@ def memory_files(agent: Any) -> list[tuple[str, str]]:
     if store is None:
         return []
     files: list[tuple[str, str]] = []
-    for item in store.search(MEMORY_NAMESPACE, limit=100):
-        value = getattr(item, "value", None)
-        content = value.get("content", "") if isinstance(value, dict) else ""
-        if isinstance(content, list):
-            content = "\n".join(str(line) for line in content)
-        key = str(getattr(item, "key", "?")).lstrip("/")
-        files.append((MEMORY_ROUTE + key, str(content)))
-    return sorted(files)
+    page = 100
+    offset = 0
+    while True:
+        items = store.search(MEMORY_NAMESPACE, limit=page, offset=offset)
+        for item in items:
+            value = getattr(item, "value", None)
+            content = value.get("content", "") if isinstance(value, dict) else ""
+            if isinstance(content, list):
+                content = "\n".join(str(line) for line in content)
+            key = str(getattr(item, "key", "?")).lstrip("/")
+            files.append((MEMORY_ROUTE + key, str(content)))
+        if len(items) < page:
+            return sorted(files)
+        offset += page
+
+
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
+def cached_memory_files(_agent: Any) -> list[tuple[str, str]]:
+    """`memory_files`, but not re-read from sqlite on every single rerun.
+
+    The sidebar expander that shows these runs its body whether or not it is open, and a
+    turn reruns the page on every approval click and widget change — so the uncached
+    version pulled every note body out of sqlite each time, to render a panel nobody had
+    opened.
+
+    `_agent` is underscore-prefixed so Streamlit excludes it from the cache key (it is
+    not hashable and never varies within a process); the key is therefore constant and
+    `max_entries=1` is the whole cache. The 60s TTL bounds staleness on its own, and
+    `refresh_memory_files()` drops it immediately after a turn that may have written.
+    """
+    return memory_files(_agent)
+
+
+def refresh_memory_files() -> None:
+    """Drop the memory cache, so a just-approved write shows up at once."""
+    cached_memory_files.clear()

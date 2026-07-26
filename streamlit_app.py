@@ -91,7 +91,15 @@ with st.sidebar:
         ),
     ).strip()
 
-if thread_id and thread_id != st.session_state.thread_id:
+if not thread_id:
+    # The widget has no `key`, so its emptied value persists across reruns while
+    # `st.session_state.thread_id` keeps the old name — a blank box and an app quietly
+    # still on the previous thread, with nothing to notice it by. Say so rather than
+    # picking a thread on the user's behalf.
+    st.sidebar.warning(
+        f"A thread needs a name — still on `{st.session_state.thread_id}`."
+    )
+elif thread_id != st.session_state.thread_id:
     # Work logs and refusal notes are indexed against the *previous* thread's
     # transcript, so they are meaningless here. The answers themselves are in the
     # checkpoint and reappear on their own.
@@ -99,33 +107,66 @@ if thread_id and thread_id != st.session_state.thread_id:
     st.rerun()
 
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
-values = agent.get_state(config).values
+# ONE read. `get_state` deserializes the thread's whole message list — the largest
+# object in the app — and this used to be called twice more at the end of every turn.
+state = agent.get_state(config)
+values = state.values
 sections = thread_sections(values)
+
+# An approval that outlived the browser session. `pending` otherwise lives only in
+# session state, so a refresh or a new tab strands the turn: the graph still considers
+# it paused, but the page would show no form and re-enable the chat input, and the next
+# question would send fresh input to a thread with a pending interrupt (the prefill 400
+# CLAUDE.md documents). Recovered only when this session is not mid-turn — during a turn
+# the live stream is the authority.
+_idle = not st.session_state.pending and st.session_state.payload is None
+if _idle and (recovered := webui.recover_pending(state)):
+    st.session_state.pending = recovered
+    # The feed for that turn died with the old session; a fresh one still carries
+    # `note_declined` and collects whatever the resumed stream emits.
+    if st.session_state.feed is None:
+        st.session_state.feed = webui.StreamlitFeed()
+    # Rerun rather than carrying on: `busy` was computed above, before this recovery, so
+    # the sidebar and chat input on THIS pass still think the session is idle.
+    st.rerun()
 
 # --- sidebar: export and durable memory ---------------------------------------------
 with st.sidebar:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     document = export_markdown(values, st.session_state.thread_id, stamp)
+    # DISABLED WHILE BUSY, and not for tidiness. Streamlit interrupts a running script at
+    # its next `st.*` call, and the feed calls `st.markdown` on every line — so a click
+    # here mid-turn raises `RerunException` inside `_stream_turn`, tearing down the
+    # `agent.stream` generator and cancelling researchers whose searches are already paid
+    # for. (`RerunException` derives from BaseException, so the `except Exception` around
+    # the stream cannot catch it; the payload is consumed before streaming for that
+    # reason.) Only the chat input and thread field were guarded before.
     st.download_button(
         "Export transcript",
         data=document,
         file_name=f"research-{st.session_state.thread_id}-{stamp}.md",
         mime="text/markdown",
         icon=":material/download:",
-        disabled=not document,
+        disabled=busy or not document,
         width="stretch",
         help="Every question in this thread with its cited answer.",
     )
 
     with st.expander("Durable memory", icon=":material/database:"):
         try:
-            saved = webui.memory_files(agent)
+            # Cached: an expander runs its body whether or not it is open, so the
+            # uncached read pulled every note out of sqlite on each rerun to fill a
+            # panel nobody had opened.
+            saved = webui.cached_memory_files(agent)
         except Exception as exc:  # noqa: BLE001 — a sidebar read must not kill the page
             st.caption(f"Could not read memory: {exc}")
             saved = []
         if saved:
             chosen = st.selectbox(
-                "File", [path for path, _ in saved], label_visibility="collapsed"
+                "File",
+                [path for path, _ in saved],
+                label_visibility="collapsed",
+                disabled=busy,
             )
             st.code(dict(saved)[chosen], language=None, height=240, wrap_lines=True)
         else:
@@ -164,15 +205,11 @@ for _index, (_kind, _text) in enumerate(sections):
             st.warning(f"{_note} — rephrasing or narrowing it usually helps.")
         st.markdown(_text)
 
-# The question of a turn already in flight. Rendered only when the checkpoint does not
-# already carry it: the human message is written on the graph's first superstep, so it
-# is present for every rerun after the first, and drawing it unconditionally would show
-# it twice for the whole length of an approval.
-if (asking := st.session_state.question) and not any(
-    kind == "human" and text == asking for kind, text in sections
-):
+# The question of a turn already in flight, drawn only until the checkpoint carries it.
+# The comparison is subtler than it looks — see `webui.should_render_question`.
+if webui.should_render_question(st.session_state.question, sections):
     with st.chat_message("user"):
-        st.markdown(asking)
+        st.markdown(st.session_state.question)
 
 if st.session_state.notice:
     st.info(st.session_state.notice)
@@ -218,34 +255,76 @@ if st.session_state.pending:
                 ),
             )
             st.rerun()
+
+        # An escape hatch, and a required one. `approval_form` keeps submit disabled
+        # until every action has a valid decision — so a tool gated with an
+        # `InterruptOnConfig` this UI cannot render a control for leaves the button
+        # permanently disabled, while `busy` has already disabled the chat input and the
+        # thread field and `st.stop()` below ends the page. The session would have no
+        # control left that could move it forward. `cli._prompt_decision` raises for the
+        # same input and `cli.main`'s broad `except` abandons the turn; this is the
+        # browser's equivalent, and it works for any stuck approval, not just that one.
+        if st.button("Abandon this turn", icon=":material/close:"):
+            st.session_state.update(
+                pending=[],
+                payload=None,
+                question=None,
+                feed=None,
+                notice=(
+                    "Turn abandoned. The pending action was not taken; ask again to "
+                    "start a fresh turn."
+                ),
+            )
+            st.rerun()
     st.stop()
 
 # --- run or resume the turn ------------------------------------------------------------
 if st.session_state.payload is not None:
     feed = st.session_state.feed
+    # CONSUMED BEFORE STREAMING, not after. Streamlit aborts a running script at its next
+    # `st.*` call by raising `RerunException` — which derives from BaseException, so the
+    # `except Exception` below does not catch it and cannot clear the payload on the way
+    # out. Leaving it set meant the next rerun re-entered here with the SAME user
+    # message: the question appended to the thread twice, `thread_sections` merging the
+    # pair into one doubled bubble, and every search paid for again. Taking it now makes
+    # an interrupted turn simply end — the same outcome as Ctrl-C in the REPL.
+    payload = st.session_state.payload
+    st.session_state.payload = None
     with (
         st.chat_message("assistant"),
         st.status("Researching…", expanded=True) as status,
+        webui.claim_thread(st.session_state.thread_id) as claimed,
     ):
+        if not claimed:
+            # Another browser session is already running this thread. Per-session `busy`
+            # cannot see that; two tabs both default to thread `main`.
+            status.update(label="Thread busy", state="error")
+            st.session_state.update(
+                question=None,
+                feed=None,
+                notice=(
+                    f"Thread `{st.session_state.thread_id}` already has a turn running "
+                    "in another session. Wait for it, or switch threads."
+                ),
+            )
+            st.rerun()
         feed.replay()  # everything this turn already did, before the approval
         try:
-            pending = _stream_turn(agent, st.session_state.payload, config, feed)
+            pending = _stream_turn(agent, payload, config, feed)
         except Exception as exc:  # noqa: BLE001 — surface any runtime error to the user
             # Whatever prose the turn already produced is in the checkpoint and reappears
             # in the transcript on the next run: the agent composes its cited report in
             # the same message that proposes `write_file`, so an abandoned turn is
             # routinely one that had already done every search.
             status.update(label="Turn failed", state="error")
-            st.session_state.update(
-                payload=None, question=None, feed=None, notice=f"Error: {exc}"
-            )
+            st.session_state.update(question=None, feed=None, notice=f"Error: {exc}")
             st.rerun()
 
         if pending:
             status.update(
                 label="Waiting for your approval", state="complete", expanded=False
             )
-            st.session_state.update(pending=pending, payload=None)
+            st.session_state.pending = pending
             st.rerun()
 
         status.update(label="Research complete", state="complete", expanded=False)
@@ -256,8 +335,9 @@ if st.session_state.payload is not None:
     # on. It becomes a page-level notice instead of vanishing, which is the whole point
     # of detecting it: silence reads as a bug in this app rather than a decision by the
     # model, and gives the user no reason to think rephrasing would help.
-    settled = thread_sections(agent.get_state(config).values)
-    refusal = _turn_refusal(agent.get_state(config).values)
+    settled_values = agent.get_state(config).values  # one read, feeding both
+    settled = thread_sections(settled_values)
+    refusal = _turn_refusal(settled_values)
     if settled and settled[-1][0] == "ai":
         st.session_state.work_logs[len(settled) - 1] = tuple(feed.events)
         if refusal:
@@ -266,5 +346,7 @@ if st.session_state.payload is not None:
     else:
         notice = refusal or "The agent finished this turn without saying anything."
 
-    st.session_state.update(payload=None, question=None, feed=None, notice=notice)
+    # The turn may have written a note; drop the cached listing so the sidebar shows it.
+    webui.refresh_memory_files()
+    st.session_state.update(question=None, feed=None, notice=notice)
     st.rerun()

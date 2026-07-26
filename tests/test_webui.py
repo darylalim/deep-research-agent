@@ -253,6 +253,36 @@ def test_every_feed_kind_is_rendered_by_both_front_ends(
     assert script.markdown, f"the browser drew nothing for {kind!r}"
 
 
+def test_feed_kinds_lists_every_kind_the_renderers_actually_handle() -> None:
+    """The other direction, and the test above is worth little without it.
+
+    `test_every_feed_kind_is_rendered_by_both_front_ends` parametrizes over
+    `FEED_KINDS`, so a kind wired into both renderers but forgotten in the tuple is
+    simply never exercised — and the next person to add a kind and wire only one
+    renderer then gets exactly the silent blank line the tuple exists to catch. Closing
+    the loop means asserting the tuple is neither missing entries nor carrying dead ones.
+
+    Reading the branches out of the source is deliberate. Driving `absorb` instead would
+    only reach the kinds a fixture happens to trigger, which is the same partial-coverage
+    problem one level down; the if/elif chains ARE the contract, so they are what gets
+    compared.
+    """
+    import inspect
+    import re
+
+    from deep_research.cli import ActivityFeed
+
+    terminal = set(
+        re.findall(r'event\.kind == "(\w+)"', inspect.getsource(ActivityFeed._emit))
+    )
+    browser = set(re.findall(r'kind == "(\w+)"', inspect.getsource(webui.render_event)))
+
+    assert terminal, "found no branches — the regex has drifted from the source"
+    assert browser, "found no branches — the regex has drifted from the source"
+    assert terminal == set(FEED_KINDS)
+    assert browser == set(FEED_KINDS)
+
+
 class TestMemoryFiles:
     """The `/memories/` browser. Reads the Store directly — no model turn, no approval."""
 
@@ -455,6 +485,29 @@ def test_the_full_file_body_is_shown_rather_than_elided() -> None:
     )
 
     assert any(block.value == body for block in script.code)
+
+
+def test_argument_values_are_shown_literally_and_never_as_markdown() -> None:
+    """Tool arguments are written by the MODEL, and this is the screen that authorises them.
+
+    The scalar branch used to render through `st.markdown`, so a `file_path` of
+    `[safe](http://elsewhere)` drew a *link* — formatted markdown standing in for the
+    literal string about to be passed to the tool, on the one screen whose entire job is
+    showing a reviewer exactly what will happen. Every value goes through `st.code` now.
+    """
+    hostile = "/memories/[safe](http://elsewhere.test)/**x**.md"
+    script = _form(
+        Interrupt(
+            id="i1",
+            value={"action_requests": [{"name": "write_file", "args": {"p": hostile}}]},
+        )
+    )
+
+    assert any(block.value == hostile for block in script.code), (
+        "the argument was not rendered verbatim in a code block"
+    )
+    # And nothing re-emitted it as markdown, where it would render as a link.
+    assert not any(hostile in (m.value or "") for m in script.markdown)
 
 
 def test_a_pause_with_no_reviewable_action_is_detected_rather_than_resumed() -> None:
