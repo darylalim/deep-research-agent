@@ -101,7 +101,23 @@ st.caption(
 )
 
 prompt = st.chat_input("Ask a research question", disabled=busy, submit_mode="disable")
-if prompt:
+if prompt and busy:
+    # `disabled` is not a guarantee, and painting this widget above the checkpoint read
+    # is what made that matter. On the pass that DISCOVERS a pause — a fresh tab on a
+    # thread the REPL left at an approval — `busy` is still False, so the input paints
+    # enabled while `agent.get_state` deserializes the whole message list. A question
+    # typed into that window is queued, and Streamlit delivers a queued value even to a
+    # widget that is disabled by the time it arrives.
+    #
+    # Accepting it here would either overwrite a `Command(resume=…)` already in
+    # `payload`, wedging the turn, or be silently discarded by the approval screen below
+    # — which had already drawn a user bubble for it via `should_render_question`. Say
+    # so instead; the notice renders further down this same pass, so there is no rerun.
+    st.session_state.notice = (
+        "That question was not sent — this thread already has a turn in flight. "
+        "Finish or abandon it, then ask again."
+    )
+elif prompt:
     st.session_state.update(
         question=prompt,
         payload={"messages": [{"role": "user", "content": prompt}]},

@@ -239,6 +239,44 @@ class TestTheApprovalPanelEscalatesToTheTurnLoop:
         assert page.session_state["pending"] == []
 
 
+class TestAQuestionCannotSlipPastATurnInFlight:
+    """`disabled=True` on `st.chat_input` is not a guarantee, and the page relies on it.
+
+    Streamlit delivers a queued widget value even to a widget that is disabled by the
+    time it arrives — and painting the chat input *above* the checkpoint read opened a
+    window where it is legitimately enabled: on the pass that discovers a pause (a fresh
+    tab on a thread left at an approval), `busy` is still False while `agent.get_state`
+    deserializes the whole message list.
+
+    Measured before the guard: `payload={'messages': [...]}, question='a brand new
+    question'` with `pending=['i1']` still set. The approval screen then `st.stop()`s,
+    approving overwrites `payload` with the resume `Command`, and the question is gone —
+    having already been drawn as a user bubble by `should_render_question`.
+    """
+
+    def test_a_question_arriving_mid_turn_is_refused_rather_than_swallowed(
+        self,
+    ) -> None:
+        page = _page(
+            pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
+            feed=webui.StreamlitFeed(),
+        )
+        assert page.chat_input[0].disabled, (
+            "precondition: the input is already disabled"
+        )
+
+        page.chat_input[0].set_value("a brand new question").run()
+
+        assert not page.exception, page.exception
+        assert page.session_state["payload"] is None, (
+            "the queued question overwrote the turn's payload"
+        )
+        assert page.session_state["question"] is None
+        assert "not sent" in (page.session_state["notice"] or "").lower()
+        # And the thing that was actually in flight is untouched.
+        assert [i.id for i in page.session_state["pending"]] == ["i1"]
+
+
 class TestGivingUpOnAnInterruptActuallyGivesUp:
     """Both paths that drop a turn, against a graph that is genuinely still paused.
 
