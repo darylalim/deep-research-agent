@@ -221,7 +221,20 @@ def _stop_note(message: Any) -> StopNote | None:
     if note is None:
         return None
     details = metadata.get("stop_details")
-    category = details.get("category") if isinstance(details, dict) else None
+    # BOTH shapes, attribute first. A wrong assumption about the *type* here is exactly as
+    # invisible as the wrong *key* this branch already shipped once, and for the same
+    # reason — the branch is dead, so nothing can tell a right guess from a wrong one until
+    # the field arrives. The two langchain paths genuinely differ: `_format_output`
+    # (non-streaming) builds `response_metadata` from `data.model_dump()`, so dicts; the
+    # `message_delta` handler — the one this app always takes, since `streaming=True` —
+    # assembles it field by field off the raw event and has to call `.model_dump()`
+    # explicitly for `container` and `context_management`, which is proof that what sits
+    # there is pydantic models. `stop_details` added to that block without one would be a
+    # `RefusalStopDetails` instance, and a dict-only read would drop the category without
+    # a sound. `getattr` on a dict returns None, so the fallback still covers the other.
+    category = getattr(details, "category", None) or (
+        details.get("category") if isinstance(details, dict) else None
+    )
     if isinstance(category, str) and category:
         return StopNote(f"{note.reason} ({category})", note.remedy)
     return note

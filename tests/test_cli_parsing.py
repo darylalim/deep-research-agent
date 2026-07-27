@@ -132,6 +132,21 @@ class TestStopNote:
         )
         assert note and note.reason == "the model declined this request (cyber)"
 
+    def test_a_model_shaped_stop_details_works_too_not_only_a_dict(self) -> None:
+        # The streaming path is the one this app always takes (`streaming=True`), and it
+        # is the path that puts pydantic MODELS in `response_metadata`: langchain's
+        # `message_delta` handler assembles the dict field by field off the raw event and
+        # calls `.model_dump()` explicitly for `container` and `context_management`. Add
+        # `stop_details` there without one and it arrives as a `RefusalStopDetails`. A
+        # dict-only read would drop the category silently — the same invisible loss as
+        # the wrong key, one layer along, and equally undetectable while the branch is
+        # dead. `SimpleNamespace` stands in for the model: attribute access is the shape
+        # under test, not pydantic itself.
+        note = _stop_note(
+            _refusal(stop_details=SimpleNamespace(type="refusal", category="bio"))
+        )
+        assert note and note.reason == "the model declined this request (bio)"
+
     def test_the_unstable_explanation_field_is_not_shown_to_the_user(self) -> None:
         # `RefusalStopDetails.explanation` is documented by the SDK as "not guaranteed to
         # be stable" — free text that can change under us, and it must not become the
