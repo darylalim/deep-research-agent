@@ -47,7 +47,13 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "ruff",
+    # Floored, for the same reason `ty` is: the *repo* depends on this version's
+    # behavior, not merely on "some ruff". Every checked-in file is 0.16's formatter
+    # output and CI runs `ruff format --check`, so an older ruff fails on files nobody
+    # touched. No upper cap — see the note under `ty`; the same reasoning applies, and
+    # the formatter's output is re-checked by CI on every run anyway, so a break is
+    # loud rather than silent.
+    "ruff>=0.16",
     # Floor raised from 0.0.58 because the *source* now depends on the fix. ty 0.0.63
     # models Pydantic `populate_by_name`, so `ChatAnthropic(model=..., max_tokens=...)`
     # type-checks without help and the three `ty: ignore`s that `config.py::build_model`
@@ -55,7 +61,15 @@ dev = [
     # directive is itself a `ty check` failure, `unused-ignore-comment`. Measured on one
     # `langchain-anthropic` build: 0.0.58 reports three errors there, 0.0.63 none. With
     # an older ty this repo no longer type-checks, so the floor is a real requirement,
-    # not hygiene. ty is pre-1.0 and pins exactly in `uv.lock`, so no upper cap.
+    # not hygiene.
+    #
+    # **No upper cap, and that is a decision rather than an oversight** — it has been
+    # raised once in review already. The 0.x caps elsewhere in this file (`deepagents`,
+    # `langgraph-cli`) bound things that ship INTO the app, where a surprise resolution
+    # changes runtime behavior. These two are developer tools: `uv.lock` pins them
+    # exactly, so CI and every `uv sync` are already deterministic, and the only exposure
+    # is an install that bypasses the lock. Capping a `0.0.x` tool at its real breaking
+    # boundary would mean `<0.0.64` and an edit per release, which buys churn, not safety.
     "ty>=0.0.63",
 ]
 # The `langgraph dev` server (the Studio / deep-agents-ui front door — see

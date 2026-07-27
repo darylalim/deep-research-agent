@@ -1254,3 +1254,74 @@ class TestRefusalIsReported:
         agent = _FakeAgent(messages=[HumanMessage("q")], rounds=[[]])
         _drive(monkeypatch, agent, "q", "/exit")
         assert "(the agent said nothing)" in capsys.readouterr().out
+
+
+OVERRUN = AIMessage(
+    content="", response_metadata={"stop_reason": "model_context_window_exceeded"}
+)
+
+
+class TestContextWindowOverrunIsReported:
+    """The second silent stop, and the regression that proved one was not enough.
+
+    `model_context_window_exceeded` shipped in anthropic 0.120 and `langchain_anthropic`
+    has no reference to it, so it reaches `response_metadata` raw and looks exactly like
+    a refusal: HTTP 200, empty content, nothing raised. While the check in `_stop_note`
+    was `== "refusal"` it fell straight through to `(the agent said nothing)` — the exact
+    misattribution the refusal work existed to remove, reopened by a dependency upgrade
+    rather than by anyone editing this file.
+
+    This app is the workload that reaches it. Nothing here or in deepagents' default
+    middleware stack summarizes or trims a thread, and threads are checkpointed and
+    resumed indefinitely, so on a long-lived thread it is a matter of time.
+    """
+
+    def test_main_names_the_overrun_instead_of_saying_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        agent = _FakeAgent(messages=[HumanMessage("q"), OVERRUN], rounds=[[]])
+        _drive(monkeypatch, agent, "q", "/exit")
+        out = capsys.readouterr().out
+
+        assert "this turn exceeded the model's context window" in out
+        assert "the agent said nothing" not in out
+
+    def test_it_is_not_reported_as_a_refusal_with_the_refusal_remedy(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The half a shared code path gets wrong for free. Detecting the stop but reusing
+        # the refusal's advice sends the user to rewrite a question that was never the
+        # problem, and says nothing about the thread that actually filled up.
+        agent = _FakeAgent(messages=[HumanMessage("q"), OVERRUN], rounds=[[]])
+        _drive(monkeypatch, agent, "q", "/exit")
+        out = capsys.readouterr().out
+
+        assert "declined" not in out
+        assert "rephrasing or narrowing" not in out
+        assert "starting a fresh thread resets it" in out
+
+    def test_an_overrun_alongside_an_answer_does_not_suppress_it(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Same rule as a refusal: the note prints beside the prose, never instead of it.
+        agent = _FakeAgent(
+            messages=[HumanMessage("q"), OVERRUN, AIMessage(REPORT)], rounds=[[]]
+        )
+        _drive(monkeypatch, agent, "q", "/exit")
+        out = capsys.readouterr().out
+
+        assert "this turn exceeded the model's context window" in out
+        assert REPORT in out
+
+    def test_a_researchers_overrun_is_surfaced_in_the_feed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A researcher carries its own isolated context, so it can overrun independently
+        # of the orchestrator — and it is invisible in exactly the way a refusal is: the
+        # `task` result comes back thin and the orchestrator synthesizes around the hole.
+        feed = ActivityFeed()
+        feed.absorb(SUBAGENT_NS, _updates("model", OVERRUN))
+        assert (
+            "! researcher · this turn exceeded the model's context window"
+            in capsys.readouterr().out
+        )

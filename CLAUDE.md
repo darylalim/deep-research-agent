@@ -751,18 +751,37 @@ turn with no visible symptom. That test calls `agent.invoke()`, not the streamin
 is also the cleanest demonstration that the model's wire format is independent of the graph's
 `stream_mode` — and that tool calls reassemble correctly from partial JSON deltas.
 
-**`stop_reason="refusal"` is the third silent stop, and it used to reach the user as
-`(the agent said nothing)`.** Opus 5 can have a generation stopped by Anthropic's
-classifiers: **HTTP 200, empty content, no exception.** So it bills, raises nothing, and
-lands in the checkpoint as an assistant message with no prose — which `render_turn`
-renders as `''`, and the REPL reported as silence. True, useless, and misattributed: it
-reads as a bug in `cli.py` rather than a decision by the model, and gives the user no
-reason to think rephrasing would help. `cli._refusal_note` / `_turn_refusal` now name it,
-and `ActivityFeed._render_refusal` covers the subagent case (a researcher's refusal is
-otherwise *completely* invisible — its `task` result just comes back thin and the
-orchestrator synthesizes around the hole).
+**Silent stops reach the user as `(the agent said nothing)` unless something names them,
+and there is more than one.** A generation can end with **HTTP 200, empty content, no
+exception** — it bills, raises nothing, and lands in the checkpoint as an assistant
+message with no prose, which `render_turn` renders as `''` and the REPL reported as
+silence. True, useless, and misattributed: it reads as a bug in `cli.py` rather than as
+something the API told us. `cli._stop_note` / `_turn_stop` name it, and
+`ActivityFeed._render_stop` covers the subagent case (a researcher's stop is otherwise
+*completely* invisible — its `task` result just comes back thin and the orchestrator
+synthesizes around the hole).
 
-Three things about that code are load-bearing:
+`cli._SILENT_STOPS` is the table, and **it is a snapshot of a Literal that grows**:
+
+- `refusal` — Anthropic's classifiers stopped the generation. Remedy: rephrase or narrow.
+- `model_context_window_exceeded` — **added in `anthropic` 0.120, absent at 0.116.**
+  Remedy: start a fresh thread. Emphatically *not* "rephrase", which is why `StopNote`
+  carries a per-reason `remedy` instead of the two print sites appending a literal.
+
+That second entry is the cautionary tale, and it was introduced by a **dependency upgrade,
+not by an edit**: `langchain_anthropic` contains no reference to the new value, so it
+arrives in `response_metadata` raw, and while the check was `== "refusal"` it fell straight
+through to `(the agent said nothing)` — reopening the exact misattribution this mechanism
+exists to close. Nothing here or in deepagents' middleware summarizes or trims a thread and
+threads are resumed indefinitely, so this app *will* reach it. It survived a careful
+by-hand review of that same upgrade, in which `general_harms` was spotted in
+`refusal_stop_details.py` and this was missed one file over in `stop_reason.py`.
+`test_cli_parsing.py::TestStopReasonsAreAccountedFor` now compares the table against
+`anthropic.types.StopReason` by set equality, so the next member goes red on `uv sync` and
+has to be classified as silent or not. **Prose telling a future reader to re-check a file
+is not a check** — that is the whole lesson, and it cost two rounds to learn.
+
+Four things about that code are load-bearing:
 
 - **Branch on `stop_reason`, never on `stop_details`.** Anthropic reports the refusal
   *category* in `stop_details`, but `langchain_anthropic` never copies it into
@@ -771,19 +790,23 @@ Three things about that code are load-bearing:
   stay category-free. `test_no_category_is_invented_when_langchain_does_not_supply_one`
   pins that; the `stop_details` branch is defensive, for the day langchain passes it.
   **Read that branch's key off the installed SDK, not off the surrounding names** —
-  `anthropic/types/refusal_stop_details.py` defines `RefusalStopDetails` as `{type:
-  "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|"general_harms"
-  |None, explanation: str|None}`, so the policy name is under **`category`**. It first
+  `anthropic/types/refusal_stop_details.py` defines `RefusalStopDetails` as
+  `{type, category, explanation}`, so the policy name is under **`category`**. It first
   shipped reading `details["refusal"]`, with a test pinning that same invented shape:
   because the branch is *dead*, a wrong key and a right one are indistinguishable until the
   field actually arrives, at which point the category is silently dropped. A dead branch's
   test has to assert the real upstream contract or it asserts nothing. `explanation` stays
   unused on purpose — the SDK documents it as "not guaranteed to be stable".
-  **The key is stable; the enum is not.** `general_harms` arrived in `anthropic` 0.120 and
-  was absent at 0.116 — so treat that list as a snapshot of the installed SDK, and note
-  that `_refusal_note` reads the value generically rather than matching on members,
-  precisely so a new category prints instead of vanishing. Re-read the file on an SDK bump;
-  don't re-derive the list from this line.
+  **The key is stable; the member list is not**, so the members are deliberately written
+  down *nowhere* — not here, not in the docstring. `general_harms` was added in 0.120, and
+  a copy of an enum in prose is one more thing to keep true by hand. `_stop_note` reads the
+  value generically rather than matching on members, so a category added tomorrow prints
+  instead of vanishing, and `TestStopReasonsAreAccountedFor` pins the *key* against the SDK.
+- **The stop table is compared against the SDK, not re-read by hand.** See above: the one
+  time it was left to a careful manual review, the reviewer checked one generated file and
+  not its sibling. `test_every_sdk_stop_reason_is_classified` asserts
+  `set(get_args(StopReason)) == NOT_SILENT | set(_SILENT_STOPS)` — strict equality, so a
+  new member cannot be silently assumed benign; someone has to say which side it is on.
 - **The note prints *beside* the answer, not instead of it.** A turn can refuse one branch
   and answer on another, and the note is what explains why the answer is thinner than the
   question. Same rule as `_print_unfinished_turn`: never discard prose the agent wrote.
@@ -791,10 +814,19 @@ Three things about that code are load-bearing:
   side, so a note scoped to a wider span would caption this turn's answer with last turn's
   refusal.
 
-The feed's dedupe key here is the **namespace**, not a call id — a refusal carries no tool
+The feed's dedupe key here is the **namespace**, not a call id — a stop carries no tool
 call, and `BaseMessage.id` is the unreliable key the rest of this file warns about. Cost:
-two distinct refusals inside one researcher collapse to one line, the same deliberate
+two distinct stops inside one researcher collapse to one line, the same deliberate
 imprecision as `note_declined` being name-level.
+
+`_render_stop` emits under the **`"refusal"` feed kind, which is now broader than it
+reads** — a context-window overrun rides the same line. Deliberate, and worth knowing
+before "fixing": the kind is an internal selector for the two renderers and never reaches
+the user (who sees `note.reason`), while renaming or adding one is **atomic across
+`FEED_KINDS`, `ActivityFeed._emit` and `webui.render_event`** — `test_webui.py` asserts
+`terminal == set(FEED_KINDS) == browser` in both directions, so every intermediate state is
+red and it cannot be sequenced past the PostToolUse hook. Rename it in one commit with the
+hook disabled, or leave it.
 
 Not implemented, deliberately: Anthropic's server-side `fallbacks` beta
 (`betas=["server-side-fallback-2026-07-01"]` + `model_kwargs={"fallbacks": "default"}`),

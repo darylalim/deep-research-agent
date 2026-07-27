@@ -125,8 +125,8 @@ def _text_of(message: Any) -> str:
 def _this_turn(messages: list[Any]) -> list[Any]:
     """Everything after the last human message — one turn's worth of the thread.
 
-    Factored out so `render_turn` and `_turn_refusal` slice the thread the *same* way.
-    They must: the refusal note and the answer are printed side by side, and a note
+    Factored out so `render_turn` and `_turn_stop` slice the thread the *same* way.
+    They must: the stop note and the answer are printed side by side, and a note
     scoped to a different span than the prose it annotates would report last turn's
     refusal above this turn's answer.
     """
@@ -137,15 +137,57 @@ def _this_turn(messages: list[Any]) -> list[Any]:
     return list(messages[start:])
 
 
-def _refusal_note(message: Any) -> str | None:
-    """A printable phrase if this assistant message is a classifier refusal, else None.
+@dataclass(frozen=True)
+class StopNote:
+    """Why a turn produced no prose, and what the user can actually do about it.
 
-    Opus 5 can end a generation with `stop_reason="refusal"`: **HTTP 200, no exception,
-    and empty content.** So it costs tokens, raises nothing, and arrives here looking
-    exactly like a turn where the model had nothing to say — `render_turn` finds no
-    prose and the REPL printed `(the agent said nothing)`. That is true and useless; it
-    reads as a bug in this code rather than a decision by the model, and the user has no
-    reason to suspect rephrasing would help.
+    Two fields rather than one sentence because the **remedy differs per stop reason**
+    and used to be hardcoded at both print sites (`main` below, and `streamlit_app`).
+    That was survivable while `refusal` was the only silent stop and stopped being so
+    the moment a second one existed: telling someone to rephrase a question that was
+    never the problem is worse than saying nothing, because it sends them to fix the
+    one thing that is already fine.
+    """
+
+    reason: str
+    remedy: str
+
+
+# Every stop reason that ends a generation with **HTTP 200, no exception, and no prose**.
+# Each bills, raises nothing, and lands in the checkpoint as an assistant message that
+# `render_turn` renders as `''` — which the REPL reported as `(the agent said nothing)`,
+# describing the symptom while hiding the cause and reading as a bug in this code rather
+# than as something the API told us.
+#
+# **This table is a snapshot of a Literal that GROWS — re-read
+# `anthropic/types/stop_reason.py` on an SDK bump.** `model_context_window_exceeded` is
+# the proof and the reason this is a dict instead of an `== "refusal"`: it arrived in
+# anthropic 0.120 (absent at 0.116), `langchain_anthropic` contains no reference to it at
+# all, so it reaches `response_metadata["stop_reason"]` raw and, until it was listed here,
+# fell straight through to `(the agent said nothing)` — the exact misattribution this
+# whole mechanism exists to prevent, reopened by a dependency upgrade.
+# `test_cli_parsing.py::TestStopReasonsAreAccountedFor` compares this table against the
+# SDK's own enum and goes red when the next one lands, because prose telling a future
+# reader to re-check a file is not a check.
+_SILENT_STOPS: dict[str, StopNote] = {
+    "refusal": StopNote(
+        "the model declined this request",
+        "rephrasing or narrowing it usually helps",
+    ),
+    "model_context_window_exceeded": StopNote(
+        "this turn exceeded the model's context window",
+        # Emphatically NOT "rephrase it". The question was fine; the *thread* is what
+        # grew. Nothing in this project or in deepagents' default middleware stack
+        # summarizes or trims a thread, and threads here are checkpointed and resumed
+        # indefinitely by design — so on a long-lived thread this is a matter of time
+        # rather than a matter of the question, and only a fresh thread clears it.
+        "starting a fresh thread resets it",
+    ),
+}
+
+
+def _stop_note(message: Any) -> StopNote | None:
+    """A note if the API reported *why* this message carries no prose, else None.
 
     **Branch on `stop_reason`, never on `stop_details`.** `langchain_anthropic` copies
     `stop_reason` into `response_metadata` and drops `stop_details` entirely — grep it:
@@ -156,30 +198,37 @@ def _refusal_note(message: Any) -> str | None:
 
     That defensive branch reads **`category`**, which is the field the SDK actually
     defines — `anthropic/types/refusal_stop_details.py`: `RefusalStopDetails` is
-    `{type: "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|
-    "general_harms"|None, explanation: str|None}`. Getting that key wrong is invisible
-    precisely *because* the branch is dead, so read it off the installed SDK rather than
-    guessing from the surrounding key names. The *key* is the stable part; the enum is
-    not — `general_harms` arrived in SDK 0.120 (it was absent at 0.116), so this list is
-    a snapshot, which is exactly why the code below reads the value generically instead
-    of matching on members. `explanation` is deliberately unused: the SDK documents it as
-    "not guaranteed to be stable", and an unstable string is not something to put in front
-    of a user as the reason their question was refused.
+    `{type: "refusal", category: <a Literal of policy names>|None, explanation: str|None}`.
+    Getting that key wrong is invisible precisely *because* the branch is dead, so read it
+    off the installed SDK rather than guessing from the surrounding key names. The **key**
+    is the stable part; the member list is not, and it is deliberately not written out
+    here — `general_harms` was added in SDK 0.120 and a copy of the enum in a docstring
+    is a second thing to keep true. `TestStopReasonsAreAccountedFor` pins it against the
+    SDK instead. Reading the value generically rather than matching on members is what
+    makes a newly-added category print instead of vanish.
+
+    `explanation` stays unused on purpose: the SDK documents it as "not guaranteed to be
+    stable", and an unstable string is not something to put in front of a user as the
+    reason their question was refused.
     """
     metadata = getattr(message, "response_metadata", None)
-    if not isinstance(metadata, dict) or metadata.get("stop_reason") != "refusal":
+    if not isinstance(metadata, dict):
+        return None
+    reason = metadata.get("stop_reason")
+    # `.get` on a non-str would raise for an unhashable value, and `stop_reason` is
+    # whatever landed in a dict we did not build.
+    note = _SILENT_STOPS.get(reason) if isinstance(reason, str) else None
+    if note is None:
         return None
     details = metadata.get("stop_details")
     category = details.get("category") if isinstance(details, dict) else None
-    return (
-        f"the model declined this request ({category})"
-        if isinstance(category, str) and category
-        else "the model declined this request"
-    )
+    if isinstance(category, str) and category:
+        return StopNote(f"{note.reason} ({category})", note.remedy)
+    return note
 
 
-def _turn_refusal(result: dict[str, Any]) -> str | None:
-    """The refusal note for this turn, if any assistant message this turn carried one.
+def _turn_stop(result: dict[str, Any]) -> StopNote | None:
+    """The stop note for this turn, if any assistant message this turn carried one.
 
     The first one, not all of them: a turn that refuses twice refused for one reason,
     and two identical lines above the answer is noise. Read from the checkpoint rather
@@ -188,7 +237,7 @@ def _turn_refusal(result: dict[str, Any]) -> str | None:
     would still be recorded in it.
     """
     for message in _this_turn(result.get("messages", [])):
-        if getattr(message, "type", None) == "ai" and (note := _refusal_note(message)):
+        if getattr(message, "type", None) == "ai" and (note := _stop_note(message)):
             return note
     return None
 
@@ -771,37 +820,49 @@ class ActivityFeed:
 
         if kind == "ai":
             if not is_orchestrator:
-                self._render_refusal(namespace, message)
+                self._render_stop(namespace, message)
             for call in getattr(message, "tool_calls", None) or []:
                 self._render_call(call, is_orchestrator)
         elif kind == "tool":
             self._render_result(message, is_orchestrator)
 
-    def _render_refusal(self, namespace: tuple[str, ...], message: Any) -> None:
-        """Say so when a *researcher* is stopped by Anthropic's classifiers.
+    def _render_stop(self, namespace: tuple[str, ...], message: Any) -> None:
+        """Say so when a *researcher* is stopped for a reason the API reported.
 
-        SUBAGENT ONLY — the caller enforces that. An orchestrator refusal is reported by
+        Both entries in `_SILENT_STOPS`, not just refusals — a researcher that overran
+        the context window is invisible in exactly the same way and for exactly the same
+        reason, so a check that knew only about classifiers would have to be written
+        twice.
+
+        SUBAGENT ONLY — the caller enforces that. An orchestrator stop is reported by
         `main`, from the checkpoint, exactly where the missing answer would have been;
         printing it here as well would say it twice.
 
-        A researcher's refusal is otherwise completely INVISIBLE. It ends that subagent's
+        A researcher's stop is otherwise completely INVISIBLE. It ends that subagent's
         turn with empty content, so the `task` result comes back thin and the
         orchestrator synthesizes around the hole. The user watches a delegation get
         dispatched, watches it complete, and reads a thinner answer than they asked for,
         with nothing anywhere saying why.
 
         Keyed on the NAMESPACE — coarser than this class's call-id rule, deliberately. A
-        refusal carries no tool call, and `BaseMessage.id` is precisely the unreliable
+        stop carries no tool call, and `BaseMessage.id` is precisely the unreliable
         key the class docstring warns about (`None` on the first pass, a fresh uuid on
         the resume), so it is the only stable key available. The cost is that two
-        distinct refusals inside one researcher collapse to one line — the same
+        distinct stops inside one researcher collapse to one line — the same
         deliberate imprecision as `note_declined` being name-level rather than
         call-level, and it errs toward under-reporting a repeat, never toward inventing
         an event.
+
+        Emitted under the `"refusal"` feed kind, which is now broader than it reads. The
+        kind is an internal selector for the two renderers and never reaches the user —
+        who sees `note.reason` — and renaming it is atomic across `FEED_KINDS`,
+        `ActivityFeed._emit` and `webui.render_event` (test_webui asserts set equality in
+        BOTH directions), so it cannot be sequenced past the pytest hook. Only the
+        `reason` distinguishes the two stops here; only `main` needs the remedy.
         """
-        note = _refusal_note(message)
-        if note and self._once(f"refusal:{namespace}"):
-            self._emit(FeedEvent("refusal", text=note))
+        note = _stop_note(message)
+        if note and self._once(f"stop:{namespace}"):
+            self._emit(FeedEvent("refusal", text=note.reason))
 
     def _render_call(self, call: dict[str, Any], is_orchestrator: bool) -> None:
         name = call.get("name")
@@ -1115,17 +1176,23 @@ def main() -> None:
             # fiction. The feed shows *actions*; the answer comes from state.
             values = agent.get_state(config).values
             answer = render_turn(values)
-            # A classifier refusal is a 200 with empty content — no exception, so it
-            # arrives here indistinguishable from a turn where the model had nothing to
-            # say, and the bare `(the agent said nothing)` below reported the agent's own
-            # decision as an apparent bug in this REPL. Printed BEFORE the answer, and
-            # not instead of it: a turn can refuse one branch and still answer, in which
-            # case the note explains why the answer is thinner than the question.
-            if refusal := _turn_refusal(values):
-                print(f"\n! {refusal} — rephrasing or narrowing it usually helps.")
+            # A silent stop — a classifier refusal, or a turn that ran past the context
+            # window — is a 200 with empty content and no exception, so it arrives here
+            # indistinguishable from a turn where the model had nothing to say, and the
+            # bare `(the agent said nothing)` below reported something the API told us as
+            # an apparent bug in this REPL. Printed BEFORE the answer, and not instead of
+            # it: a turn can lose one branch and still answer, in which case the note
+            # explains why the answer is thinner than the question.
+            #
+            # The remedy comes from the note, never from this line. It used to be the
+            # hardcoded "rephrasing or narrowing it usually helps", which is exactly
+            # wrong for a context-window overrun — that question was fine and the thread
+            # is what grew.
+            if stop := _turn_stop(values):
+                print(f"\n! {stop.reason} — {stop.remedy}.")
             if answer:
                 print(f"\nagent > {answer}")
-            elif not refusal:
+            elif not stop:
                 print("\n(the agent said nothing)")
 
 

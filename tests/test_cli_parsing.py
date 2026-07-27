@@ -16,56 +16,96 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deep_research.cli import (
+    _SILENT_STOPS,
     _export,
-    _refusal_note,
     _short,
+    _stop_note,
     _text_of,
-    _turn_refusal,
+    _turn_stop,
     render_thread,
     render_turn,
 )
 
 
-def _refusal(**metadata: object) -> AIMessage:
-    """An assistant message shaped like a real classifier refusal.
+def _stopped(reason: str, **metadata: object) -> AIMessage:
+    """An assistant message shaped like a real silent stop.
 
-    Empty content and `stop_reason="refusal"` in `response_metadata` — which is exactly
-    what arrives: the API returns HTTP 200 with no content blocks, so nothing raises and
+    Empty content and a `stop_reason` in `response_metadata` — which is exactly what
+    arrives: the API returns HTTP 200 with no content blocks, so nothing raises and
     nothing downstream distinguishes it from a turn the model simply had nothing to add
     to.
     """
-    return AIMessage(
-        content="", response_metadata={"stop_reason": "refusal", **metadata}
-    )
+    return AIMessage(content="", response_metadata={"stop_reason": reason, **metadata})
 
 
-class TestRefusalNote:
-    """A refusal must be reported as a refusal, not as silence.
+def _refusal(**metadata: object) -> AIMessage:
+    return _stopped("refusal", **metadata)
 
-    `stop_reason="refusal"` is a 200 with empty content: it costs tokens, raises nothing,
-    and reaches `render_turn` as a message with no prose. The REPL printed
-    `(the agent said nothing)`, which is true and useless — it reads as a bug in the CLI
-    rather than a decision by the model, and gives the user no reason to think rephrasing
-    would help.
+
+def _overrun(**metadata: object) -> AIMessage:
+    return _stopped("model_context_window_exceeded", **metadata)
+
+
+class TestStopNote:
+    """A silent stop must be reported as what it was, not as silence.
+
+    Both `refusal` and `model_context_window_exceeded` are a 200 with empty content: they
+    cost tokens, raise nothing, and reach `render_turn` as a message with no prose. The
+    REPL printed `(the agent said nothing)`, which is true and useless — it reads as a bug
+    in the CLI rather than as something the API reported, and gives the user nothing to
+    act on.
     """
 
     def test_a_refusal_is_named_as_one(self) -> None:
-        assert _refusal_note(_refusal()) == "the model declined this request"
+        note = _stop_note(_refusal())
+        assert note and note.reason == "the model declined this request"
 
-    def test_an_ordinary_message_is_not_a_refusal(self) -> None:
-        assert _refusal_note(AIMessage("here is the answer")) is None
+    def test_a_context_window_overrun_is_named_and_is_not_called_a_refusal(
+        self,
+    ) -> None:
+        # The regression this whole class grew for. `model_context_window_exceeded`
+        # arrived in anthropic 0.120 and `langchain_anthropic` has no reference to it, so
+        # it lands in `response_metadata` raw; while the check here was `== "refusal"` it
+        # fell through to `(the agent said nothing)`.
+        note = _stop_note(_overrun())
+        assert note and note.reason == "this turn exceeded the model's context window"
+        assert "declined" not in note.reason
 
-    def test_a_truncated_turn_is_not_a_refusal(self) -> None:
+    def test_the_remedy_is_per_stop_reason_and_not_hardcoded_at_the_print_site(
+        self,
+    ) -> None:
+        # WHY `StopNote` carries two fields. The remedy used to be a literal appended by
+        # `main` and by `streamlit_app`, and it said "rephrasing or narrowing it usually
+        # helps" — advice that is actively wrong for an overrun, where the question was
+        # fine and the thread is what grew. Break either remedy and this goes red.
+        refusal, overrun = _stop_note(_refusal()), _stop_note(_overrun())
+        assert refusal and overrun
+        assert "rephras" in refusal.remedy
+        assert "rephras" not in overrun.remedy
+        assert "thread" in overrun.remedy
+
+    def test_an_ordinary_message_is_not_a_stop(self) -> None:
+        assert _stop_note(AIMessage("here is the answer")) is None
+
+    def test_a_truncated_turn_is_not_a_stop(self) -> None:
         # `max_tokens` is the other silent stop_reason in this project's history, and it
         # means something completely different — the answer exists and got cut off.
         truncated = AIMessage(
             content="half an ans", response_metadata={"stop_reason": "max_tokens"}
         )
-        assert _refusal_note(truncated) is None
+        assert _stop_note(truncated) is None
 
     def test_a_message_with_no_metadata_is_handled(self) -> None:
         # ToolMessages, HumanMessages, and anything a fake hands us: no crash, no note.
-        assert _refusal_note(SimpleNamespace(content="x")) is None
+        assert _stop_note(SimpleNamespace(content="x")) is None
+
+    def test_an_unhashable_stop_reason_does_not_crash_the_lookup(self) -> None:
+        # `_SILENT_STOPS` is a dict now, and `response_metadata` is a dict this code did
+        # not build. A list there would raise `TypeError: unhashable` from `.get` and take
+        # down the turn on the path whose entire job is to explain a turn that went wrong.
+        assert (
+            _stop_note(SimpleNamespace(response_metadata={"stop_reason": []})) is None
+        )
 
     def test_no_category_is_invented_when_langchain_does_not_supply_one(self) -> None:
         # THE POINT OF THE DEFENSIVE BRANCH. Anthropic reports the refusal category in
@@ -73,7 +113,8 @@ class TestRefusalNote:
         # `response_metadata` — grep `chat_models.py`: `stop_reason` appears three times,
         # `stop_details` not once. So today the note MUST be category-free. Printing a
         # guessed category would be inventing evidence about why the model stopped.
-        assert "(" not in (_refusal_note(_refusal()) or "")
+        note = _stop_note(_refusal())
+        assert note and "(" not in note.reason
 
     def test_a_category_is_used_if_langchain_ever_starts_passing_it_through(
         self,
@@ -86,17 +127,20 @@ class TestRefusalNote:
         # is dead today (langchain drops `stop_details`), so a wrong key looks identical
         # to a right one until the day the field arrives and the category is silently
         # dropped. A guard that cannot fail is not a guard.
-        note = _refusal_note(
+        note = _stop_note(
             _refusal(stop_details={"type": "refusal", "category": "cyber"})
         )
-        assert note == "the model declined this request (cyber)"
+        assert note and note.reason == "the model declined this request (cyber)"
 
     def test_the_unstable_explanation_field_is_not_shown_to_the_user(self) -> None:
         # `RefusalStopDetails.explanation` is documented by the SDK as "not guaranteed to
-        # be stable". `category` is a closed enum; the explanation is free text that can
-        # change under us, and it must not become the reason a user is told their question
-        # was refused.
-        note = _refusal_note(
+        # be stable" — free text that can change under us, and it must not become the
+        # reason a user is told their question was refused. The category is shown instead
+        # because it is a Literal the SDK versions, NOT because that Literal is fixed:
+        # `general_harms` was added in 0.120. `TestStopReasonsAreAccountedFor` is what
+        # tracks the drift; `_stop_note` reads the value generically so a member added
+        # tomorrow prints rather than vanishing.
+        note = _stop_note(
             _refusal(
                 stop_details={
                     "type": "refusal",
@@ -105,15 +149,67 @@ class TestRefusalNote:
                 }
             )
         )
-        assert note == "the model declined this request (cyber)"
+        assert note and note.reason == "the model declined this request (cyber)"
 
 
-class TestTurnRefusal:
+class TestStopReasonsAreAccountedFor:
+    """Pin `_SILENT_STOPS` and the `category` key against the installed SDK.
+
+    `cli.py` tells the reader to re-read `anthropic/types/` on an SDK bump. That is
+    exactly the check this repo's own rule says cannot be trusted to prose — and it has
+    already failed once: the anthropic 0.116 -> 0.120 upgrade was reviewed by hand,
+    `general_harms` was spotted in `refusal_stop_details.py`, and
+    `model_context_window_exceeded` was missed one file over in `stop_reason.py` — the
+    change with behaviour attached. These two tests are what would have caught it, on
+    `uv sync`, without anyone remembering to look.
+
+    Importing `anthropic` directly is deliberate: it is the package that DEFINES the
+    contract, `langchain-anthropic` hard-depends on it, and reading the enum from
+    anywhere else would just be another copy to keep true.
+    """
+
+    # Stop reasons that need no note: the turn produced prose (or, for `max_tokens`, a
+    # truncated answer that is still shown). Listed rather than defaulted so that a NEW
+    # member is never silently assumed benign — classifying it is the point.
+    NOT_SILENT = frozenset(
+        {"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn"}
+    )
+
+    def test_every_sdk_stop_reason_is_classified(self) -> None:
+        from typing import get_args
+
+        from anthropic.types import StopReason
+
+        assert set(get_args(StopReason)) == self.NOT_SILENT | set(_SILENT_STOPS), (
+            "the SDK's StopReason changed. A new member reaches "
+            "`response_metadata['stop_reason']` raw — langchain forwards it without "
+            "knowing it — so decide which side it belongs on: add it to `_SILENT_STOPS` "
+            "with a reason and a remedy if it can end a turn with no prose, or to "
+            "NOT_SILENT if the turn still carries an answer."
+        )
+
+    def test_the_refusal_category_key_still_exists(self) -> None:
+        # `_stop_note`'s dead defensive branch reads `stop_details["category"]`. The KEY
+        # is the half that has to stay put; the member list deliberately is not pinned,
+        # because it grows and the code reads the value generically. A rename here is
+        # invisible at runtime precisely because the branch is dead.
+        from anthropic.types.refusal_stop_details import RefusalStopDetails
+
+        assert "category" in RefusalStopDetails.model_fields
+
+
+class TestTurnStop:
     def test_it_finds_a_refusal_in_this_turn(self) -> None:
         state = {"messages": [HumanMessage("q"), _refusal()]}
-        assert _turn_refusal(state) == "the model declined this request"
+        note = _turn_stop(state)
+        assert note and note.reason == "the model declined this request"
 
-    def test_a_previous_turns_refusal_is_not_reported_again(self) -> None:
+    def test_it_finds_a_context_window_overrun_in_this_turn(self) -> None:
+        state = {"messages": [HumanMessage("q"), _overrun()]}
+        note = _turn_stop(state)
+        assert note and note.reason == "this turn exceeded the model's context window"
+
+    def test_a_previous_turns_stop_is_not_reported_again(self) -> None:
         # Scoped with the SAME slice `render_turn` uses (`_this_turn`), deliberately: the
         # note and the answer print side by side, so a note scoped to a wider span would
         # caption this turn's answer with last turn's refusal.
@@ -125,21 +221,22 @@ class TestTurnRefusal:
                 AIMessage("here is the answer"),
             ]
         }
-        assert _turn_refusal(state) is None
+        assert _turn_stop(state) is None
         assert render_turn(state) == "here is the answer"
 
-    def test_a_refusal_alongside_an_answer_is_still_reported(self) -> None:
-        # A turn can refuse one branch and answer anyway; the note is what explains why
+    def test_a_stopped_branch_alongside_an_answer_is_still_reported(self) -> None:
+        # A turn can lose one branch and answer anyway; the note is what explains why
         # the answer is thinner than the question.
         state = {"messages": [HumanMessage("q"), _refusal(), AIMessage("partial")]}
-        assert _turn_refusal(state) == "the model declined this request"
+        note = _turn_stop(state)
+        assert note and note.reason == "the model declined this request"
         assert render_turn(state) == "partial"
 
     def test_an_ordinary_turn_reports_nothing(self) -> None:
-        assert _turn_refusal({"messages": [HumanMessage("q"), AIMessage("a")]}) is None
+        assert _turn_stop({"messages": [HumanMessage("q"), AIMessage("a")]}) is None
 
     def test_missing_messages_key_is_handled(self) -> None:
-        assert _turn_refusal({}) is None
+        assert _turn_stop({}) is None
 
 
 class TestTextOf:

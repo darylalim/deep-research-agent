@@ -45,7 +45,7 @@ from deep_research import webui
 from deep_research.cli import (
     _declined_tools,
     _stream_turn,
-    _turn_refusal,
+    _turn_stop,
     export_markdown,
     thread_sections,
 )
@@ -245,8 +245,10 @@ for _index, (_kind, _text) in enumerate(sections):
             with st.expander("Work log", icon=":material/manage_search:"):
                 for _event in _events:
                     webui.render_event(_event)
+        # Already a finished sentence, remedy and all — see where it is stored. Appending
+        # advice here would hardcode the refusal remedy onto every stop reason.
         if _note := st.session_state.refusals.get(_index):
-            st.warning(f"{_note} — rephrasing or narrowing it usually helps.")
+            st.warning(_note)
         st.markdown(_text)
 
 # The question of a turn already in flight, drawn only until the checkpoint carries it.
@@ -421,22 +423,31 @@ if st.session_state.payload is not None:
 
         status.update(label="Research complete", state="complete", expanded=False)
 
-    # Attach this turn's work log and any refusal note to the answer it produced. A
-    # classifier refusal is a 200 with empty content — no exception, no prose — so a
-    # turn CAN finish with no `ai` section at all, and the note then has nothing to hang
-    # on. It becomes a page-level notice instead of vanishing, which is the whole point
-    # of detecting it: silence reads as a bug in this app rather than a decision by the
-    # model, and gives the user no reason to think rephrasing would help.
+    # Attach this turn's work log and any stop note to the answer it produced. A silent
+    # stop — a classifier refusal, or a turn that ran past the context window — is a 200
+    # with empty content, no exception and no prose, so a turn CAN finish with no `ai`
+    # section at all, and the note then has nothing to hang on. It becomes a page-level
+    # notice instead of vanishing, which is the whole point of detecting it: silence
+    # reads as a bug in this app rather than as something the API reported.
+    #
+    # Formatted into its final sentence HERE, remedy included, so the render site is a
+    # bare `st.warning(note)`. The remedy is per stop reason (`cli.StopNote`) and used to
+    # be hardcoded at the render site as "rephrasing or narrowing it usually helps" —
+    # which is the wrong advice for a context-window overrun, where the question was fine
+    # and the thread is what grew. Storing the finished string also keeps what lands in
+    # `st.session_state.refusals` a plain `str`, which is what survives a rerun most
+    # simply and what the page's tests seed.
     settled_values = agent.get_state(config).values  # one read, feeding both
     settled = thread_sections(settled_values)
-    refusal = _turn_refusal(settled_values)
+    stop = _turn_stop(settled_values)
+    stop_note = f"{stop.reason} — {stop.remedy}." if stop else None
     if settled and settled[-1][0] == "ai":
         st.session_state.work_logs[len(settled) - 1] = tuple(feed.events)
-        if refusal:
-            st.session_state.refusals[len(settled) - 1] = refusal
+        if stop_note:
+            st.session_state.refusals[len(settled) - 1] = stop_note
         notice = None
     else:
-        notice = refusal or "The agent finished this turn without saying anything."
+        notice = stop_note or "The agent finished this turn without saying anything."
 
     # The turn may have written a note; drop the cached listing so the sidebar shows it.
     webui.refresh_memory_files()
