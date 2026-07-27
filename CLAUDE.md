@@ -92,8 +92,21 @@ uv run ty check                  # type check (Astral's ty)
   exactly this). `target-version` is inferred from `requires-python`, so the
   3.11 floor governs `UP` fixes without a separate setting.
 - **`ty`** (Astral's type checker) is a pinned `dev` dependency; run it with
-  `uv run ty check`. Some source files carry inline `# ty: ignore[...]` comments
-  — see the deliberate false-positive suppression in `config.py::build_model`.
+  `uv run ty check`. **There are currently no `# ty: ignore` directives in first-party
+  code, and the `ty>=0.0.63` floor is what keeps it that way.** `config.py::build_model`
+  and `evals/evaluators.py`'s `JUDGE` used to carry four between them, for one false
+  positive: ty built `ChatAnthropic`'s signature from the Pydantic *aliases*
+  (`model_name`, `max_tokens_to_sample`) and didn't model `populate_by_name`, so `model=`
+  and `max_tokens=` read as unknown arguments. **ty 0.0.63 fixed it** — measured against
+  one `langchain-anthropic` build, 0.0.58 reports three errors in `build_model` and 0.0.63
+  reports none, so it was the checker that changed, not the library. Two consequences
+  worth keeping straight: the directives had to go, because a *dead* one is itself a
+  `ty check` failure (`unused-ignore-comment` — ty's own equivalent of the `RUF100` in the
+  bullet directly above, and it exits non-zero, so CI goes red); and the floor had
+  to move with them, because deleting a suppression converts "tolerates an old ty" into
+  "requires a new one" and nothing else records that. If you ever add a suppression back,
+  write down which ty version still needs it — an upgrade is what makes it dead, and the
+  failure surfaces in CI's lint job rather than anywhere near the code.
 - Requires `.env` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` (copy from
   `.env.example`). `config.missing_keys()` hard-exits the CLI if either is unset.
 
@@ -759,13 +772,18 @@ Three things about that code are load-bearing:
   pins that; the `stop_details` branch is defensive, for the day langchain passes it.
   **Read that branch's key off the installed SDK, not off the surrounding names** —
   `anthropic/types/refusal_stop_details.py` defines `RefusalStopDetails` as `{type:
-  "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|None,
-  explanation: str|None}`, so the policy name is under **`category`**. It first shipped
-  reading `details["refusal"]`, with a test pinning that same invented shape: because the
-  branch is *dead*, a wrong key and a right one are indistinguishable until the field
-  actually arrives, at which point the category is silently dropped. A dead branch's test
-  has to assert the real upstream contract or it asserts nothing. `explanation` stays
+  "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|"general_harms"
+  |None, explanation: str|None}`, so the policy name is under **`category`**. It first
+  shipped reading `details["refusal"]`, with a test pinning that same invented shape:
+  because the branch is *dead*, a wrong key and a right one are indistinguishable until the
+  field actually arrives, at which point the category is silently dropped. A dead branch's
+  test has to assert the real upstream contract or it asserts nothing. `explanation` stays
   unused on purpose — the SDK documents it as "not guaranteed to be stable".
+  **The key is stable; the enum is not.** `general_harms` arrived in `anthropic` 0.120 and
+  was absent at 0.116 — so treat that list as a snapshot of the installed SDK, and note
+  that `_refusal_note` reads the value generically rather than matching on members,
+  precisely so a new category prints instead of vanishing. Re-read the file on an SDK bump;
+  don't re-derive the list from this line.
 - **The note prints *beside* the answer, not instead of it.** A turn can refuse one branch
   and answer on another, and the note is what explains why the answer is thinner than the
   question. Same rule as `_print_unfinished_turn`: never discard prose the agent wrote.

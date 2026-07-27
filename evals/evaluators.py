@@ -41,9 +41,11 @@ URL = re.compile(r"https?://[^\s)\]>,]+")
 # Opus 5 rejects `temperature` with a 400 — a judge wants `temperature=0`, so the
 # app's own `build_model()` is the wrong constructor to reuse here. (Opus 5 would
 # also think on every grade, which is pure cost for a classification call.)
-# The `ty: ignore` is the same false positive `config.py::build_model` carries: ty
-# builds the signature from the Pydantic aliases and does not model `populate_by_name`.
-JUDGE = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=1024)  # ty: ignore[unknown-argument, missing-argument]
+# This line used to carry the same `ty: ignore` as `config.py::build_model`, for the
+# same Pydantic-alias false positive; ty 0.0.63 fixed it and the now-dead directive was
+# itself a `ty check` failure. See that docstring — and the `ty>=0.0.63` dev floor it
+# explains, which this line depends on too.
+JUDGE = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=1024)
 
 
 def _outputs(record: Any) -> dict[str, Any]:

@@ -156,10 +156,13 @@ def _refusal_note(message: Any) -> str | None:
 
     That defensive branch reads **`category`**, which is the field the SDK actually
     defines — `anthropic/types/refusal_stop_details.py`: `RefusalStopDetails` is
-    `{type: "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|None,
-    explanation: str|None}`. Getting that key wrong is invisible precisely *because* the
-    branch is dead, so read it off the installed SDK rather than guessing from the
-    surrounding key names. `explanation` is deliberately unused: the SDK documents it as
+    `{type: "refusal", category: "cyber"|"bio"|"frontier_llm"|"reasoning_extraction"|
+    "general_harms"|None, explanation: str|None}`. Getting that key wrong is invisible
+    precisely *because* the branch is dead, so read it off the installed SDK rather than
+    guessing from the surrounding key names. The *key* is the stable part; the enum is
+    not — `general_harms` arrived in SDK 0.120 (it was absent at 0.116), so this list is
+    a snapshot, which is exactly why the code below reads the value generically instead
+    of matching on members. `explanation` is deliberately unused: the SDK documents it as
     "not guaranteed to be stable", and an unstable string is not something to put in front
     of a user as the reason their question was refused.
     """

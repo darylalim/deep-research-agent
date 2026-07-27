@@ -48,7 +48,15 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=9.1.1",
     "ruff",
-    "ty>=0.0.58",
+    # Floor raised from 0.0.58 because the *source* now depends on the fix. ty 0.0.63
+    # models Pydantic `populate_by_name`, so `ChatAnthropic(model=..., max_tokens=...)`
+    # type-checks without help and the three `ty: ignore`s that `config.py::build_model`
+    # used to carry (plus the one in `evals/evaluators.py`) were deleted — a dead
+    # directive is itself a `ty check` failure, `unused-ignore-comment`. Measured on one
+    # `langchain-anthropic` build: 0.0.58 reports three errors there, 0.0.63 none. With
+    # an older ty this repo no longer type-checks, so the floor is a real requirement,
+    # not hygiene. ty is pre-1.0 and pins exactly in `uv.lock`, so no upper cap.
+    "ty>=0.0.63",
 ]
 # The `langgraph dev` server (the Studio / deep-agents-ui front door — see
 # `deep_research/graph.py`). Its OWN group, deliberately NOT in the default set, so

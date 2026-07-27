@@ -97,20 +97,24 @@ def build_model() -> ChatAnthropic:
     worse than a constrained override.
     `test_config.py::test_thinking_is_adaptive_and_summarized_never_disabled` pins all of it.
 
-    The `ty: ignore` silences a false positive: ty builds the signature from the
-    Pydantic *aliases* (`model_name`, `max_tokens_to_sample`) and doesn't model
-    `populate_by_name`.
+    This call used to carry three `ty: ignore`s for a false positive — ty built the
+    signature from the Pydantic *aliases* (`model_name`, `max_tokens_to_sample`) and
+    did not model `populate_by_name`, so `model=` and `max_tokens=` read as unknown
+    arguments and `model_name` as a missing one. **ty 0.0.63 fixed it**; measured on
+    the identical `langchain-anthropic` build, 0.0.58 reports all three and 0.0.63 is
+    clean. The directives are gone because a dead one is itself a `ty check` failure
+    (`unused-ignore-comment`), the same way `RUF100` treats a dead `noqa`. That is why
+    the dev floor is `ty>=0.0.63` and not the older pin — with an earlier ty these
+    three lines are hard errors again.
     """
-    return ChatAnthropic(  # ty: ignore[missing-argument]
-        model=MODEL_NAME,  # ty: ignore[unknown-argument]
-        max_tokens=MAX_TOKENS,  # ty: ignore[unknown-argument]
+    return ChatAnthropic(
+        model=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
         streaming=True,
         # `display="summarized"` is REQUIRED, not cosmetic: Opus 5's default
         # ("omitted") returns thinking blocks with no `thinking` text, which then
         # cannot be replayed — and every tool result replays the assistant message
         # that requested it. See the docstring above for the measured 400.
-        # No `ty: ignore` needed here, unlike the two above: `thinking` is a real
-        # field name, not a Pydantic alias, so ty resolves it without help.
         thinking={"type": "adaptive", "display": "summarized"},
     )
 
