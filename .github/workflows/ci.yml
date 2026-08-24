@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# `actions/checkout` is pinned to a floating major (`@v7`); `astral-sh/setup-uv` is
+# pinned to an EXACT patch (`@v10.0.1`) because it stopped publishing floating major
+# tags after v7 — v8, v9 and v10 exist only as `vX.Y.Z`. `@v10` is a 404 and fails
+# the run at "Set up job", before a single step executes. Measured: run 32787477177,
+# "Unable to resolve action `astral-sh/setup-uv@v10`". Bump it by hand; do not
+# "tidy" it to `@v10`.
+
 # Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
 concurrency:
   group: ci-${{ github.ref }}
@@ -21,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1  # exact patch, deliberately — see the note above
         with:
           enable-cache: true
       # `--group ui`, unlike `serve`, because that group has FIRST-PARTY code behind
@@ -47,7 +54,7 @@ jobs:
         python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1  # exact patch, deliberately — see the note above
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
