@@ -8,4 +8,4 @@ cross-session memory, and gates file writes behind human approval.
 Entry point: `python -m deep_research`  (see cli.main).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

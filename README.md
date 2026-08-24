@@ -10,7 +10,7 @@ files or running commands.
 
 | Capability | How | Where |
 | --- | --- | --- |
-| **Planning** | Built-in `write_todos` (always on in Deep Agents) | — |
+| **Planning** | `write_todos`, via langchain's `TodoListMiddleware` | — |
 | **Web search** | Tavily (`tavily_search`) | `deep_research/tools.py` |
 | **Subagent orchestration** | A `researcher` subagent, delegated to via the `task` tool | `deep_research/subagents.py` |
 | **Persistent memory** | `SqliteStore` behind a `/memories/` route (cross-session) | `deep_research/agent.py` |

@@ -17,6 +17,7 @@ replaces `_stream_turn`, so the graph is never actually run.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,7 +30,13 @@ from streamlit.testing.v1 import AppTest
 from deep_research import cli as cli_module
 from deep_research import webui
 
-PAGE = "streamlit_app.py"
+# **Absolute, deliberately.** Streamlit 1.62 changed how `AppTest.from_file`
+# resolves a relative path: it used to be relative to the working directory (so
+# `"streamlit_app.py"` worked when pytest ran from the repo root) and is now
+# relative to *the file that calls it*, which resolves to `tests/streamlit_app.py`
+# and raises `FileNotFoundError`. Anchoring on `__file__` is right under both rules
+# and additionally stops depending on the working directory.
+PAGE = str(Path(__file__).resolve().parent.parent / "streamlit_app.py")
 
 _WRITE = {
     "name": "write_file",
@@ -252,11 +259,22 @@ class TestAQuestionCannotSlipPastATurnInFlight:
     question'` with `pending=['i1']` still set. The approval screen then `st.stop()`s,
     approving overwrites `payload` with the resume `Command`, and the question is gone —
     having already been drawn as a user bubble by `should_render_question`.
+
+    **Streamlit 1.62 closed that hole upstream, which is why the second test below stubs
+    the widget instead of driving it.** `register_widget(..., disabled=...)` now discards
+    an incoming value for a widget that rendered disabled, as stale or forged
+    (`runtime/state/session_state.py`, "Enforce `disabled` server-side"), so `set_value`
+    on the disabled input leaves `prompt` as None and the guard is never reached — this
+    class's original single test went red on the upgrade for that reason, with the page
+    behaving correctly. The guard still has to stay: `pyproject.toml` supports
+    `streamlit>=1.57`, where the old delivery is live, and it is the only thing that
+    turns a swallowed question into a notice rather than a silent drop. So the two tests
+    split what each can honestly prove — the invariant through the real widget, the
+    branch through a stubbed one.
     """
 
-    def test_a_question_arriving_mid_turn_is_refused_rather_than_swallowed(
-        self,
-    ) -> None:
+    def test_a_queued_question_never_disturbs_the_turn_in_flight(self) -> None:
+        """The end-to-end invariant, and it holds on either side of the 1.62 change."""
         page = _page(
             pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
             feed=webui.StreamlitFeed(),
@@ -272,8 +290,36 @@ class TestAQuestionCannotSlipPastATurnInFlight:
             "the queued question overwrote the turn's payload"
         )
         assert page.session_state["question"] is None
-        assert "not sent" in (page.session_state["notice"] or "").lower()
         # And the thing that was actually in flight is untouched.
+        assert [i.id for i in page.session_state["pending"]] == ["i1"]
+
+    def test_a_delivered_question_is_refused_with_a_notice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `if prompt and busy:` branch itself, on a value Streamlit still delivers.
+
+        The stub is the whole point: it reproduces what 1.57-1.61 do to a disabled input,
+        which the installed Streamlit no longer will. Without it this test would pass on
+        an empty branch — `prompt` is None, nothing runs, and every assertion about the
+        turn being untouched is satisfied by Streamlit having dropped the value. That is
+        this repo's recurring failure mode, an assertion met by an unrelated condition.
+        """
+        import streamlit as st
+
+        monkeypatch.setattr(
+            st, "chat_input", lambda *_args, **_kwargs: "a brand new question"
+        )
+        page = _page(
+            pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
+            feed=webui.StreamlitFeed(),
+        )
+
+        assert not page.exception, page.exception
+        assert "not sent" in (page.session_state["notice"] or "").lower(), (
+            "the question was swallowed instead of refused"
+        )
+        assert page.session_state["payload"] is None
+        assert page.session_state["question"] is None
         assert [i.id for i in page.session_state["pending"]] == ["i1"]
 
 

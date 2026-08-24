@@ -13,6 +13,7 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.human_in_the_loop import InterruptOnConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
@@ -77,10 +78,7 @@ so is one that states findings whose source URLs live only in the file you wrote
 Put the report — with its citations inline — in what you say.
 
 Do NOT narrate — no "let me search…", no "memory is empty…", no "both researchers came
-back". You will see appended guidance to the contrary: a "## Progress Updates" section
-claiming "the user can see your responses and tool outputs in real time" and asking for
-"brief progress updates at reasonable intervals". Every part of that is wrong here, and
-this instruction overrides it:
+back". Two reasons, both structural rather than stylistic:
 
 - The user already watches your TOOLS live — the plan, each delegation, every search
   query, as they happen. A progress update tells them only what they have already been
@@ -152,6 +150,15 @@ def build_backend() -> CompositeBackend:
 GATED_TOOLS: dict[str, bool | InterruptOnConfig] = {
     "write_file": True,
     "edit_file": True,
+    # ARRIVED IN deepagents 0.7.x, and unlike `execute` it is REAL — `FilesystemMiddleware`
+    # offers it on every model call, and it is the only gated name here that destroys data
+    # rather than adding it. On the 0.6.12 -> 0.7.8 upgrade the tool appeared, this entry
+    # did not exist yet, and the entire offline suite stayed green: nothing compared the
+    # agent's actual tool list against the set this dict claims to cover. An agent could
+    # have deleted a note under `/memories/` — the one place writes are durable — with no
+    # approval prompt. `test_every_mutating_tool_the_model_is_offered_is_gated` closes that
+    # by deriving the check from the built agent instead of from this list.
+    "delete": True,
     # LATENT — does nothing today, and that is fine. `FilesystemMiddleware` strips
     # `execute` from `request.tools` on every model call unless the backend satisfies
     # `SandboxBackendProtocol`, and for a `CompositeBackend` that is decided by its
@@ -192,6 +199,29 @@ def build_agent(*, checkpointer: Any = None, store: Any = None) -> Any:
         tools=[build_web_search()],
         system_prompt=SYSTEM_PROMPT,
         subagents=[build_research_subagent()],
+        # `write_todos`, which SYSTEM_PROMPT step 1 mandates. Through 0.6.x deepagents put
+        # `TodoListMiddleware` in the base stack itself and passing another via
+        # `middleware=` registered a SECOND `write_todos` — there is no dedupe — so this
+        # line would have been a bug. 0.7.0 dropped it from the base stack, which both
+        # requires this and makes it safe.
+        #
+        # Deliberately ONLY here. deepagents used to give every declarative subagent its
+        # own copy, which is what forced the `orchestrator_trajectory` vs `trajectory`
+        # split in the evals: a `researcher` tidying up after itself with `write_todos`
+        # scored the ORCHESTRATOR a pass on the very planning defect that eval exists to
+        # watch. Custom middleware passed here does not propagate to declarative subagents
+        # (they take their own `middleware` key), so the researcher now has no todo list at
+        # all — which is what this repo always wanted and never had.
+        #
+        # NOT passed `system_prompt=`, though 0.7.x finally makes that possible. The
+        # middleware injects langchain's `WRITE_TODOS_SYSTEM_PROMPT`, which says four ways
+        # to skip the list for anything under three steps; SYSTEM_PROMPT step 1 names and
+        # overrides it, measured at ~80% compliance over 15 runs. Replacing that fragment
+        # outright is now a one-kwarg deterministic fix, but it means holding a copy of
+        # langchain's prose that goes stale in silence, and the compliance it would buy is
+        # an EVAL-scored property this repo has 15 runs of history on. Change it there,
+        # with numbers — not as a side effect of a dependency upgrade.
+        middleware=[TodoListMiddleware()],
         backend=build_backend(),
         interrupt_on=GATED_TOOLS,
         checkpointer=checkpointer,

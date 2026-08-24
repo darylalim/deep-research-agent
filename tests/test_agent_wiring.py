@@ -16,8 +16,8 @@ from contextlib import contextmanager
 from typing import Any
 from unittest import mock
 
+from deepagents import graph as graph_module
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
-from deepagents.graph import BASE_AGENT_PROMPT
 from deepagents.middleware.filesystem import supports_execution
 
 from deep_research import agent as agent_module
@@ -62,13 +62,80 @@ def test_mutating_and_shell_tools_are_gated() -> None:
     # inert unless the tool actually reaches the model, which for `execute` it does
     # not — see the next test. This one is the real gate for `write_file`/`edit_file`
     # and a statement of intent for `execute`.
-    for tool_name in ("write_file", "edit_file", "execute"):
+    for tool_name in ("write_file", "edit_file", "delete", "execute"):
         assert tool_name in GATED_TOOLS, f"{tool_name} is not gated"
         config = GATED_TOOLS[tool_name]
         gated = config is True or (
             isinstance(config, dict) and config.get("allowed_decisions")
         )
         assert gated, f"{tool_name} is present but its value does not enable gating"
+
+
+# Every tool the model may be offered that CANNOT change the world. Written down rather
+# than defaulted so that a tool arriving from a dependency upgrade has to be classified by
+# a person: unknown means "fail", never "assume harmless". Same shape, and the same
+# reasoning, as `_SILENT_STOPS` vs `NOT_SILENT` in `test_cli_parsing.py`.
+READ_ONLY_TOOLS = frozenset(
+    {
+        "ls",
+        "read_file",
+        "glob",
+        "grep",
+        "write_todos",  # rewrites a state channel, not the filesystem
+        "task",  # delegates; the subagent's OWN mutations interrupt on their own
+        "tavily_search",
+    }
+)
+
+
+def test_every_mutating_tool_the_model_is_offered_is_gated() -> None:
+    """Derive the safety check from the BUILT AGENT, never from `GATED_TOOLS` itself.
+
+    This is the test whose absence let the deepagents 0.6.12 -> 0.7.8 upgrade through.
+    0.7.x added a `delete` tool to `FilesystemMiddleware`, `GATED_TOOLS` did not list it,
+    and all 202 tests stayed green — because every one of them asked what the dict *says*
+    rather than what the model is *handed*. The agent could have deleted a note under
+    `/memories/`, the one place its writes are durable, with no approval prompt.
+
+    `test_mutating_and_shell_tools_are_gated` is the complement and both are needed: it
+    asserts the three names we care about are gated *properly* (a `False` value silently
+    un-gates while the key stays), and this one asserts there is no FOURTH name nobody
+    noticed. Neither implies the other.
+    """
+    with open_agent() as agent:
+        offered = set(agent.nodes["tools"].bound.tools_by_name)
+
+    unclassified = offered - READ_ONLY_TOOLS - set(GATED_TOOLS)
+    assert not unclassified, (
+        f"the agent is offered {sorted(unclassified)}, which is neither gated nor listed "
+        "as read-only. If it can change the world (write, edit, delete, execute), add it "
+        "to GATED_TOOLS; if it cannot, add it to READ_ONLY_TOOLS. Do not leave it "
+        "unclassified — that is how `delete` arrived unguarded in deepagents 0.7.x."
+    )
+    # The other direction, so the allowlist cannot quietly rot into a list of names that
+    # no longer exist while still granting blanket permission to whatever replaced them.
+    assert offered >= READ_ONLY_TOOLS, (
+        f"READ_ONLY_TOOLS names tools the agent no longer has: "
+        f"{sorted(READ_ONLY_TOOLS - offered)}"
+    )
+
+
+def test_write_todos_is_offered_because_the_prompt_mandates_it() -> None:
+    """SYSTEM_PROMPT step 1 orders a tool that deepagents stopped providing.
+
+    Through 0.6.x `TodoListMiddleware` was in deepagents' base stack. 0.7.0 removed it, so
+    `write_todos` vanished from the agent while step 1 went on demanding it — an
+    instruction to call a tool the model is never offered. `build_agent` now passes the
+    middleware explicitly, which is only correct on 0.7+: on 0.6.x it would have
+    registered a SECOND `write_todos`, since nothing dedupes them.
+
+    Nothing else catches this. The prompt is a string, the tool list comes from a
+    dependency, and no test crossed the two — the failure would have surfaced as the
+    `plans_with_todos` eval quietly scoring zero and the feed's plan line going blank.
+    """
+    with open_agent() as agent:
+        assert "write_todos" in agent.nodes["tools"].bound.tools_by_name
+    assert "write_todos" in SYSTEM_PROMPT
 
 
 def test_execute_is_latent_because_the_backend_cannot_run_it() -> None:
@@ -85,32 +152,54 @@ def test_execute_is_latent_because_the_backend_cannot_run_it() -> None:
     assert not supports_execution(build_backend())
 
 
-def test_system_prompt_overrides_the_injected_narration_guidance() -> None:
-    # `create_deep_agent()` APPENDS `BASE_AGENT_PROMPT` after our system prompt, and it
-    # opens by telling the model "the user can see your responses and tool outputs in real
-    # time" and closes with a "## Progress Updates" section asking for "brief progress
-    # updates at reasonable intervals". Being appended, it also wins on recency.
-    #
-    # Both claims are false here. The user watches a live feed of TOOL activity; the
-    # agent's prose does not stream at all — `cli.render_turn` prints it in one block when
-    # the turn ends. Measured on a real run: three paragraphs of stale narration ("Let me
-    # first check memory", "Memory is empty", "Both subagents returned solid findings")
-    # printed *above* the answer, one of them restating a `⌕ /memories/ · empty` line the
-    # user had already watched scroll by.
-    #
-    # This is the SECOND time deepagents' injected prompt has beaten SYSTEM_PROMPT — the
-    # first was `TodoListMiddleware`'s "skip the todo list" guidance, which cost 15 runs to
-    # characterise. Both halves are asserted, so this test tells you *which* thing broke:
-    # if deepagents drops the section our override becomes dead weight, and if someone
-    # trims SYSTEM_PROMPT the narration comes straight back.
-    assert "Progress Updates" in BASE_AGENT_PROMPT, (
-        "deepagents no longer injects the narration guidance — SYSTEM_PROMPT's override "
-        "of it is now dead weight and should be removed."
+def test_nothing_is_appended_to_our_system_prompt() -> None:
+    """The model receives SYSTEM_PROMPT and nothing else — asserted on the real string.
+
+    Through 0.6.x, `create_deep_agent()` APPENDED `BASE_AGENT_PROMPT` after our prompt,
+    where it won on recency: it opened with "the user can see your responses and tool
+    outputs in real time" and closed with a "## Progress Updates" section asking for
+    "brief progress updates at reasonable intervals". Both claims were false here — the
+    user watches a live feed of TOOL activity, while the agent's prose does not stream at
+    all — and the measured cost was three paragraphs of stale narration printed above the
+    answer. `SYSTEM_PROMPT` carried a section naming and overriding it, and the version of
+    this test that guarded it asserted BOTH halves precisely so it would say which one had
+    moved.
+
+    deepagents 0.7.0 is what moved: it no longer authors a base prompt at all
+    (`BASE_AGENT_PROMPT` survives only as a deprecated module attribute, removal slated
+    for 0.9.0), so the override became the dead weight its own failure message predicted
+    and was deleted with this rewrite. What replaces it is stricter than either half was:
+    the exact string handed to `create_agent` must BE `SYSTEM_PROMPT`.
+
+    Read it in both directions. It goes red if deepagents (or a harness profile — an
+    unregistered model gets an empty one, and `claude-opus-5` is unregistered today)
+    starts contributing prompt text again, which is when a narration override would be
+    needed back. And it goes red if anything in this repo starts appending to the prompt
+    at assembly time rather than editing the constant, which is where a prompt change
+    would otherwise become invisible to every other test in this file.
+    """
+    with _capture_calls(graph_module, "create_agent") as calls, open_agent():
+        pass
+
+    assert calls, "create_agent was never called"
+    assembled = calls[0]["system_prompt"]
+    assert assembled == SYSTEM_PROMPT, (
+        "something now contributes system-prompt text beyond SYSTEM_PROMPT. If it is a "
+        "revived base/profile prompt, check whether it tells the model to narrate "
+        "progress — that guidance is false for this app and needs overriding again.\n"
+        f"extra: {assembled.replace(SYSTEM_PROMPT, '<SYSTEM_PROMPT>')!r}"
     )
-    assert "Progress Updates" in SYSTEM_PROMPT, (
-        "SYSTEM_PROMPT must NAME and override the '## Progress Updates' guidance "
-        "deepagents appends after it, or the agent narrates over its own answer."
-    )
+
+
+def test_the_agent_is_still_told_not_to_narrate() -> None:
+    """The instruction outlived the prompt it used to argue with, and must.
+
+    Deleting the override above is not the same as deciding narration is fine. Prose
+    still arrives in one block from `render_turn` when the turn ends, so "let me first
+    check memory" is read next to the feed line that already showed the result. Nothing
+    injects the contrary guidance today, but nothing rules the behavior out either.
+    """
+    assert "Do NOT narrate" in SYSTEM_PROMPT
 
 
 def test_only_memories_is_routed_to_the_durable_store() -> None:

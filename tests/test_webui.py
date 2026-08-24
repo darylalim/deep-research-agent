@@ -156,8 +156,12 @@ class TestStreamlitFeedInheritsEveryRule:
     def test_a_researchers_own_todos_and_ls_are_not_shown_as_the_agents(
         self, feed: webui.StreamlitFeed
     ) -> None:
-        # deepagents gives every declarative subagent its own TodoListMiddleware and
-        # FilesystemMiddleware, so a `researcher` really does call `write_todos` and `ls`.
+        # Subagents keep their own FilesystemMiddleware, so a `researcher` really does
+        # call `ls` (and `write_file`, and now `delete`). The `todos` half is defence in
+        # depth as of deepagents 0.7.x: subagents no longer get a `TodoListMiddleware`,
+        # and `build_agent` passes one for the orchestrator alone. Both are asserted,
+        # because the guard keys on the NAMESPACE rather than on a per-tool list — which
+        # is what keeps it correct through exactly this kind of upstream reshuffle.
         # Rendering those namespace-blind would print a researcher's private checklist as
         # the agent's plan, and claim durable memory was consulted on a turn where the
         # orchestrator never looked — hiding the exact direct-path defect CLAUDE.md says

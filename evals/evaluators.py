@@ -12,9 +12,12 @@ Split deliberately into two kinds:
 
 **Grade the orchestrator's contract against `orchestrator_trajectory`, never
 `trajectory`.** Those `SYSTEM_PROMPT` steps are addressed to the orchestrator, and
-deepagents hands every subagent its own `write_todos`/`ls`/`write_file` — so a flat
-trajectory lets a researcher's own bookkeeping score as if the orchestrator had done
-it. Only `searched_the_web` deliberately counts the whole tree.
+deepagents hands every subagent its own `FilesystemMiddleware` — so a flat trajectory
+lets a researcher's own `ls`/`write_file`/`delete` bookkeeping score as if the
+orchestrator had done it. Only `searched_the_web` deliberately counts the whole tree.
+(Through 0.6.x subagents got a `TodoListMiddleware` too, which put `write_todos` — the
+very tool `plans_with_todos` grades — on that list. 0.7.x removed it, so that particular
+leak is closed at the source; the split still earns its keep on the other three.)
 
 Every evaluator takes `(run, example)` and returns a single
 `{"score": ..., "comment": ...}`. Returning several metrics from one function is

@@ -1047,9 +1047,11 @@ class TestActivityFeed:
     def test_a_researchers_own_todos_and_ls_are_not_shown_as_the_agents(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # deepagents gives EVERY declarative subagent its own TodoListMiddleware and
-        # FilesystemMiddleware, so a `researcher` really can call `write_todos` and `ls`
-        # regardless of what `subagents.py` lists in its `tools`. Rendering those
+        # deepagents gives EVERY declarative subagent its own FilesystemMiddleware, so a
+        # `researcher` really can call `ls` regardless of what `subagents.py` lists in its
+        # `tools`. The `write_todos` half is defence in depth as of 0.7.x, which stopped
+        # giving subagents a `TodoListMiddleware`; the guard keys on the namespace, not on
+        # the tool, so it covers both without caring which is live. Rendering those
         # namespace-blind would:
         #   - print a researcher's private checklist as a second `✎ plan`, appearing to
         #     supersede the plan the user was just shown;

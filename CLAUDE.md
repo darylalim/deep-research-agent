@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
-(currently v0.6.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
+(currently v0.7.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
 `agent.py` (~220 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
 (~1130 lines, the largest module here) — the human-in-the-loop
 interrupt/resume protocol that wiring implies, plus every rule about what a user may
@@ -62,9 +62,11 @@ uv run ty check                  # type check (Astral's ty)
 - **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
-  gate, the Opus 5 no-sampling / thinking-not-disabled invariants, the `/memories/`
+  gate — including the one derived from the BUILT AGENT's tool list, which is what
+  now catches a tool arriving ungated from a dependency — the Opus 5 no-sampling /
+  thinking-not-disabled invariants, the `/memories/`
   route and its store
-  namespace, deepagents 0.7.0 backend readiness, the `langgraph dev`
+  namespace, the deepagents 0.7 backend contract, the `langgraph dev`
   served-graph assembly — it must build with **no** local checkpointer/store yet
   keep the same gate — and, in `test_webui.py`, that the browser front end still
   *reuses* `cli.py`'s rules rather than having drifted into its own copy of them),
@@ -140,19 +142,53 @@ auto-detection resolves to for this app (its `assistant_id` branch is a LangGrap
 Platform concept a local CLI never sets), so it is the key every note already in
 `memories.sqlite` lives under — change it and the user's durable memory is orphaned,
 silently. Passing it *explicitly* is separately required: a `StoreBackend` with no
-`namespace` is itself deprecated for removal in 0.7.0.
+`namespace` was deprecated and is removed in 0.7.
 
 The backend is passed to `create_deep_agent()` as an **instance**
-(`backend=build_backend()`). deepagents also accepts a
+(`backend=build_backend()`). deepagents also accepted a
 `Callable[[Runtime], BackendProtocol]` factory there, and this project used to — but
 the factory form, along with `StateBackend(runtime)` / `StoreBackend(runtime)` and a
-`StoreBackend` with no explicit `namespace`, is deprecated for **removal in
-deepagents 0.7.0** (the backends resolve the runtime themselves now). Hence the
-`deepagents>=0.6.12,<0.7` cap in `pyproject.toml`: it is capped at the *minor*
-because deepagents is 0.x, so that is where it breaks.
+`StoreBackend` with no explicit `namespace`, was **removed in deepagents 0.7.0** (the
+backends resolve the runtime themselves now). The project is on `>=0.7.8,<0.8`; it is
+capped at the *minor* because deepagents is 0.x, so that is where it breaks.
 
-**Three tests in `test_agent_wiring.py` keep this 0.7.0-ready**, because the
-deprecations fire at *different times* and no single test sees them all:
+**The 0.6 -> 0.7 crossing is the most instructive upgrade in this repo's history, and
+none of it was caught by a test.** All three deprecations above had been handled years
+early, so the migration looked free: the whole offline suite passed 202/202 on 0.7.8
+*before a single source change*. It was wrong in two ways, both found only by building
+the agent and reading the tool list it actually offers:
+
+- **`write_todos` disappeared.** 0.7.x drops `TodoListMiddleware` from the base stack.
+  `SYSTEM_PROMPT` step 1 would have ordered a tool the model is never handed, the feed's
+  `plan` line would have gone permanently blank, and `plans_with_todos` would have scored
+  zero for a reason having nothing to do with the agent. `build_agent` now passes
+  `middleware=[TodoListMiddleware()]` — which is correct **only** on 0.7+: on 0.6.x the
+  base stack already had one and passing another registered a *second* `write_todos`,
+  since nothing dedupes them.
+- **A `delete` tool appeared, ungated.** `GATED_TOOLS` did not list it and nothing
+  noticed, so the agent could have destroyed a note under `/memories/` — the one place
+  its writes are durable — with no approval prompt. That is the precise failure the gate
+  exists to prevent, arriving through a dependency rather than through an edit.
+
+The durable fix is neither of those two lines; it is
+`test_every_mutating_tool_the_model_is_offered_is_gated`, which derives the safety check
+from the **built agent** and fails on any tool that is neither gated nor on an explicit
+read-only allowlist. Unknown means fail, never "assume harmless" — the same shape as
+`_SILENT_STOPS` vs `NOT_SILENT`, and adopted for the same reason. Every test that missed
+this asked what the source *says* rather than what the model is *handed*.
+
+**One thing 0.7 fixed for free.** Subagents no longer get their own `TodoListMiddleware`
+either, and custom middleware passed to `create_deep_agent` does **not** propagate to
+declarative subagents — so `write_todos` is now orchestrator-only *structurally*. That
+closes, at the source, the leak that forced the `orchestrator_trajectory` vs `trajectory`
+split described under *Evaluating it*: a `researcher` tidying up after itself can no
+longer score the orchestrator a pass on planning. The namespace split stays exactly as it
+is, because subagents keep their `FilesystemMiddleware` and so still emit `ls`,
+`write_file` and now `delete` — and because keying on the namespace rather than on a list
+of tool names is what made that code survive this reshuffle untouched.
+
+**Three tests in `test_agent_wiring.py` were written to keep this 0.7.0-ready**, because
+the deprecations fire at *different times* and no single test sees them all:
 `test_backend_construction_is_free_of_deprecation_warnings` (the `runtime` form —
 warns at construction), `test_memory_namespace_is_explicit_and_unchanged` (the
 missing-`namespace` form — warns only when a store op actually *resolves* the
@@ -585,12 +621,35 @@ a suite that silently skips in CI protects nothing, hence the group.
 
 **Widget behaviour is tested with `streamlit.testing.v1.AppTest`**, which runs a script
 headless and exposes the elements it produced (`AppTest.from_string`, then
-`.button_group[0].set_value("approve").run()`). `AppTest.from_file("streamlit_app.py")`
-drives the whole page — it works offline because `conftest.py` already sets dummy
-credentials and an isolated `DEEP_RESEARCH_STATE_DIR` as top-level code, so
-`missing_keys()` passes and the sqlite files land in a temp dir. `tests/test_webui.py`
-covers rendering and the widgets; `tests/test_streamlit_page.py` covers the rerun state
-machine those sit inside.
+`.button_group[0].set_value("approve").run()`). `AppTest.from_file(PAGE)` drives the
+whole page — it works offline because `conftest.py` already sets dummy credentials and
+an isolated `DEEP_RESEARCH_STATE_DIR` as top-level code, so `missing_keys()` passes and
+the sqlite files land in a temp dir. `tests/test_webui.py` covers rendering and the
+widgets; `tests/test_streamlit_page.py` covers the rerun state machine those sit inside.
+
+**`PAGE` is an absolute path built from `__file__`, and it has to be.** Streamlit 1.62
+changed how `AppTest.from_file` resolves a *relative* path — from "relative to the
+working directory" to "relative to the file that calls it" — so the plain
+`"streamlit_app.py"` that worked when pytest ran from the repo root started resolving to
+`tests/streamlit_app.py` and took all 13 page tests out with `FileNotFoundError`.
+Anchoring on `__file__` is correct under both rules and additionally stops the suite
+depending on the working directory.
+
+**Streamlit 1.62 also closed the queued-value hole upstream — and the page's guard still
+has to stay.** `register_widget(..., disabled=...)` now discards an incoming value for a
+widget that rendered disabled, treating it as stale or forged
+(`runtime/state/session_state.py`, "Enforce `disabled` server-side"). So `set_value` on
+the disabled chat input no longer reaches the script, and the single test that drove the
+`if prompt and busy:` branch through the real widget went red *while the page was
+behaving correctly*. Two things follow. The guard stays, because `pyproject.toml`
+supports `streamlit>=1.57` where the old delivery is live, and it is the only thing that
+turns a swallowed question into a visible notice. And the test had to **split**:
+`test_a_queued_question_never_disturbs_the_turn_in_flight` drives the real widget and
+proves the end-to-end invariant on either side of the change, while
+`test_a_delivered_question_is_refused_with_a_notice` monkeypatches `st.chat_input` to
+return a value — reproducing what 1.57-1.61 do — because without the stub it would pass
+on an empty branch, every assertion satisfied by Streamlit having dropped the value
+rather than by the guard. That is this file's recurring failure mode, one version later.
 
 **Do not over-trust it on the fragments.** Measured: interacting with a widget *inside* a
 fragment makes `AppTest` re-run the whole app rather than simulating a fragment-scoped
@@ -644,8 +703,10 @@ gets exactly the silent blank line the tuple exists to prevent.
   it can't see the main conversation and is **one-shot/stateless** per `task` call,
   so its prompt must be self-contained. It exists to keep the orchestrator's context
   lean by absorbing many searches and returning one cited summary.
-- `write_todos` and `task` are **built into Deep Agents** — they're not defined in
-  this repo. Only `tavily_search` (`tools.py`) is a custom tool here.
+- `task` is **built into Deep Agents**; `write_todos` comes from langchain's
+  `TodoListMiddleware`, which `agent.py` passes explicitly via `middleware=[...]` because
+  deepagents 0.7 stopped putting it in the base stack. Neither is defined in this repo.
+  Only `tavily_search` (`tools.py`) is a custom tool here.
 
 ## Model constraint (real gotcha)
 
@@ -779,7 +840,12 @@ by-hand review of that same upgrade, in which `general_harms` was spotted in
 `test_cli_parsing.py::TestStopReasonsAreAccountedFor` now compares the table against
 `anthropic.types.StopReason` by set equality, so the next member goes red on `uv sync` and
 has to be classified as silent or not. **Prose telling a future reader to re-check a file
-is not a check** — that is the whole lesson, and it cost two rounds to learn.
+is not a check** — that is the whole lesson, and it cost two rounds to learn. The
+mechanism has since been exercised in anger and held: the `anthropic` 0.120 -> 0.125 and
+`langchain-anthropic` 1.5.2 -> 1.6.1 upgrade moved neither the seven `StopReason`
+members nor `RefusalStopDetails.category`, and `chat_models.py` still names
+`stop_reason` three times and `stop_details` not once — so the table needed no edit and,
+more to the point, nobody had to remember to look.
 
 Four things about that code are load-bearing:
 
@@ -898,14 +964,18 @@ assumes otherwise:
   answer, scoring 0 for the wrong reason. `harness._approve_all` mirrors `cli.py`'s
   id-keyed resume.
 - **Grade the orchestrator against `orchestrator_trajectory`, never `trajectory`.**
-  deepagents gives *every* declarative subagent its own `TodoListMiddleware` and
-  `FilesystemMiddleware` (`graph.py:643-651`), so the `researcher` really can call
-  `write_todos`, `ls` and `write_file` — whatever `subagents.py` lists in its `tools` —
-  and its tool messages stream out *before* the parent's `task` result. Flatten the two
-  and a researcher tidying up after itself scores the **orchestrator** a pass on plan /
-  check-memory / persist, including on the very `write_todos` defect this eval exists to
-  watch. It would read as "the prompt fix worked" when it had not. Only
-  `searched_the_web` counts the whole tree, deliberately.
+  deepagents gives *every* declarative subagent its own `FilesystemMiddleware`, so the
+  `researcher` really can call `ls`, `write_file` and `delete` — whatever `subagents.py`
+  lists in its `tools` — and its tool messages stream out *before* the parent's `task`
+  result. Flatten the two and a researcher tidying up after itself scores the
+  **orchestrator** a pass on check-memory / persist. It would read as "the prompt fix
+  worked" when it had not. Only `searched_the_web` counts the whole tree, deliberately.
+  (Through 0.6.x subagents got a `TodoListMiddleware` too, which put `write_todos` — the
+  very defect `plans_with_todos` exists to watch — inside that blind spot. 0.7 removed it
+  and `agent.py` restores it for the orchestrator alone, so that one is now structurally
+  impossible rather than merely filtered. The filter still keys on the **namespace**
+  rather than on a list of tool names, which is precisely why it needed no edit when the
+  list changed underneath it.)
 - **A unique `thread_id` is not isolation.** `/memories/` is routed to the Store, which
   is shared across *every* thread — so example 2 reads what example 1 wrote and skips
   researching. `harness._reset_state()` drops both databases between examples, which is
@@ -961,24 +1031,36 @@ leaked). Pooled, 12/15 ≈ **80%**. Both samples are individually unremarkable a
 apparent contradiction is what small n looks like. Do not tune the prompt off a handful of
 runs, and never "fix" a `plans_with_todos` failure by weakening the evaluator.
 
-**The SAME mechanism bit a second time, in `BASE_AGENT_PROMPT`, and nobody had swept for
-it.** `create_deep_agent()` **appends** `BASE_AGENT_PROMPT` *after* your system prompt
-(`graph.py`: `final_system_prompt = system_prompt + "\n\n" + base_prompt`), so it also wins
-on recency. It opens with "The user can see your responses and tool outputs **in real
-time**" and closes with a `## Progress Updates` section: "For longer tasks, provide brief
-progress updates at reasonable intervals". No harness profile suppresses it — the registered
-ones are `claude-opus-4-7` / `sonnet-4-6` / `haiku-4-5` (plus three `gpt-5.x-codex`), so
-`claude-opus-5` gets an empty profile. Re-measured on the Opus 5 upgrade, since a
-registered profile would have made our override dead weight: still empty, so the override
-in `SYSTEM_PROMPT` is still load-bearing.
+**The SAME mechanism bit a second time, in `BASE_AGENT_PROMPT` — and the fix has since
+been RETIRED by an upgrade, which is the more useful half of the story.** Through 0.6.x
+`create_deep_agent()` **appended** `BASE_AGENT_PROMPT` *after* your system prompt
+(`graph.py`: `final_system_prompt = system_prompt + "\n\n" + base_prompt`), so it also won
+on recency. It opened with "The user can see your responses and tool outputs **in real
+time**" and closed with a `## Progress Updates` section: "For longer tasks, provide brief
+progress updates at reasonable intervals". Measured on a real REPL run: the agent printed
+**three paragraphs of stale narration** above its answer ("Let me first check memory",
+"Memory is empty", "Both subagents returned solid, cited findings"), one of which restated
+a `⌕ /memories/ · empty` line the user had already watched scroll past. `SYSTEM_PROMPT`
+grew a closing section naming and overriding it.
 
-Measured on a real REPL run: the agent printed **three paragraphs of stale narration** above
-its answer ("Let me first check memory", "Memory is empty", "Both subagents returned solid,
-cited findings"), one of which restated a `⌕ /memories/ · empty` line the user had already
-watched scroll past. `SYSTEM_PROMPT`'s closing section now names and overrides it, and
-`test_system_prompt_overrides_the_injected_narration_guidance` asserts *both* halves — so it
-tells you which one broke if deepagents ever drops the section (our override becomes dead
-weight) or someone trims ours (the narration returns).
+**deepagents 0.7 removed the authored base prompt entirely** — `BASE_AGENT_PROMPT` survives
+only as a deprecated module attribute (removal slated for 0.9.0) and nothing appends it.
+Measured on 0.7.8: the string handed to `create_agent` **is** `SYSTEM_PROMPT`, byte for
+byte. So the override became dead weight and was deleted; the *instruction* ("Do NOT
+narrate", plus the two structural reasons) stays, because prose still arrives in one block
+from `render_turn` whatever the harness does or does not say.
+
+That the guard test named the outcome in its own failure message — "deepagents no longer
+injects the narration guidance, so SYSTEM_PROMPT's override is now dead weight and should
+be removed" — is the point worth copying. **Asserting both halves of an override is what
+makes it safe to delete later.** A test that had only checked our own prompt would have
+kept passing while the thing it defended against no longer existed, and the override would
+have sat in the prompt indefinitely, costing tokens and arguing with a ghost.
+`test_nothing_is_appended_to_our_system_prompt` replaces it with something stricter in the
+other direction: the assembled prompt must equal `SYSTEM_PROMPT` exactly, so it goes red
+the day deepagents (or a harness profile — `claude-opus-5` still resolves to an empty one,
+re-measured here) starts contributing text again, which is exactly when an override would
+be needed back.
 
 **Note the trap in the reasoning, not just the bug.** When the streaming feed was being
 planned, this fix was deferred on the argument that "streaming makes the narration guidance
@@ -994,11 +1076,19 @@ steps compete for one budget. At n=10 it evaporated: **9 of 10 runs did both.** 
 "fixed" the prompt architecture off n=5, we would have redesigned around noise. (Note the
 n=10 study cannot formally *test* the association — planning hit 10/10, so the 2×2 has an
 empty row and no power. The refutation comes from the nine counterexamples, not from the
-p-value, which is vacuous.) A deterministic fix would
-mean monkeypatching `deepagents.graph.TodoListMiddleware` to replace its prompt (the class
-takes `system_prompt=`, but deepagents constructs it internally as `TodoListMiddleware()`,
-and passing your own via `middleware=[...]` registers a *second* `write_todos` tool —
-there is no dedupe). That coupling was judged not worth it; the eval watches it instead.
+p-value, which is vacuous.)
+
+**The deterministic fix is now one kwarg away, and is deliberately NOT taken.** It used to
+require monkeypatching `deepagents.graph.TodoListMiddleware`, because deepagents
+constructed it internally as `TodoListMiddleware()` and passing your own via
+`middleware=[...]` registered a *second* `write_todos` — there is no dedupe. On 0.7 the
+base stack no longer has one, `agent.py` constructs it, and the class has always taken
+`system_prompt=`; so replacing langchain's skip-the-list guidance outright is now a normal
+argument rather than a coupling. Two reasons it stays untaken. It means holding a copy of
+langchain's prose in this repo, which goes stale in silence — the same hazard as writing an
+SDK enum down by hand. And the thing it would buy is an **eval-scored** property with 15
+runs of history behind its current number; changing it belongs in `evals/` with a measured
+before/after, not as a side effect of a dependency upgrade. The eval watches it meanwhile.
 
 **`claims_are_cited` took two fixes, and both are the kind that get undone.**
 
@@ -1062,7 +1152,12 @@ doesn't configure X" is not evidence that X is unconfigured — grep the install
   `subagents=[...]` in `agent.py`.
 - **Gate a tool** → add its name to `GATED_TOOLS` in `agent.py`. Check the model is
   actually *offered* that tool, though — gating a name the backend never exposes is a
-  no-op (see `execute`, above).
+  no-op (see `execute`, above). The reverse direction is automatic:
+  `test_every_mutating_tool_the_model_is_offered_is_gated` reads the built agent's tool
+  list and fails on anything that is neither gated nor in its explicit `READ_ONLY_TOOLS`
+  allowlist, so a tool arriving from a dependency upgrade has to be classified by a
+  person. That test exists because `delete` arrived ungated in deepagents 0.7 and 202
+  passing tests noticed nothing.
 - **Production persistence** → swap `SqliteStore`/`SqliteSaver` for the Postgres
   equivalents in `open_agent()`; the `CompositeBackend` routing is unchanged.
 - **Serve it over HTTP / drive it from a web UI** → `uv run --group serve langgraph

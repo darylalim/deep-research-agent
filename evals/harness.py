@@ -159,14 +159,19 @@ class TurnRecorder:
         # An empty namespace is the orchestrator; anything else is inside a subagent's
         # subgraph (measured: `('tools:<uuid>',)`). Keeping the two apart is not
         # bookkeeping — it is correctness. deepagents gives every declarative subagent
-        # its OWN TodoListMiddleware and FilesystemMiddleware (graph.py:643-651), so the
-        # `researcher` really can call `write_todos`, `ls` and `write_file` no matter
-        # what `subagents.py` lists in its `tools`. And its tool messages stream out
-        # *before* the parent's `task` result. Fold them into one list and a researcher
-        # tidying up after itself earns the ORCHESTRATOR a pass on the three
-        # SYSTEM_PROMPT steps (plan / check memory / persist) that are addressed to the
-        # orchestrator alone — including the very `write_todos` defect this eval exists
-        # to track. It would read as "the prompt fix worked" when it did not.
+        # its OWN FilesystemMiddleware, so the `researcher` really can call `ls`,
+        # `write_file` and `delete` no matter what `subagents.py` lists in its `tools`.
+        # And its tool messages stream out *before* the parent's `task` result. Fold them
+        # into one list and a researcher tidying up after itself earns the ORCHESTRATOR a
+        # pass on SYSTEM_PROMPT steps (check memory / persist) addressed to the
+        # orchestrator alone. It would read as "the prompt fix worked" when it did not.
+        #
+        # Through 0.6.x subagents also got their own `TodoListMiddleware`, which put
+        # `write_todos` — the tool `plans_with_todos` grades — in that same blind spot.
+        # 0.7.x removed it and `build_agent` restores it for the orchestrator only, so
+        # that one is now structurally impossible rather than merely filtered. The rest
+        # still need the filter, and it stays uniform: classifying by NAMESPACE is what
+        # makes it robust to the next middleware deepagents moves.
         is_orchestrator = not namespace
 
         kind = getattr(message, "type", None)

@@ -757,11 +757,19 @@ class ActivityFeed:
                 # that rewrites the message list wholesale is covered, not just this one.
                 continue
             if (todos := update.get("todos")) and is_orchestrator:
-                # ORCHESTRATOR ONLY. deepagents gives every declarative subagent its own
-                # `TodoListMiddleware`, so a `researcher` really can call `write_todos` —
-                # and its list streams out under `('tools:<uuid>',)`. Rendering that would
-                # print a researcher's private checklist as the agent's plan, appearing to
-                # supersede the plan the user was just shown. This is the same
+                # ORCHESTRATOR ONLY. Through deepagents 0.6.x every declarative subagent
+                # got its own `TodoListMiddleware`, so a `researcher` really could call
+                # `write_todos` — and its list streamed out under `('tools:<uuid>',)`.
+                # Rendering that would print a researcher's private checklist as the
+                # agent's plan, appearing to supersede the plan the user was just shown.
+                #
+                # 0.7.x drops that middleware from the subagent stack, so today the guard
+                # is defence in depth rather than a live fix — `build_agent` passes
+                # `TodoListMiddleware` for the ORCHESTRATOR only, and nothing propagates it
+                # down. Keep it anyway: a `todos` update under a subagent namespace is not
+                # this agent's plan whatever put it there, and the sibling `ls` guard
+                # below IS still live, since subagents keep their `FilesystemMiddleware`.
+                # This is the same
                 # orchestrator/subagent conflation `evals/harness.py` keeps apart with
                 # `orchestrator_trajectory` vs `trajectory`; the display layer has to make
                 # the same distinction, for the same reason.

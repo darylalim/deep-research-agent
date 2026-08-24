@@ -425,12 +425,17 @@ def test_evaluators_accept_both_the_object_and_dict_run_shapes():
 def test_a_subagents_bookkeeping_does_not_earn_the_orchestrator_a_pass():
     """The tool-side twin of the prose leak above, and a nastier one.
 
-    deepagents gives every declarative subagent its own TodoListMiddleware and
-    FilesystemMiddleware, so the `researcher` really has `write_todos`, `ls` and
-    `write_file` — whatever `subagents.py` lists in its `tools`. Its tool messages
-    also stream out *before* the parent's `task` result. So an orchestrator that
-    plans nothing, reads no memory and persists nothing still scored a clean sweep
-    on all three, purely on a researcher tidying up after itself.
+    deepagents gives every declarative subagent its own FilesystemMiddleware, so the
+    `researcher` really has `ls`, `write_file` and `delete` — whatever `subagents.py`
+    lists in its `tools`. Its tool messages also stream out *before* the parent's `task`
+    result. So an orchestrator that reads no memory and persists nothing still scored a
+    clean sweep, purely on a researcher tidying up after itself.
+
+    `write_todos` stays in the fixture below even though deepagents 0.7.x no longer gives
+    subagents a `TodoListMiddleware` — `build_agent` passes one for the orchestrator only.
+    That is deliberate: `TurnRecorder` splits on the NAMESPACE, not on a per-tool list, so
+    feeding it a tool a subagent can no longer emit is a direct check that the split does
+    not quietly depend on which middleware deepagents ships this month.
     """
     recorder = TurnRecorder()
     # The orchestrator delegates immediately — no plan, no memory check.

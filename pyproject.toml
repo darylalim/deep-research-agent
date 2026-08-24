@@ -18,12 +18,34 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11,<4.0"
 dependencies = [
     # Deep Agents harness (bundles langgraph transitively).
-    # Capped at the MINOR: deepagents is 0.x, so a minor bump is its breaking
-    # boundary, and 0.7.0 is a known break — it removes the `runtime` argument to
-    # StateBackend/StoreBackend and the callable-factory form of `backend=`, both
-    # of which `agent.py` used to rely on. Everything else here is capped at the
-    # major, matching the LangChain 1.0 LTS line.
-    "deepagents>=0.6.12,<0.7",
+    # Capped at the MINOR: deepagents is 0.x, so a minor bump is its breaking boundary.
+    # Everything else here is capped at the major, matching the LangChain 1.0 LTS line.
+    #
+    # **The 0.6 -> 0.7 crossing is the reason that cap is not cosmetic.** Two of its
+    # changes are invisible to `ty`, to lint, and — this is the part worth remembering —
+    # to the entire offline suite, which passed 202/202 on 0.7.8 with BOTH defects live.
+    # Measured by building `build_agent()` and listing the tool node:
+    #
+    #   0.6.12: [edit_file, execute, glob, grep, ls, read_file, task, tavily_search,
+    #            write_file, write_todos]
+    #   0.7.8:  [delete, edit_file, execute, glob, grep, ls, read_file, task,
+    #            tavily_search, write_file]
+    #
+    # 1. `write_todos` GONE — 0.7.x drops `TodoListMiddleware` from the base stack, so
+    #    `SYSTEM_PROMPT` step 1 would order a tool the model is never offered and
+    #    `plans_with_todos` would score zero for a reason having nothing to do with the
+    #    agent. `agent.py` now passes `middleware=[TodoListMiddleware()]`, which is only
+    #    correct on 0.7+: on 0.6.x it registered a SECOND `write_todos` (no dedupe).
+    # 2. `delete` APPEARED, ungated — an unreviewed filesystem mutation reachable on
+    #    `/memories/`, the one place this agent's writes are durable. Now in
+    #    `GATED_TOOLS`.
+    #
+    # The lasting fix is neither of those, it is
+    # `test_every_mutating_tool_the_model_is_offered_is_gated`: it derives the check from
+    # the BUILT AGENT's tool list, so an unclassified tool arriving from any future
+    # upgrade fails instead of passing. Every test that missed this asked what the source
+    # *says* rather than what the model is *handed*. Keep the floor at 0.7.8 and above.
+    "deepagents>=0.7.8,<0.8",
     # LangChain 1.0 LTS core + framework
     "langchain>=1.0,<2.0",
     "langchain-core>=1.0,<2.0",
