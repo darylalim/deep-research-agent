@@ -88,8 +88,46 @@ uv run ty check                  # type check (Astral's ty)
   via `[tool.hatch.build.targets.wheel]`). So `uv sync` installs it editable and
   `import deep_research` works without a `pythonpath` shim.
 - **CI** (`.github/workflows/ci.yml`): a `lint` job (ruff + `ruff format --check` +
-  ty) and a `test` matrix over Python 3.11–3.13, all via `uv`. The offline suite
-  needs no secrets. Keep it green.
+  ty), a `test` matrix, and a `release` job, all via `uv`. The offline suite needs
+  no secrets. Keep it green. Three things about it are deliberate:
+  - **The matrix is `3.11` and `3.14` — the floor and the ceiling of
+    `requires-python = ">=3.11,<4.0"`, not every version in between.** A Python break
+    is either "the floor lacks it" or "the newest release removed it", and both ends
+    are covered; the middle versions cost runners and buy no signal, and `uv.lock`
+    resolves universally so there is no per-version wheel gap for them to catch
+    either. 3.14 was **measured** green (205 passed, full `ui` group) before it
+    replaced 3.12/3.13 — it had been claimed by `requires-python` and tested by
+    nothing.
+  - **`uv sync --locked`, never a bare `uv sync`.** A bare one silently re-resolves
+    and rewrites `uv.lock` inside the runner, so a committed lock that had drifted
+    from `pyproject.toml` passed CI forever. `--locked` fails the build instead, and
+    it is what makes "`uv.lock` is committed, regenerate it with `uv lock`" an
+    enforced rule rather than an aspiration.
+  - **`permissions: contents: read` at workflow level**, widened to `contents: write`
+    by the `release` job alone. That job is the entire blast radius.
+- **Releases are automatic, and the version is NOT in `pyproject.toml`.** The
+  `release` job publishes a GitHub Release the first time
+  `deep_research/__init__.py` names a version that has none. `pyproject.toml`
+  declares the version `dynamic`; hatchling greps `__init__.py` for the
+  `__version__` assignment (`[tool.hatch.version]`), so a workflow keyed on
+  `paths: ['pyproject.toml']` would never fire. Four things are load-bearing:
+  - **`needs: [lint, test]`** is what makes unattended publishing safe: a version
+    bump on a red tree cannot be tagged, because the job never starts.
+  - **Detection asks "is there a release for `v<version>`?", not "did this push
+    change `__init__.py`".** A diff against `HEAD~1` is wrong under squash merges,
+    force pushes and re-runs. The existence check is idempotent, so a run the
+    `concurrency` block cancelled (or one that failed) simply retries on the next
+    green push instead of needing a hand-made tag. The cost is the mirror image:
+    deleting a release re-creates it on the next push — delete the **tag** too if
+    you mean it gone.
+  - **`--target $GITHUB_SHA`** pins the tag to the commit the other two jobs just
+    proved green. Without it GitHub tags whatever the branch head happens to be when
+    the API call lands, which is not necessarily what was tested.
+  - **Notes come from `--generate-notes`, and a tag CI creates is lightweight.**
+    v0.1.0 and v0.2.0 were hand-written *annotated* tags whose message became the
+    release body; that style ends here. Pushing an annotated tag by hand before the
+    bump merges does not preserve it — the job reuses the tag but writes generated
+    notes over your prose.
 - **No console-script entry point** — the app is invoked only as a module
   (`python -m deep_research` → `__main__.py` → `cli.main`).
 - **`ruff` selects more than the defaults** (`[tool.ruff.lint]` in `pyproject.toml`):

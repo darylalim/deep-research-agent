@@ -111,7 +111,7 @@ serve = [
 # agent. Run it with `uv run --group ui streamlit run streamlit_app.py`.
 #
 # **Unlike `serve`, CI installs this one** (`.github/workflows/ci.yml` syncs
-# `--group ui` in both jobs). The difference is first-party code: nothing in this repo
+# `--group ui` in its `lint` and `test` jobs). The difference is first-party code: nothing in this repo
 # imports langgraph-cli, so there is nothing for lint/ty/pytest to check in `serve` —
 # whereas `webui.py` and `streamlit_app.py` are ours, and without the group `ty` fails
 # them with `unresolved-import` and `tests/test_webui.py` skips itself.

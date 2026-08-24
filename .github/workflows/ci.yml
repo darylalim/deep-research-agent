@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege. Nothing in this workflow writes to the repo; a job that needs
+# more (a release, say) asks for it at the job level rather than widening this.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
 concurrency:
   group: ci-${{ github.ref }}
@@ -15,24 +20,19 @@ jobs:
     name: Lint & type check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
-      # `--group ui`, unlike `serve`, because that group has FIRST-PARTY code behind it
-      # (`deep_research/webui.py`, `streamlit_app.py`). `uv sync` is an exact sync, so a
-      # bare one uninstalls the group and `ty` then fails those files with
-      # `unresolved-import: streamlit`. `serve` stays out because no module in this repo
-      # imports langgraph-cli — there is nothing there for lint or ty to check.
-      - name: Install dependencies
-        run: uv sync --group ui
-      - name: Ruff lint
-        run: uv run ruff check
-      - name: Ruff format check
-        run: uv run ruff format --check
-      - name: Type check (ty)
-        run: uv run ty check
+      # `--group ui`, unlike `serve`, because that group has FIRST-PARTY code behind
+      # it (`deep_research/webui.py`, `streamlit_app.py`) and `uv sync` is an exact
+      # sync — without it `ty` fails both with `unresolved-import: streamlit`.
+      # `--locked` so a `uv.lock` that has drifted from `pyproject.toml` fails the
+      # build instead of being silently re-resolved into a lock nobody committed.
+      - run: uv sync --locked --group ui
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run ty check
 
   test:
     name: Tests (py${{ matrix.python-version }})
@@ -40,21 +40,80 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # The floor and the ceiling of `requires-python = ">=3.11,<4.0"`. The
+        # versions between them cost runners and buy no signal: a Python break is
+        # either "the floor lacks it" or "the newest release removed it", and both
+        # ends are covered here. 3.14 measured green (205 passed) before it landed.
+        python-version: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      # `--group ui` so `tests/test_webui.py` actually RUNS here rather than skipping.
-      # It guards its import with `pytest.importorskip("streamlit")`, which keeps a
-      # partial install working locally — but a suite that silently skips in CI is a
-      # suite that is not protecting anything.
-      - name: Install dependencies
-        run: uv sync --group ui
-      # Runs the offline suite only; `live` tests are deselected by default, so
-      # no ANTHROPIC_API_KEY / TAVILY_API_KEY secrets are needed here.
-      - name: Run tests
-        run: uv run pytest
+      # `--group ui` so `tests/test_webui.py` actually RUNS here rather than
+      # skipping itself on `pytest.importorskip("streamlit")` — a suite that
+      # silently skips in CI is a suite that is not protecting anything.
+      - run: uv sync --locked --group ui
+      # Offline suite only; `live` tests are deselected by `addopts`, so no
+      # ANTHROPIC_API_KEY / TAVILY_API_KEY secrets are needed here.
+      - run: uv run pytest
+
+  # Publishes a GitHub Release the first time `deep_research/__init__.py` names a
+  # version that has none. `needs:` is the load-bearing part — a version bump on a
+  # red tree can never be tagged, because this job does not start until both others
+  # are green.
+  #
+  # Detection asks "is there a release for v<version>?", NOT "did this push touch
+  # __init__.py". A diff against HEAD~1 is wrong under squash merges, force pushes
+  # and re-runs; the existence check is idempotent, so a release that failed (or a
+  # bump whose run got cancelled by a newer push) simply retries on the next green
+  # push instead of needing a hand-made tag. The cost is that deleting a release
+  # re-creates it on the next push — delete the tag too if you mean it gone.
+  release:
+    name: Release
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The only job here that writes anything. The workflow-level default stays
+    # `contents: read`, so this is the whole blast radius.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Release on a new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The same read hatchling does for `[tool.hatch.version]`: grep
+          # `__init__.py` for the assignment. `pyproject.toml` declares the version
+          # `dynamic` and does NOT contain it, so watching that file instead would
+          # mean this job never fires.
+          version=$(sed -n 's/^__version__ *= *"\([^"]*\)".*/\1/p' deep_research/__init__.py)
+          if [ -z "$version" ]; then
+            echo "::error file=deep_research/__init__.py::no __version__ assignment found"
+            exit 1
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released — nothing to do."
+            exit 0
+          fi
+          # Anything that is not a bare X.Y.Z (0.3.0rc1, 0.3.0.dev1, a typo'd
+          # 0.3.0-wip) must not take the "Latest" badge. With no human step between
+          # the merge and the publish, this regex is the only thing that catches it.
+          # A plain string, not an array, and deliberately unquoted below: on an
+          # EMPTY array `"${flags[@]}"` is an unbound-variable error under `set -u`
+          # before bash 4.4 (verified: bash 3.2 dies, bash 5.2 does not). Runners
+          # ship 5.x today, but an unattended publish should not rest on that.
+          prerelease=
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || prerelease=--prerelease
+          # --target pins the tag to the commit the two jobs above just proved
+          # green. Without it GitHub tags whatever the branch head is at API-call
+          # time, which is not necessarily what was tested.
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --generate-notes $prerelease
+          echo "Released $tag at $GITHUB_SHA"
