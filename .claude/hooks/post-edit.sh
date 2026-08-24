@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # PostToolUse(Edit|Write) — keep the CI gate green as Claude edits Python.
 #
-# Two steps, in this order and in ONE script on purpose: `ruff check --fix`
-# rewrites the file, so a pytest run racing it in a parallel hook could read a
-# half-rewritten tree. Sequential is deterministic.
+# Three steps, in this order and in ONE script on purpose: `ruff check --fix`
+# rewrites the file, so a checker racing it in a parallel hook could read a
+# half-rewritten tree. Sequential is deterministic. Within that constraint the
+# order is cheapest-first — 0.10s, 0.24s, 5.1s measured — so the common failure
+# is reported in a fraction of a second instead of after the whole suite.
 #
 #   1. ruff  — format + autofix the edited file, then surface anything ruff could
 #              NOT autofix (this repo selects E,F,I,UP,B,SIM,RUF,BLE).
-#   2. pytest — for edits under deep_research/ or tests/, run the offline suite.
-#               ~1s, needs no keys and no network: conftest.py sets dummy keys and
+#   2. ty    — CI's `lint` job runs `ty check` alongside ruff, so leaving it out
+#              here meant a type error surfaced as a red GitHub Actions run rather
+#              than next to the file that caused it. Project-wide (ty has no useful
+#              single-file mode) and measured at 0.24s, so it runs on EVERY .py edit
+#              — including `streamlit_app.py` and `evals/`, which CI type-checks but
+#              the pytest step below deliberately skips. Note that a DEAD
+#              `# ty: ignore` is itself a failure here (`unused-ignore-comment`),
+#              which is exactly the kind of error that otherwise only shows up in CI.
+#   3. pytest — for edits under deep_research/ or tests/, run the offline suite.
+#               ~5s, needs no keys and no network: conftest.py sets dummy keys and
 #               redirects DEEP_RESEARCH_STATE_DIR to a tempdir, and pyproject sets
 #               `addopts = -m 'not live'` so the paid `live` tests are deselected.
 #
@@ -56,7 +66,20 @@ if ! leftover=$(uv run ruff check -- "$file" 2>&1); then
   exit 2
 fi
 
-# --- 2. pytest: only for source/test edits ------------------------------------
+# --- 2. ty: every .py file, because CI type-checks every .py file -------------
+if ! tyout=$(uv run ty check 2>&1); then
+  {
+    echo "ty reports type errors after your edit to ${rel}."
+    echo "The CI 'lint' job runs 'uv run ty check' and will fail on these."
+    echo "Note: a DEAD '# ty: ignore' is itself an error (unused-ignore-comment),"
+    echo "so an upgrade that FIXES a false positive turns its suppression red."
+    echo
+    printf '%s\n' "$tyout" | tail -30
+  } >&2
+  exit 2
+fi
+
+# --- 3. pytest: only for source/test edits ------------------------------------
 case "$rel" in
   deep_research/*|tests/*) ;;
   *) exit 0 ;;
@@ -66,10 +89,10 @@ if ! out=$(uv run pytest -q 2>&1); then
   {
     echo "The offline test suite is RED after your edit to ${rel}."
     echo
-    echo "These tests guard this repo's load-bearing invariants — the Opus 4.8"
+    echo "These tests guard this repo's load-bearing invariants — the Opus 5"
     echo "no-sampling-params rule, the GATED_TOOLS human-approval gate, the"
     echo "/memories/ durable route and its store namespace, the HITL decision"
-    echo "protocol, and deepagents 0.7.0 backend readiness. A failure here is"
+    echo "protocol, and the deepagents 0.7 backend contract. A failure here is"
     echo "usually a real regression, not a flaky test. Do not proceed until green."
     echo
     printf '%s\n' "$out" | tail -40

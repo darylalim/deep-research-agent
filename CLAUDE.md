@@ -40,21 +40,27 @@ uv run ty check                  # type check (Astral's ty)
   `/astral:<skill>` — `/astral:uv`, `/astral:ty`, `/astral:ruff` — so that
   dependency management, type checking, and lint/format follow current best
   practices rather than remembered defaults.
-- **A PostToolUse hook already runs ruff and pytest for you.** `.claude/settings.json`
+- **A PostToolUse hook already runs ruff, ty and pytest for you.** `.claude/settings.json`
   wires `.claude/hooks/post-edit.sh` to every `Edit`/`Write` of a `.py` file — as
   `bash <path>`, deliberately, so a lost exec bit can't silently disable the gate;
   wire any new hook the same way. It formats and autofixes with ruff, reports
-  whatever ruff *can't* autofix, and — for edits under `deep_research/` or `tests/` —
-  runs the offline suite (~1s, no keys, no network). A non-zero exit blocks with the
-  failure in stderr. **Two consequences for how you edit here:** `ruff check --fix`
+  whatever ruff *can't* autofix, type-checks with `ty` (0.24s, project-wide — CI's
+  `lint` job runs it too, so leaving it out of the hook only moved the failure to a
+  red GitHub Actions run; it is also the one step that covers `streamlit_app.py` and
+  `evals/`, which the pytest step below skips), and — for edits under
+  `deep_research/` or `tests/` — runs the offline suite (**~5s**, no keys, no
+  network; measured, and the number this file carried for a long time — "~1s" — was
+  5x optimistic). A non-zero exit blocks with the failure in stderr. **Two consequences for how you edit here:** `ruff check --fix`
   deletes an import whose first *use* lands in a *later* edit, so add an import and its
   first use in the SAME edit (splitting them silently drops the import); and since
   pytest reruns on every `.py` edit, sequence a multi-edit refactor so each step leaves
   the suite green (e.g. rewrite the last user of a symbol before deleting the symbol),
-  or the hook blocks mid-refactor. Both steps live in one script, in that order,
+  or the hook blocks mid-refactor. All three steps live in one script, in that order,
   deliberately:
-  `ruff check --fix` rewrites the file, so a pytest run racing it in a parallel hook
-  could read a half-rewritten tree. The same settings file `deny`s reads *and* edits
+  `ruff check --fix` rewrites the file, so a checker racing it in a parallel hook
+  could read a half-rewritten tree. Past that constraint the order is cheapest-first
+  (0.10s / 0.24s / 5.1s), so the usual failure is reported in a fraction of a second
+  rather than after the whole suite has run. The same settings file `deny`s reads *and* edits
   of `.env` and `.deep_research/**` (live agent state: checkpoints, memories,
   *pending approvals*) — both gitignored, so git cannot undo damage to them — and
   `deny`s *edits* of `uv.lock`, which **is** committed: regenerate it with `uv lock`,
