@@ -27,6 +27,7 @@ from langgraph.types import Command, Interrupt
 
 from deep_research import cli as cli_module
 from deep_research.cli import (
+    _LS_EMPTY,
     DEFAULT_ALLOWED_DECISIONS,
     PREVIEW_LINES,
     ActivityFeed,
@@ -35,6 +36,28 @@ from deep_research.cli import (
     _render_action,
     main,
 )
+
+
+def test_the_empty_ls_sentinel_still_matches_what_deepagents_returns() -> None:
+    """Derive the sentinel from the installed package, never from this file's memory.
+
+    `cli._LS_EMPTY` is a hand-copied literal — one private function's return value — so
+    it is exactly the kind of fact that goes stale in silence on an upgrade. It already
+    did once: 0.6 returned a `"[]"` repr for an empty listing, 0.7 returns a bare string,
+    and until this was noticed an empty `/memories/` rendered `?` instead of `empty`.
+
+    Calling the real `_format_file_paths` is what makes the next change loud instead. The
+    same shape as `TestStopReasonsAreAccountedFor` comparing the stop table against the
+    SDK: ask the dependency, do not re-read it by hand.
+    """
+    from deepagents.middleware.filesystem import _format_file_paths
+
+    assert _format_file_paths([]) == _LS_EMPTY, (
+        "deepagents changed what an empty `ls` listing looks like; cli._LS_EMPTY is now "
+        "stale and an empty /memories/ will render `?` instead of `empty`."
+    )
+    # And the non-empty side is still a list repr, which is what `ast.literal_eval` parses.
+    assert _format_file_paths(["/memories/a.md"]) == "['/memories/a.md']"
 
 
 def _updates(node: str, *messages: object) -> dict:
@@ -1018,12 +1041,20 @@ class TestActivityFeed:
     def test_the_ls_line_reads_the_list_repr_not_the_line_count(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # deepagents builds the `ls` body as `str(paths)` — a Python list repr on ONE
-        # line, `"[]"` or `"['/memories/a.md', '/b.md']"` — not newline-separated entries.
+        # deepagents builds the `ls` body on ONE line — not newline-separated entries.
         # Counting lines reported "1 file(s)" for an EMPTY store every single time, and
         # made the "empty" branch unreachable. This line is how the user sees whether
         # durable memory was consulted; one that lies is worse than no line at all.
-        cases = (("[]", "empty"), ("['/memories/a.md', '/b.md']", "2 file(s)"))
+        #
+        # BOTH empty shapes are covered deliberately: `"[]"` is the 0.6 list repr and
+        # `"No files found"` is 0.7's bare sentinel. Testing only the first is how the
+        # sentinel went unhandled while this test stayed green — an empty /memories/
+        # rendered `?`, and nothing said so.
+        cases = (
+            ("[]", "empty"),
+            ("No files found", "empty"),
+            ("['/memories/a.md', '/b.md']", "2 file(s)"),
+        )
         for body, expected in cases:
             feed = ActivityFeed()
             feed.absorb(

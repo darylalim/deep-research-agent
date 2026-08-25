@@ -56,6 +56,13 @@ class FeedEvent:
     is_orchestrator: bool = True
 
 
+# What deepagents' `_format_file_paths` (`middleware/filesystem.py`) returns for an EMPTY
+# listing: a bare sentinel, not the `"[]"` repr that 0.6 produced. Hardcoded rather than
+# imported — it is one private function's return literal, and guessing wrong degrades a
+# single feed line to `?` rather than breaking anything. `test_the_empty_ls_sentinel_still_
+# matches_what_deepagents_returns` calls the real function and goes red if it ever changes.
+_LS_EMPTY = "No files found"
+
 # Every `kind` the feed can emit — the contract between `ActivityFeed` and its renderers.
 # Both `ActivityFeed._emit` (terminal) and `webui.render_event` (browser) are if/elif
 # chains that silently draw NOTHING for a kind they do not recognize, so adding a kind and
@@ -944,20 +951,31 @@ class ActivityFeed:
             # looked, hiding the exact "the direct path skips /memories/" defect CLAUDE.md
             # says to keep watching.
             #
-            # And the body is NOT newline-separated entries: deepagents builds it as
-            # `str(paths)` — a Python list repr, `"[]"` or `"['/memories/a.md']"`. Counting
-            # lines therefore reported "1 file(s)" for an EMPTY store, every time, and the
-            # "empty" branch was unreachable. Parse the repr, and if it is not one, say so
-            # rather than inventing a number.
+            # And the body is NOT newline-separated entries. `_format_file_paths` renders
+            # a non-empty listing as `str(paths)` — a Python list repr on ONE line,
+            # `"['/memories/a.md']"` — and an empty one as the bare `_LS_EMPTY` sentinel.
+            # Counting lines is wrong for both: it reported "1 file(s)" for an EMPTY store,
+            # every time. So match the sentinel, else parse the repr, and if it is neither
+            # say `?` rather than inventing a number.
+            #
+            # Handling BOTH empty shapes is the point. `"[]"` was 0.6's and the sentinel is
+            # 0.7's, and for a while only the repr was handled — so an empty `/memories/`
+            # rendered `?`, which reads as "the feed could not tell" when the truth was
+            # "the orchestrator looked and found nothing". This line is the direct-path
+            # signal the evals watch; one that cannot say `empty` is barely worth printing.
             path = self._ls_paths.get(call_id, "/memories/")
-            try:
-                entries = ast.literal_eval(_text_of(message).strip())
-            except (ValueError, SyntaxError):
-                entries = None
-            if isinstance(entries, list):
-                count = f"{len(entries)} file(s)" if entries else "empty"
+            body = _text_of(message).strip()
+            if body == _LS_EMPTY:
+                count = "empty"
             else:
-                count = "?"
+                try:
+                    entries = ast.literal_eval(body)
+                except (ValueError, SyntaxError):
+                    entries = None
+                if isinstance(entries, list):
+                    count = f"{len(entries)} file(s)" if entries else "empty"
+                else:
+                    count = "?"
             self._emit(FeedEvent("listed", text=path, detail=count))
         elif name == "task":
             # The one honest way to name a researcher: recover the sub-question from the

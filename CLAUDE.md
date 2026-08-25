@@ -73,8 +73,8 @@ uv run ty check                  # type check (Astral's ty)
   `uv run pytest` or the CI `lint` job is where it surfaces, detached from the edit that
   caused it. If you edit Python outside `Edit`/`Write`, run the three steps yourself:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
-- **Tests** live in `tests/` (pytest) — 8 files, ~4,100 lines, **206 offline tests in
-  ~4s**. Where things are: `test_cli_hitl.py` (1,329 lines, the largest — the HITL
+- **Tests** live in `tests/` (pytest) — 8 files, ~4,100 lines, and the offline suite runs
+  in **~4s**. Where things are: `test_cli_hitl.py` (1,329 lines, the largest — the HITL
   decision protocol, `ActivityFeed`, duplicate interrupts, command dispatch),
   `test_cli_parsing.py` (`render_turn` / `_text_of` / the stop-reason table),
   `test_agent_wiring.py` (the gate, the backend contract, the served graph),
@@ -403,10 +403,14 @@ Also note the `ls` body is **not** newline-separated: deepagents renders a non-e
 as `str(paths)`, a Python list repr (`"['/memories/a.md']"`), and an *empty* one as the bare
 string `"No files found"` (`_format_file_paths`, `deepagents/middleware/filesystem.py`).
 Counting lines is wrong either way — it reports "1 file(s)" for an empty store — so `cli.py`
-parses the repr with `ast.literal_eval` and prints `?` when it is not one. **Known defect on
-0.7.x: an empty `/memories/` therefore renders `⌕ /memories/ · ?`, and the `"empty"` branch
-is unreachable** — `tests/test_cli_hitl.py` still feeds it the 0.6-era `"[]"`, so nothing
-goes red.
+matches the `_LS_EMPTY` sentinel, else parses the repr with `ast.literal_eval`, and prints
+`?` only when it is neither. **Both empty shapes are handled deliberately**, because for a
+while only the 0.6 repr was: an empty `/memories/` rendered `⌕ /memories/ · ?`, which reads
+as "the feed could not tell" when the truth was "the orchestrator looked and found nothing"
+— and this line is the direct-path signal the evals watch. `_LS_EMPTY` is a hand-copied
+literal, so `test_the_empty_ls_sentinel_still_matches_what_deepagents_returns` calls the
+real `_format_file_paths` instead of trusting it, the same way the stop table is compared
+against the SDK rather than re-read by hand.
 
 A subagent's stream namespace (`('tools:<pregel-task-uuid>',)`) **cannot be bound** back to
 the `task` tool-call that spawned it — the uuid is not the tool-call id, and correlating
