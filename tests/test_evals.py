@@ -19,6 +19,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Interrupt
 
+from deep_research.agent import GATED_TOOLS
 from deep_research.cli import render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
 from evals.evaluators import (
@@ -33,11 +34,39 @@ from evals.evaluators import (
 )
 from evals.harness import (
     LIVE_STATE_DIR,
+    MUTATING_TOOLS,
     TurnRecorder,
     _approve_all,
     _reset_state,
     ensure_isolated_state_dir,
 )
+
+
+def test_the_evals_mutation_list_covers_every_gated_tool() -> None:
+    """`MUTATING_TOOLS` and `GATED_TOOLS` are independent in value, not in content.
+
+    `harness.MUTATING_TOOLS` is deliberately not an import of `agent.GATED_TOOLS`: an
+    evaluator that read the dict it is checking would agree with it and pass no matter
+    what that dict said. `mutations_require_approval` observes both sides instead —
+    what the agent *proposed* against what actually *interrupted*.
+
+    But that independence is about the values. A gated tool missing from the tuple is
+    invisible to `TurnRecorder`, so it is never recorded as proposed, so the evaluator
+    returns its vacuous "nothing to approve" pass and the metric silently stops
+    covering it. That is not hypothetical: deepagents 0.7 added `delete`, `GATED_TOOLS`
+    gained it, this tuple did not, and the only gated tool that DESTROYS data went
+    unmeasured. Names in sync; values still observed rather than trusted.
+
+    Verify it bites: drop `"delete"` from `MUTATING_TOOLS` and watch this go red.
+    """
+    assert set(MUTATING_TOOLS) == set(GATED_TOOLS), (
+        "harness.MUTATING_TOOLS has drifted from agent.GATED_TOOLS — "
+        f"gated but unmeasured: {sorted(set(GATED_TOOLS) - set(MUTATING_TOOLS))}; "
+        f"measured but ungated: {sorted(set(MUTATING_TOOLS) - set(GATED_TOOLS))}. "
+        "A gated tool absent here is never recorded as proposed, so "
+        "mutations_require_approval scores it a vacuous 1."
+    )
+
 
 ORCHESTRATOR: tuple[str, ...] = ()
 # What a subagent's subgraph namespace actually looks like (measured).
