@@ -212,36 +212,53 @@ with st.sidebar:
 for _index, (_kind, _text) in enumerate(sections):
     with st.chat_message("user" if _kind == "human" else "assistant"):
         if _events := st.session_state.work_logs.get(_index):
-            # A PLAIN expander. The lazy form is not an oversight, and the reason it
-            # is refused is the reason `approval_panel` refuses `st.form`.
+            # A PLAIN expander — and NOT for the reason this comment used to give.
+            # Worth reading before "fixing", because the lazy form is what Streamlit's
+            # own best-practices reference prescribes here.
             #
-            # The cost is real: measured, a collapsed `st.expander` still runs its
-            # body and produces every element inside it (15 of 15 in a probe), and
-            # Streamlit sends them whether or not the panel is open — its own
-            # docstring says so. `on_change="rerun"` plus `if exp.open:` produces
-            # none, and is what the best-practices reference prescribes here.
+            # The eager form's cost is real, and was measured on these exact shapes (a
+            # two-researcher turn: plan, ls, two delegations, seven searches, two
+            # completions). A collapsed `st.expander` still runs its body, and
+            # Streamlit sends every element inside it whether or not the panel is open
+            # — its own docstring says so — while `on_change="rerun"` plus
+            # `if panel.open:` sends none:
             #
-            # It is still wrong here, because it converts a passive container into a
-            # rerun-firing widget and THIS LOOP DRAWS ABOVE THE STREAMING BLOCK. These
-            # expanders are on screen while `agent.stream` is live, so a click would
-            # raise `RerunException` inside `_stream_turn` — a BaseException, which is
-            # exactly why the `except Exception` down there cannot catch it — tearing
-            # down the generator and cancelling researchers whose searches are already
-            # paid for. That is the bug this page has paid for twice already (the
-            # export button, then the memory selectbox), and the rule it learned is
-            # that every control which can fire a rerun is `disabled` while `busy`.
-            # `st.expander` has no `disabled` parameter — checked against 1.60's
-            # signature, not remembered — so it cannot be made lazy AND inert. A
-            # performance-shaped fix that deletes a safety property is the same trade
-            # `st.form` offered, and it gets the same answer.
+            #     turns │ eager  lazy  saved │ eager ms  lazy ms
+            #         1 │    16     2     14 │     72.4     71.5
+            #        10 │   160    20    140 │     67.2     60.8
+            #        40 │   640    80    560 │    103.6     80.1
+            #
+            # The old objection was that the lazy form turns a passive container into a
+            # rerun-firing widget, and THIS LOOP DRAWS ABOVE THE STREAMING BLOCK — so a
+            # click mid-turn would raise `RerunException` inside `_stream_turn` and
+            # cancel researchers whose searches are already paid for. True of a bare
+            # widget; FALSE behind a `@st.fragment`, which is how `webui.memory_browser`
+            # gets away with exactly this. See `_fragment_run_should_not_preempt_script`
+            # (streamlit `runtime/scriptrunner_utils/script_requests.py`): a rerun
+            # carrying a `fragment_id_queue` that did NOT come from
+            # `st.rerun(scope="fragment")` returns None at `on_scriptrunner_yield`, so
+            # it does not preempt. A widget inside a fragment provably cannot tear this
+            # stream down, and no test here can show that — `AppTest` runs the whole app
+            # for a fragment interaction — but the source can.
+            #
+            # What kills it is the OTHER half of that same guarantee. A rerun that
+            # cannot preempt is not dropped, it is queued: picked up only at
+            # `on_scriptrunner_ready`, after the running script finishes. A research
+            # turn is minutes long and this transcript is on screen throughout, so
+            # clicking a past turn's work log would open an EMPTY panel — the frontend
+            # expands it at once, but the body it is waiting on cannot be computed until
+            # the turn ends — with no `disabled` on `st.expander` (checked against
+            # 1.62's signature, not remembered) to explain the wait. `memory_browser` can be
+            # a fragment precisely because its selectbox DOES take `disabled=busy`, so
+            # it is never a live-looking control with a deferred answer.
+            #
+            # Today's `on_change="ignore"` expander is not a widget at all: the browser
+            # opens it client-side, instantly, mid-turn, for zero round-trips. That is
+            # what the 14 elements per turn buy, and it is worth the price.
             #
             # The cost accepted is bounded rather than unbounded: `work_logs` is
             # per-session and rebuilt on a thread switch, so a fresh page starts empty
             # and this grows only with turns completed in THIS session.
-            #
-            # `webui.memory_browser` faces the identical choice and answers it the
-            # other way round; the difference is that it is a `@st.fragment`, where a
-            # rerun is fragment-scoped and cannot reach the stream.
             with st.expander("Work log", icon=":material/manage_search:"):
                 for _event in _events:
                     webui.render_event(_event)
@@ -283,7 +300,9 @@ def approval_panel() -> None:
 
     Both exits call a bare `st.rerun()`, which is app-scoped even from inside a fragment
     — required, because each one hands control back to the page's turn loop, and only a
-    full rerun re-enters the streaming block below with the new `payload`.
+    full rerun re-enters the streaming block below with the new `payload`. The second of
+    them, `abandon`, is drawn by `approval_form` in the same row as its submit button
+    and passed down as a callback; see that function for why the split runs that way.
 
     The `st.chat_message` wrapper is created *inside* the fragment rather than around the
     call. A fragment may write into a container made outside it, but only one that was
@@ -300,33 +319,30 @@ def approval_panel() -> None:
             with st.expander("Work log", icon=":material/manage_search:"):
                 st.session_state.feed.replay()
         st.markdown("**The agent is waiting on you.**")
-        if decisions := webui.approval_form(st.session_state.pending):
-            # A rejected call reaches the stream as a ToolMessage with `status="error"`
-            # carrying the human's own reason, so nothing downstream can tell a rejection
-            # from a crash. Tell the feed, or it reports an honoured decision as a bug.
-            st.session_state.feed.note_declined(
-                _declined_tools(st.session_state.pending, decisions)
-            )
-            st.session_state.update(
-                pending=[],
-                payload=Command(
-                    resume={
-                        interrupt_id: {"decisions": chosen}
-                        for interrupt_id, chosen in decisions.items()
-                    }
-                ),
-            )
-            st.rerun()
 
-        # An escape hatch, and a required one. `approval_form` keeps submit disabled
-        # until every action has a valid decision — so a tool gated with an
-        # `InterruptOnConfig` this UI cannot render a control for leaves the button
-        # permanently disabled, while `busy` has already disabled the chat input and the
-        # thread field and `st.stop()` below ends the page. The session would have no
-        # control left that could move it forward. `cli._prompt_decision` raises for the
-        # same input and `cli.main`'s broad `except` abandons the turn; this is the
-        # browser's equivalent, and it works for any stuck approval, not just that one.
-        if st.button("Abandon this turn", icon=":material/close:"):
+        def abandon() -> None:
+            """Draw the escape hatch, and take it if it is clicked.
+
+            A callback handed to `approval_form` rather than a button drawn here,
+            because the two controls belong in ONE row — a primary action with an
+            unrelated-looking button stranded beneath it reads as an afterthought,
+            which is the wrong thing for the only control that can free a stuck
+            session. `webui.py` owns that layout; what abandoning *means* is this
+            page's session-state machine, which that module deliberately knows
+            nothing about, so it stays here.
+
+            Required, not a convenience. `approval_form` keeps submit disabled until
+            every action has a valid decision — so a tool gated with an
+            `InterruptOnConfig` this UI cannot render a control for leaves that button
+            permanently disabled, while `busy` has already disabled the chat input and
+            the thread field and `st.stop()` below ends the page. The session would
+            have no control left that could move it forward. `cli._prompt_decision`
+            raises for the same input and `cli.main`'s broad `except` abandons the
+            turn; this is the browser's equivalent, and it works for any stuck
+            approval rather than just that one.
+            """
+            if not st.button("Abandon this turn", icon=":material/close:"):
+                return
             # Record the ids FIRST, and record them at all because clearing session
             # state does not resume the graph. Without this the checkpoint still held
             # the interrupt, `recover_pending` re-seeded `pending` on the very next
@@ -343,6 +359,29 @@ def approval_panel() -> None:
                 notice=(
                     "Turn abandoned. The pending action was not taken; ask again to "
                     "start a fresh turn."
+                ),
+            )
+            # Unwinds straight out of `approval_form`, so the decisions branch below
+            # cannot also fire on this pass. Correct: a browser delivers at most one
+            # click per run, and app-scoped even from inside this fragment.
+            st.rerun()
+
+        if decisions := webui.approval_form(
+            st.session_state.pending, secondary_action=abandon
+        ):
+            # A rejected call reaches the stream as a ToolMessage with `status="error"`
+            # carrying the human's own reason, so nothing downstream can tell a rejection
+            # from a crash. Tell the feed, or it reports an honoured decision as a bug.
+            st.session_state.feed.note_declined(
+                _declined_tools(st.session_state.pending, decisions)
+            )
+            st.session_state.update(
+                pending=[],
+                payload=Command(
+                    resume={
+                        interrupt_id: {"decisions": chosen}
+                        for interrupt_id, chosen in decisions.items()
+                    }
                 ),
             )
             st.rerun()

@@ -391,6 +391,60 @@ def test_nothing_is_submittable_until_every_action_is_decided() -> None:
     assert script.button[0].disabled, "one of two actions decided — still not ready"
 
 
+_FORM_WITH_HATCH = """
+import streamlit as st
+from deep_research import webui
+
+def hatch() -> None:
+    st.button("Abandon this turn", icon=":material/close:")
+
+st.session_state["decisions"] = webui.approval_form(
+    st.session_state["pending"], secondary_action=hatch
+)
+"""
+
+
+def test_the_secondary_action_is_drawn_even_while_submit_is_disabled() -> None:
+    """The escape hatch has to survive the one state it exists for.
+
+    `approval_form` keeps submit disabled until every action has a valid decision, so a
+    tool gated with decisions this UI cannot render disables it forever — and by then
+    the page has disabled the chat input and the thread field too. Drawing the second
+    control only when the form is `ready` would remove the only way out at exactly the
+    moment it is needed, which is why `secondary_action` is called unconditionally.
+
+    `AppTest` flattens containers, so this asserts presence and ORDER rather than the
+    horizontal row itself. Order is the half that carries meaning: the primary action
+    comes first, and the hatch reads as the alternative to it rather than as a separate
+    section. Asserting the row would be asserting something the harness cannot see.
+    """
+    script = AppTest.from_string(_FORM_WITH_HATCH)
+    script.session_state["pending"] = [
+        Interrupt(id="i1", value={"action_requests": [_WRITE]})
+    ]
+    script.run()
+
+    assert not script.exception, script.exception
+    assert [button.label for button in script.button] == [
+        "Send decisions",
+        "Abandon this turn",
+    ]
+    assert script.button[0].disabled, "nothing decided, so submit stays shut"
+    assert script.session_state["decisions"] is None
+
+
+def test_omitting_the_secondary_action_leaves_submit_alone() -> None:
+    """The positive control for the test above, and what the other form tests rest on.
+
+    Without this, "the hatch is drawn" could be passing on a button `approval_form`
+    always draws, and every `script.button[0]` in this file would be indexing into a
+    row whose shape nothing pins.
+    """
+    script = _form(Interrupt(id="i1", value={"action_requests": [_WRITE]}))
+
+    assert [button.label for button in script.button] == ["Send decisions"]
+
+
 def test_approving_every_action_yields_a_mapping_keyed_by_interrupt_id() -> None:
     # The shape LangGraph demands: `Command(resume={interrupt_id: {"decisions": [...]}})`.
     # A flat `{"decisions": [...]}` raises RuntimeError as soon as a turn holds two

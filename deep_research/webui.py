@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
@@ -436,7 +436,11 @@ def reviewable_actions(pending: list[Any]) -> int:
     )
 
 
-def approval_form(pending: list[Any]) -> dict[str, list[dict[str, Any]]] | None:
+def approval_form(
+    pending: list[Any],
+    *,
+    secondary_action: Callable[[], None] | None = None,
+) -> dict[str, list[dict[str, Any]]] | None:
     """Render every pending action; return `{interrupt_id: [decision, ...]}` on submit.
 
     `None` until the reviewer has produced a valid decision for *every* pending action
@@ -457,6 +461,21 @@ def approval_form(pending: list[Any]) -> dict[str, list[dict[str, Any]]] | None:
     that picking a decision costs. Anything derived from position in `pending` would not
     be: the same interrupt appears twice in that list, and nothing guarantees the order
     chunks arrived in.
+
+    **`secondary_action` is a callable, not a returned container, and the split is the
+    point.** The page needs its "Abandon this turn" escape hatch in the same row as
+    submit — one row of actions, rather than a primary button with an unrelated-looking
+    one stranded beneath it. But *what that button does* is session-state surgery this
+    module deliberately knows nothing about (see the module docstring), while *where it
+    sits* is layout, which belongs here with the rest of the rendering. Handing the row
+    a render callback puts each half where it lives. Returning the container instead
+    would change this function's return type, which ten tests in `test_webui.py` drive
+    directly.
+
+    It is drawn unconditionally, including while `ready` is False — a reviewer stuck
+    behind a submit button that can never enable is the exact case the second control
+    exists for, so gating it on readiness would delete the escape hatch precisely when
+    it is needed.
     """
     by_interrupt: dict[str, list[dict[str, Any]]] = {}
     complete = True
@@ -479,12 +498,20 @@ def approval_form(pending: list[Any]) -> dict[str, list[dict[str, Any]]] | None:
             by_interrupt[interrupt_id] = decisions
 
     ready = complete and bool(by_interrupt)
-    submitted = st.button(
-        "Send decisions",
-        type="primary",
-        icon=":material/send:",
-        disabled=not ready,
-    )
+    with st.container(horizontal=True, gap="small"):
+        submitted = st.button(
+            "Send decisions",
+            type="primary",
+            icon=":material/send:",
+            disabled=not ready,
+        )
+        if secondary_action is not None:
+            # Anything this raises propagates, and one thing deliberately does: the
+            # page's hatch ends in `st.rerun()`, whose `RerunException` unwinds
+            # straight out of this function. That is why the caller's decisions
+            # branch cannot also fire on the same pass — which is correct, since a
+            # browser delivers at most one button click per run anyway.
+            secondary_action()
     return by_interrupt if submitted and ready else None
 
 

@@ -582,10 +582,23 @@ rerun, `export_markdown` computed while `busy`) were both declined on these numb
 Five things about that are load-bearing:
 
 - **`webui.approval_form` stays a plain function.** `test_webui.py` drives it directly
-  from a three-line `AppTest.from_string` script — ten tests do, via its `_form` helper —
-  so decorating it would drag all ten inside a fragment for no benefit. The fragment is a
-  thin wrapper in the *page*, which is also the correct module: it mutates the page's
+  from a three-line `AppTest.from_string` script — eleven tests do, via its `_form` helper
+  — so decorating it would drag them all inside a fragment for no benefit. The fragment is
+  a thin wrapper in the *page*, which is also the correct module: it mutates the page's
   session-state machine, and `webui.py` deliberately knows nothing about that.
+  **That boundary is why "Abandon this turn" reaches its row as a callback.** The two
+  controls belong in one row — a primary button with an unrelated-looking one stranded
+  beneath it reads as an afterthought, which is wrong for the only control that can free a
+  stuck session. So `approval_form` draws submit inside `st.container(horizontal=True)`
+  and calls its `secondary_action` beside it: layout stays here with the rest of the
+  rendering, while what abandoning *means* stays in the page. Returning the container
+  instead would change this function's return type, which those eleven tests drive
+  directly. It is called **unconditionally**, including while submit is disabled — gating
+  the escape hatch on `ready` would delete it at precisely the moment it is needed, and
+  `test_the_secondary_action_is_drawn_even_while_submit_is_disabled` was verified red by
+  making exactly that edit. The page's callback ends in `st.rerun()`, whose
+  `RerunException` unwinds straight out of `approval_form`, so the decisions branch cannot
+  also fire on the same pass; correct, since a browser delivers one click per run.
 - **Both exits call a bare `st.rerun()`, which is app-scoped even from inside a
   fragment.** Required, because only a full rerun re-enters the streaming block with the
   new `payload`. `scope="fragment"` raises `StreamlitAPIException` during a full run;
@@ -607,8 +620,40 @@ Five things about that are load-bearing:
   is Streamlit's preferred fix for a collapsed expander still computing its body. It
   renders the selectbox only while the panel is open, and two tests reach for
   `sidebar.selectbox[0]` to prove `busy` reaches that widget at all — the pair recorded
-  below as having once passed for the wrong reason. `cached_memory_files` already reduces
-  the closed-panel cost to a dict lookup, which is most of what the guard would buy.
+  below as having once passed for the wrong reason. **Those two tests are the whole of the
+  argument.** The cost sentence this file used to end on — that `cached_memory_files`
+  reduces the closed-panel cost to a dict lookup — was wrong in the way this file keeps
+  relearning: the cache elides the sqlite *read*, not the *elements*. Streamlit sends a
+  closed expander's contents regardless, so the `st.code` inside ships the selected note's
+  whole body on every rerun. Measured at 16 elements vs 2 on the comparable shape below.
+  `webui.memory_browser`'s docstring carries the correction; do not rebuild a cost defence
+  in place of the tests.
+
+**The transcript's work-log expanders face the identical choice and answer it the other
+way, and the numbers are written down because the reasoning that used to sit here was
+wrong.** Streamlit's own best-practices reference prescribes `on_change="rerun"` plus
+`if panel.open:` so a collapsed expander stops computing and sending its body. Measured on
+the real shapes — actual `FeedEvent`s through `webui.render_event`, a two-researcher turn
+of plan / `ls` / two delegations / seven searches / two completions:
+
+| turns in session | eager elements | lazy elements | saved | eager ms | lazy ms |
+|---|---|---|---|---|---|
+| 1 | 16 | 2 | 14 | 72.4 | 71.5 |
+| 10 | 160 | 20 | 140 | 67.2 | 60.8 |
+| 40 | 640 | 80 | 560 | 103.6 | 80.1 |
+
+The saving is real and linear in turns. It is still declined — but **not for the reason
+this file gave**, which was that a click would raise `RerunException` inside `_stream_turn`
+and cancel paid-for searches. Behind a `@st.fragment` that is provably false (see the
+`RerunException` section below). What actually kills it is the *queueing* half of the same
+guarantee: a fragment rerun waits for the running script, so a reviewer who clicks a past
+turn's work log mid-turn gets a panel that opens **empty** and stays empty for the minutes
+the turn runs, with no `disabled` on `st.expander` (checked against 1.62's signature, not
+remembered) to explain the wait. `memory_browser` escapes this only because its selectbox
+*does* take `disabled=busy`. Today's `on_change="ignore"` expander is not a widget at all —
+the browser opens it client-side, instantly, for zero round-trips, and that is what the 14
+elements per turn buy. The accepted cost is bounded anyway: `work_logs` is per-session and
+reset on a thread switch, so it grows only with turns completed in THIS session.
 
 **Script order: chrome above the checkpoint read — and it is NOT load-bearing.** The
 page's title, caption and `st.chat_input` are written above `agent.get_state(config)`,
@@ -664,15 +709,35 @@ simultaneously can raise `database is locked`. `claim_thread` guards one process
 
 **`RerunException` derives from `BaseException`, and that has teeth here.** Streamlit
 aborts a running script at its next `st.*` call — and the feed calls `st.markdown` on
-every line — so *any* live widget clicked mid-turn tears down the `agent.stream`
-generator, cancelling researchers whose searches are already paid for. The page's
-`except Exception` around the stream cannot catch it. Two consequences, both load-bearing:
-every control that could fire a rerun is disabled while `busy` (the chat input, the
-thread field, **the export button and the memory selectbox** — the last two were missed
-first time round), and **the payload is consumed before streaming, not after**. Leaving
-it set meant the next rerun re-entered with the same user message: the question appended
-to the thread twice, `thread_sections` merging the pair into one doubled bubble, and
-every search billed again.
+every line — so a live widget **in the page body** clicked mid-turn tears down the
+`agent.stream` generator, cancelling researchers whose searches are already paid for.
+The page's `except Exception` around the stream cannot catch it. Two consequences, both
+load-bearing: every control that could fire a rerun is disabled while `busy` (the chat
+input, the thread field, **the export button and the memory selectbox** — the last two
+were missed first time round), and **the payload is consumed before streaming, not
+after**. Leaving it set meant the next rerun re-entered with the same user message: the
+question appended to the thread twice, `thread_sections` merging the pair into one
+doubled bubble, and every search billed again.
+
+**"In the page body" is a load-bearing qualifier, and this file used to say "*any* live
+widget".** A widget inside an `@st.fragment` provably CANNOT preempt a running script.
+`_fragment_run_should_not_preempt_script` (streamlit
+`runtime/scriptrunner_utils/script_requests.py`) returns True for any rerun carrying a
+`fragment_id_queue` that did not come from `st.rerun(scope="fragment")` — and that flag
+has exactly one call site in the whole library, `commands/execution_control.py` — after
+which `on_scriptrunner_yield` returns `None` rather than the rerun request. That is what
+lets `webui.memory_browser` hold a live selectbox at all. Read off the installed source
+rather than assumed, because **no test here can show it**: `AppTest` re-runs the whole app
+for a fragment interaction, so the suite proves fragments *render* and can prove nothing
+about the isolation they exist for. Do not write a test that appears to assert it; read
+the predicate instead.
+
+**The same guarantee is why a fragment is not a free lunch.** A rerun that cannot preempt
+is not discarded — it is queued, and picked up only at `on_scriptrunner_ready`, i.e. after
+the running script finishes. On a front end whose turns take minutes, "deferred until the
+turn ends" is a real user-visible cost, and it is what decided the work-log expanders
+above. A fragment converts a *destructive* mid-turn click into a *silent* one; that is an
+improvement, not an exemption.
 
 **A pending approval must be recoverable from the checkpoint.** `st.session_state.pending`
 dies with the browser session, but the interrupt does not — so a refresh or a new tab
@@ -696,7 +761,10 @@ render would disable it forever, while `busy` has already disabled the chat inpu
 thread field and `st.stop()` ends the page. There would be no control left that could
 move the session forward. `cli._prompt_decision` raises `ValueError` for the same input
 and `cli.main`'s broad `except` abandons the turn; the "Abandon this turn" button is the
-browser's equivalent, and it works for any stuck approval rather than just that one.
+browser's equivalent, and it works for any stuck approval rather than just that one. It is
+drawn by `approval_form` itself, in the same row as submit, via the `secondary_action`
+callback described above — so the way out sits beside the thing it is an alternative to,
+and stays enabled while submit is not.
 
 **`.streamlit/config.toml` sets `server.address = "localhost"`.** Streamlit leaves it
 unset by default, which listens on every interface — observed directly: a plain
