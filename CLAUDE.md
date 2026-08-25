@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
 (currently v0.7.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
-`agent.py` (~220 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
-(~1130 lines, the largest module here) — the human-in-the-loop
+`agent.py` (~250 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
+(~1220 lines, the largest module here) — the human-in-the-loop
 interrupt/resume protocol that wiring implies, plus every rule about what a user may
-be shown. `webui.py` (~610) and `streamlit_app.py` (~400) are the browser front end:
+be shown. `webui.py` (~635) and `streamlit_app.py` (~455) are the browser front end:
 no longer small — `webui.py` is over half of `cli.py` — but still mostly *reuse* of
 `cli.py`'s rules, plus the rerun state machine that reuse has to sit inside.
 `config.py`, `tools.py`, and `subagents.py` are genuinely small support modules.
@@ -31,6 +31,7 @@ uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
 uv run python -m evals --run --limit 1   # score the agent (~100k tokens PER example)
+uv run python -m evals --run --code-only # trajectory metrics only — skips the LLM judges, free
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
@@ -64,8 +65,23 @@ uv run ty check                  # type check (Astral's ty)
   of `.env` and `.deep_research/**` (live agent state: checkpoints, memories,
   *pending approvals*) — both gitignored, so git cannot undo damage to them — and
   `deny`s *edits* of `uv.lock`, which **is** committed: regenerate it with `uv lock`,
-  never hand-edit it.
-- **Tests** live in `tests/` (pytest). The offline suite is deliberately narrow —
+  never hand-edit it. (It also carries an `allow` list — the read-only `uv` invocations —
+  which only suppresses permission prompts and gates nothing.)
+- **The hook's matcher is `Edit|Write`, so a `.py` file changed through Bash is never
+  checked.** `sed -i`, a heredoc, `git checkout`, a script that rewrites a module — none
+  of them run ruff, ty or pytest, and none of them fail. Nothing warns you; the next
+  `uv run pytest` or the CI `lint` job is where it surfaces, detached from the edit that
+  caused it. If you edit Python outside `Edit`/`Write`, run the three steps yourself:
+  `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
+- **Tests** live in `tests/` (pytest) — 8 files, ~4,100 lines, **206 offline tests in
+  ~4s**. Where things are: `test_cli_hitl.py` (1,329 lines, the largest — the HITL
+  decision protocol, `ActivityFeed`, duplicate interrupts, command dispatch),
+  `test_cli_parsing.py` (`render_turn` / `_text_of` / the stop-reason table),
+  `test_agent_wiring.py` (the gate, the backend contract, the served graph),
+  `test_webui.py` + `test_streamlit_page.py` (the browser renderer and its rerun state
+  machine), `test_evals.py` (evaluators and harness), `test_config.py` (the model
+  payload), `test_live.py` (marked `live`, deselected by default).
+  The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
   gate — including the one derived from the BUILT AGENT's tool list, which is what
@@ -87,6 +103,11 @@ uv run ty check                  # type check (Astral's ty)
   `deep_research` differs from the distribution name `deep-research-agent`, wired
   via `[tool.hatch.build.targets.wheel]`). So `uv sync` installs it editable and
   `import deep_research` works without a `pythonpath` shim.
+- **`astral-sh/setup-uv` is pinned to an exact patch (`@v10.0.1`), not a floating
+  major — do not "tidy" it to `@v10`.** It stopped publishing a moving major tag, and
+  `@v10` now fails every job at *Set up job*, before a single step runs: "Unable to
+  resolve action". `actions/checkout@v7` beside it is fine — the rationale is in
+  `ci.yml`'s own comments. Bump it by hand.
 - **CI** (`.github/workflows/ci.yml`): a `lint` job (ruff + `ruff format --check` +
   ty), a `test` matrix, and a `release` job, all via `uv`. The offline suite needs
   no secrets. Keep it green. Three things about it are deliberate:
@@ -155,6 +176,9 @@ uv run ty check                  # type check (Astral's ty)
   failure surfaces in CI's lint job rather than anywhere near the code.
 - Requires `.env` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` (copy from
   `.env.example`). `config.missing_keys()` hard-exits the CLI if either is unset.
+  **`python -m evals` needs a third — `LANGSMITH_API_KEY`** — and hard-exits on any of
+  the three (`evals/__main__.py`), because the dataset and the experiment both live in
+  LangSmith. It is not needed for `pytest`, the REPL, or either browser/server front door.
 
 ## Architecture: the three things that span multiple files
 
@@ -244,7 +268,7 @@ tool call at *invoke* time.
 
 ### 2. The `interrupt_on` ↔ `checkpointer` dependency (`agent.py`)
 
-`GATED_TOOLS` (`write_file`, `edit_file`, `execute`) is passed as `interrupt_on`,
+`GATED_TOOLS` (`write_file`, `edit_file`, `delete`, `execute`) is passed as `interrupt_on`,
 which pauses the graph for human approval. **This REQUIRES a checkpointer** — the
 pending interrupt is persisted there. The two are wired together in the same
 `create_deep_agent()` call; don't add interrupts without a checkpointer, and note
@@ -322,7 +346,9 @@ drives them:
   rejected call with a synthetic `ToolMessage` whose status is `"error"` and whose content is
   *the human's own reason*, if they gave one. So nothing downstream can tell a rejection from
   a crash — the feed printed `! write_file failed: too risky` at the person who had just typed
-  `r`. `main` passes the decisions it collected to `ActivityFeed.note_declined`; a feed that
+  `r`. `main` zips the decisions it collected back against the `action_requests`
+  (`_declined_tools`) and hands `ActivityFeed.note_declined` the resulting set of tool
+  *names* — name-level, because an `ActionRequest` carries no tool-call id; a feed that
   guesses from the message content cannot be right.
 
 - **A thread rewrite is not new activity.** `PatchToolCallsMiddleware.before_agent` answers
@@ -361,15 +387,26 @@ subagent's internal prose gets shown as the agent's answer. Same rule for `/expo
 streaming loop has the chunks in hand.
 
 **The feed's plan and `ls` lines are orchestrator-only, and that is the same rule the evals
-enforce.** Every declarative subagent gets its own `TodoListMiddleware` *and*
-`FilesystemMiddleware`, so a `researcher` really does call `write_todos` and `ls` — and
-those chunks stream out under its namespace. Render them namespace-blind and you print a
-researcher's private checklist as the agent's plan (appearing to supersede the plan the user
-was just shown), and print `⌕ /memories/` on a turn where the orchestrator never looked —
-hiding the very direct-path defect this file tells you to keep watching. It is the
-`orchestrator_trajectory` vs `trajectory` distinction, in the display layer. Also note the
-`ls` body is **not** newline-separated: deepagents builds it as `str(paths)`, a Python list
-repr (`"[]"`), so counting lines reports "1 file(s)" for an empty store, forever.
+enforce.** Every declarative subagent still gets its own `FilesystemMiddleware`, so a
+`researcher` really does call `ls`, `write_file` and `delete` — and those chunks stream out
+under its namespace. Render them namespace-blind and you print `⌕ /memories/` on a turn where
+the orchestrator never looked, hiding the very direct-path defect this file tells you to keep
+watching. It is the `orchestrator_trajectory` vs `trajectory` distinction, in the display
+layer. The **plan** half of the guard is defence in depth rather than load-bearing now:
+through 0.6.x a subagent got its own `TodoListMiddleware` too and could print its private
+checklist as the agent's plan, but 0.7 dropped it from the subagent stack and
+`middleware=[...]` does not propagate (see *One thing 0.7 fixed for free*, above). Keep the
+filter keyed on the **namespace** rather than on a tool-name list — that is exactly why it
+needed no edit when the list changed underneath it.
+
+Also note the `ls` body is **not** newline-separated: deepagents renders a non-empty listing
+as `str(paths)`, a Python list repr (`"['/memories/a.md']"`), and an *empty* one as the bare
+string `"No files found"` (`_format_file_paths`, `deepagents/middleware/filesystem.py`).
+Counting lines is wrong either way — it reports "1 file(s)" for an empty store — so `cli.py`
+parses the repr with `ast.literal_eval` and prints `?` when it is not one. **Known defect on
+0.7.x: an empty `/memories/` therefore renders `⌕ /memories/ · ?`, and the `"empty"` branch
+is unreachable** — `tests/test_cli_hitl.py` still feeds it the 0.6-era `"[]"`, so nothing
+goes red.
 
 A subagent's stream namespace (`('tools:<pregel-task-uuid>',)`) **cannot be bound** back to
 the `task` tool-call that spawned it — the uuid is not the tool-call id, and correlating
@@ -490,7 +527,10 @@ top to bottom on every interaction, but a research turn pauses mid-flight for ap
 so the turn cannot live in one pass. Four `st.session_state` keys carry it — `payload`
 (the next thing to send: a question or a `Command(resume=…)`), `question`, `feed`, and
 `pending` — and together they unroll `cli.main`'s `while pending := _stream_turn(...)`
-loop across reruns instead of iterations. `_stream_turn` itself is **imported, not
+loop across reruns instead of iterations. Five more keys ride alongside without being part
+of that loop: `thread_id`; `abandoned`, which feeds `recover_pending(skip=…)`; and
+`work_logs` / `refusals` / `notice`, which are keyed by *turn index* so a past turn's feed
+and stop-notes survive into later reruns. `_stream_turn` itself is **imported, not
 reimplemented**, so the drain-then-prompt rule holds identically: an interrupt chunk does
 not end the stream, and pausing mid-iteration would freeze the Pregel loop and cancel a
 running researcher's already-paid-for searches.
@@ -640,6 +680,12 @@ input to a thread with a pending interrupt (the prefill 400 documented above).
 authority, because the checkpoint lags it. This is also what makes "a thread you start in
 one front door continues in the other" true for a thread the REPL left paused.
 
+**It also takes `skip=`, fed from `st.session_state.abandoned`, and that argument is what
+makes "Abandon this turn" actually abandon it.** The interrupt is still in the checkpoint
+after the user walks away from it, so an unfiltered `recover_pending` re-finds it on the
+very next rerun and redraws the approval form directly under its own "Turn abandoned"
+notice — a loop with no exit but closing the tab.
+
 **The page needs an escape hatch, and `approval_form` is why.** It keeps submit disabled
 until every action has a valid decision — so a tool gated with decisions this UI cannot
 render would disable it forever, while `busy` has already disabled the chat input and the
@@ -773,7 +819,7 @@ threads.** Under `display="omitted"` a thinking block comes back as
 next request dies:
 
 ```
-400 messages.1.content.0.thinking.thinking: Field required
+400 messages.1.content.1.thinking.thinking: Field required
 ```
 
 The reason this is fatal rather than cosmetic: **every tool result replays the assistant
@@ -838,7 +884,8 @@ is untouched. Four tests in `test_config.py` pin this cluster: `_should_stream()
 True, the request payload must carry no sampling param, that payload's `thinking` key must
 be exactly `{"type": "adaptive", "display": "summarized"}` (this sentence used to say "and
 no `thinking` key" — the Opus 5 upgrade inverted it, and following the stale version would
-reintroduce the `thinking.thinking: Field required` 400 documented 80 lines above), and
+reintroduce the `thinking.thinking: Field required` 400 documented under the `thinking`
+heading above), and
 `MAX_TOKENS` must stay at or above 64k — asserted against the *shipped default*, which is
 why `tests/conftest.py` pops `DEEP_RESEARCH_MAX_TOKENS` rather than pinning it (it calls
 `load_dotenv()` first, so a developer's own spend cap in `.env` would otherwise fail an
@@ -947,7 +994,9 @@ than the problem warrants. Detection first; recovery is a separate decision.
 ## Prompt caching is already on — don't wire it again
 
 `create_deep_agent()` appends an `AnthropicPromptCachingMiddleware` itself, to the
-orchestrator *and* to every subagent (`deepagents/graph.py`, `_append_prompt_caching_middleware`).
+orchestrator *and* to every subagent (`deepagents/graph.py` calls
+`append_prompt_caching_middleware` — no leading underscore — defined in
+`deepagents/middleware/_prompt_caching.py`).
 It sets three breakpoints — last system-prompt block, last tool definition (which
 covers the whole contiguous tool set), and a top-level `cache_control` in
 `model_settings` that auto-caches the growing message tail. So the system prompt,
@@ -992,7 +1041,7 @@ promises) and the prose (citations, responsiveness). Traces are already on — L
 auto-instruments from `LANGSMITH_TRACING`/`LANGSMITH_API_KEY`, which `config.py`'s
 import-time `load_dotenv()` puts in the environment. No code wires it.
 
-Four things here were **measured**, not inferred, and each one breaks a harness that
+Six things here were **measured**, not inferred, and each one breaks a harness that
 assumes otherwise:
 
 - **The trajectory is not in the returned state.** `invoke()` on a two-part question
@@ -1140,8 +1189,9 @@ before/after, not as a side effect of a dependency upgrade. The eval watches it 
 conjunction over every claim in the report: at 95% per-claim compliance a 30-claim report
 passes 0.95³⁰ ≈ 21% of the time, at 90% it passes 4%. The boolean read 0 on anything long
 enough to be worth writing, and scored "missing one citation" identically to "cited
-nothing" — no gradient, so it could never show a fix had worked. `_citation_score` carries
-the argument; `test_citation_score_is_a_proportion_not_a_conjunction` pins it.
+nothing" — no gradient, so it could never show a fix had worked. `_coverage_score` carries
+the argument — and it is shared with `answers_the_question`, so this is one decision covering
+both metrics; `test_coverage_score_is_a_proportion_not_a_conjunction` pins it.
 
 *It must justify each verdict, or it invents them.* Asked merely to list uncited claims, it
 flagged figures whose citation sat at the end of their own bullet. Adjudicated claim by
@@ -1191,7 +1241,15 @@ doesn't configure X" is not evidence that X is unconfigured — grep the install
 ## Extending it (where things go)
 
 - **New tool** → build in `tools.py`, then add to `tools=[...]` in `agent.py`
-  (orchestrator) or a subagent's `tools` in `subagents.py`.
+  (orchestrator) or a subagent's `tools` in `subagents.py`. **On the existing one:
+  leave `search_depth`, `time_range`, `topic` and `include_domains` unset in
+  `build_web_search`.** They are absent deliberately, not by omission — each is in
+  `TavilySearch`'s *args schema*, so the model picks one per call, and `_run` resolves
+  them as `self.X if self.X else X`. A value set at construction therefore silently
+  overrides whatever the model asked for, on every search, forever; `time_range="week"`
+  added to "get fresh results" would stop the agent researching anything older than a
+  week. Both prompts teach per-query use, which only works while these stay `None`.
+  `max_results` is the opposite — instantiation-only — so it belongs there.
 - **New subagent** → return another `SubAgent` dict from `subagents.py`, add to
   `subagents=[...]` in `agent.py`.
 - **Gate a tool** → add its name to `GATED_TOOLS` in `agent.py`. Check the model is

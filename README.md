@@ -15,7 +15,7 @@ files or running commands.
 | **Subagent orchestration** | A `researcher` subagent, delegated to via the `task` tool | `deep_research/subagents.py` |
 | **Persistent memory** | `SqliteStore` behind a `/memories/` route (cross-session) | `deep_research/agent.py` |
 | **Durable thread state + interrupts** | `SqliteSaver` checkpointer (survives restarts) | `deep_research/agent.py` |
-| **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `execute` | `deep_research/agent.py` + `cli.py` |
+| **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `delete` / `execute` | `deep_research/agent.py` + `cli.py` |
 | **Browser UI** | Streamlit chat with a live work log and in-page approvals | `streamlit_app.py` + `deep_research/webui.py` |
 | **Observability** | LangSmith tracing via env vars | `.env` |
 
@@ -140,7 +140,7 @@ create_deep_agent(
                         default = StateBackend,         # ephemeral, per-thread (checkpointed)
                         routes  = {"/memories/": StoreBackend},  # durable, cross-session
                     )
-    interrupt_on  = {write_file, edit_file, execute}   # human approval (needs a checkpointer)
+    interrupt_on  = {write_file, edit_file, delete, execute}  # human approval (needs a checkpointer)
     checkpointer  = SqliteSaver(...)                    # durable thread state + interrupts
     store         = SqliteStore(...)                    # durable long-term memory
 )
