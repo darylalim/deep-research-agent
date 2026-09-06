@@ -2,7 +2,9 @@
 
     --upload    create/sync the dataset in LangSmith (idempotent)
     --run       run the agent over the dataset and score it
-    --code-only skip the LLM judges (free, and enough for a trajectory regression)
+    --code-only skip the LLM judges — enough for a trajectory regression, and it
+                saves ~$0.01 of the ~$2-4 a sweep costs. The judges were never the
+                expensive part; the agent run is. NOT free.
 
 The env var juggling below is load-bearing. `deep_research.config` resolves
 `STATE_DIR` into a module constant at *import* time, so the throwaway state dir
@@ -26,7 +28,9 @@ def main() -> None:
     parser.add_argument("--upload", action="store_true", help="create/sync the dataset")
     parser.add_argument("--run", action="store_true", help="evaluate the agent")
     parser.add_argument(
-        "--code-only", action="store_true", help="skip the LLM judges (free)"
+        "--code-only",
+        action="store_true",
+        help="skip the LLM judges (saves ~$0.01; the agent run is the real cost)",
     )
     parser.add_argument(
         "--prefix", default="workflow", help="experiment name prefix in LangSmith"
@@ -34,7 +38,7 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        help="only evaluate the first N examples (a full sweep is ~100k tokens each)",
+        help="only evaluate the first N examples (~290k tokens each, but 47k-1M observed)",
     )
     args = parser.parse_args()
     if not (args.upload or args.run):
