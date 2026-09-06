@@ -30,7 +30,7 @@ uv run --group ui streamlit run streamlit_app.py   # the SAME agent in a browser
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
-uv run python -m evals --run --limit 1   # score the agent (~290k tokens/example; see *What a sweep costs*)
+uv run python -m evals --run --limit 1   # one example: 47k-1M tokens (see *What a sweep costs*)
 uv run python -m evals --run --code-only # trajectory metrics only — skips the judges, NOT the agent
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
@@ -1163,24 +1163,37 @@ assumes otherwise:
   `config.build_model()` for it. Opus 5 would also *think* on every grade, which is pure
   cost on a classification call.
 
-- **What a sweep costs — and the judges are not why.** Measured on the current default
-  model over the 5-example dataset: **$4.49 / 1.97M tokens** with judges
-  (`judgesplit-full-8708ffe9`), **$1.83 / 0.91M** with `--code-only`
-  (`judgesplit-code-7a132bbe`). That gap is *agent stochasticity, not judging* — evaluators
-  run after the target function returns and cannot add a token to it. Per example the mean
-  is ~290k tokens, but the spread is **21x** (measured 47,311 to 1,004,583 across ten
-  example-runs), so budget by the sweep; a per-example point estimate is meaningless.
-  **`--code-only` is therefore not "free"** — it skips two Haiku judges worth **$0.013 per
-  sweep (0.3%)** and still runs the agent over every example. Three older sweeps cost
-  $3.20-$3.54 on `claude-opus-4-8`, so the Opus 5 upgrade — adaptive thinking, billed as
-  output — roughly doubled this, and nothing recorded it until now. Two traps for whoever
-  re-measures: an experiment's `run_stats.token_count` is **agent-only**, because
-  `langsmith/evaluation/_runner.py` wraps every evaluator in a hardcoded
-  `project_name="evaluators"` and the judges' tokens land in that *separate* project
-  (27,496 tokens all-time, workspace-wide) — verified by the session aggregate equalling
-  the sum of its root runs *to the token*, on all five experiments; and `langsmith run list`
-  applies a **7-day default window**, so an old experiment looks empty until you pass
-  `--since`. It is not retention. The data is still there.
+- **An experiment's `run_stats.token_count` is agent-only — the judges' tokens are filed
+  somewhere else entirely.** `langsmith/evaluation/_runner.py` wraps every evaluator in a
+  hardcoded `project_name="evaluators"`, so a harness that reads an experiment's totals to
+  price the *agent* is already right, and one that subtracts a judge component
+  double-counts. Verified three ways, because "excluded" and "included but negligible"
+  predict aggregates only 0.4% apart and no amount of eyeballing separates them: the
+  session aggregate equals the sum of its root runs **to the token** on all five
+  experiments; a model-scoped query finds zero Haiku runs inside an experiment session; and
+  the `evaluators` project's token counter did not move *at all* across a `--code-only`
+  sweep, which added 28 evaluator runs and zero tokens. Read it with
+  `client.read_project(project_name=..., include_stats=True)` — the `langsmith` **Python
+  package this repo depends on ships no CLI**; the `langsmith` binary is a separate Go tool
+  nothing here installs, and its `run list` applies a **7-day default window**, so an old
+  experiment reads as empty until you pass `--since`. That is not retention; the data is
+  still there.
+
+  **What a sweep costs.** Over the 5-example dataset: `$4.49 / 1.97M tokens` and
+  `$1.83 / 0.91M` on `claude-opus-5`; `$3.20`, `$3.43`, `$3.54` on `claude-opus-4-8`. Two
+  conclusions the numbers carry, and one they do not. They do show the judges are not the
+  expensive part: *every* judge run ever made in this workspace totals 27,496 tokens /
+  $0.039 — an upper bound, since that project is workspace-wide, and still two orders of
+  magnitude under one sweep — so **`--code-only` is not "free"**, it skips ~$0.01 of
+  judging and runs the agent over every example regardless. They also forbid a per-example
+  point estimate: the observed range is **47,311 to 1,004,583 tokens, 21x**, so quote a
+  range or a sweep total. What they do **not** show is any model-upgrade effect. The two
+  Opus 5 sweeps *bracket* all three Opus 4.8 sweeps, mean cost moved **0.93x — downward** —
+  and the same-config spread is 2.45x, which swamps it. An earlier draft of this very
+  bullet concluded "Opus 5 roughly doubled it", by comparing the higher of the two new
+  sweeps against the old ones and not the lower; that is this file's own small-n warning,
+  self-inflicted, in the list headed *measured, not inferred*. n=2 against n=3 at 2.45x
+  spread decides nothing.
 
 The dataset (`evals/dataset.py`) is deliberately **reference-free**: examples carry a
 structural expectation (`min_delegations`) rather than a hand-written gold answer, because

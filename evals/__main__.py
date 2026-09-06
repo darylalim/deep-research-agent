@@ -2,9 +2,16 @@
 
     --upload    create/sync the dataset in LangSmith (idempotent)
     --run       run the agent over the dataset and score it
-    --code-only skip the LLM judges — enough for a trajectory regression, and it
-                saves ~$0.01 of the ~$2-4 a sweep costs. The judges were never the
-                expensive part; the agent run is. NOT free.
+    --code-only skip the LLM judges. NOT free — it saves ~$0.01 of judging and
+                still runs the agent over every example, which is the whole bill.
+                See CLAUDE.md, *What a sweep costs*, for the measured figures;
+                they are deliberately not restated here, because five copies of
+                a number is how the last one drifted.
+
+`argparse` gets an explicit one-line `description=` rather than this docstring.
+The default formatter reflows whatever it is handed into a single paragraph, so
+passing `__doc__` printed the note below to end users as if it addressed them,
+ran the cost warning straight into it, and left "below" pointing at nothing.
 
 The env var juggling below is load-bearing. `deep_research.config` resolves
 `STATE_DIR` into a module constant at *import* time, so the throwaway state dir
@@ -24,13 +31,16 @@ from dotenv import load_dotenv
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="evals", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="evals",
+        description="Run the agent against the LangSmith eval dataset and score it.",
+    )
     parser.add_argument("--upload", action="store_true", help="create/sync the dataset")
     parser.add_argument("--run", action="store_true", help="evaluate the agent")
     parser.add_argument(
         "--code-only",
         action="store_true",
-        help="skip the LLM judges (saves ~$0.01; the agent run is the real cost)",
+        help="skip the LLM judges (saves ~$0.01; the agent still runs on every example)",
     )
     parser.add_argument(
         "--prefix", default="workflow", help="experiment name prefix in LangSmith"
@@ -38,11 +48,18 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        help="only evaluate the first N examples (~290k tokens each, but 47k-1M observed)",
+        help="only evaluate the first N examples (47k-1M tokens each, measured)",
     )
     args = parser.parse_args()
     if not (args.upload or args.run):
         parser.error("nothing to do — pass --upload and/or --run")
+    # `--limit 0` used to be the most expensive way to ask for nothing: the guard
+    # below was `if args.limit:`, so a falsy zero fell through to the *whole*
+    # dataset. Measured, by doing it: one example got through before the kill, at
+    # 232,865 tokens / $0.51. A negative limit reached `islice` and died there with
+    # a raw ValueError. Both are argument errors; say so before spending anything.
+    if args.limit is not None and args.limit < 1:
+        parser.error(f"--limit must be at least 1 (got {args.limit})")
 
     load_dotenv()
     for key in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY", "LANGSMITH_API_KEY"):
@@ -77,9 +94,9 @@ def main() -> None:
 
     evaluators = CODE_EVALUATORS if args.code_only else ALL_EVALUATORS
     # `evaluate` takes a dataset name or an iterable of examples; the latter is how
-    # a smoke run stays cheap.
+    # a smoke run stays *smaller*. Not cheap — one example measured 47k-1M tokens.
     data: Any = dataset.DATASET_NAME
-    if args.limit:
+    if args.limit is not None:
         client = Client()
         data = list(
             islice(client.list_examples(dataset_name=dataset.DATASET_NAME), args.limit)

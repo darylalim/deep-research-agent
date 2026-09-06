@@ -4,8 +4,9 @@ Split deliberately into two kinds:
 
 - **Code evaluators** grade the *trajectory* — the workflow `SYSTEM_PROMPT`
   promises (plan, check memory, delegate, search, persist). These are objective,
-  free, and they are the only tests this repo has ever had of the prompt's
-  contract. They earned their keep immediately: `write_todos` was never being
+  free to *grade* — pure Python, no model call — and they are the only tests this
+  repo has ever had of the prompt's contract. Free to grade is not free to run:
+  `--code-only` selects exactly this list and still pays for the agent. They earned their keep immediately: `write_todos` was never being
   called at all.
 - **LLM judges** grade the *prose* — citation discipline and responsiveness,
   which no regex can settle.
