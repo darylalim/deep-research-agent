@@ -306,7 +306,7 @@ class DatasetReader(Protocol):
     def list_examples(self, *, dataset_id: Any) -> Iterable[Any]: ...
 
 
-def _remote(client: DatasetReader, dataset_id: Any) -> dict[str | None, Any]:
+def _by_question(rows: Iterable[Any]) -> dict[str | None, Any]:
     """Map question text -> the uploaded example.
 
     Keyed on the question because that is the only identity an example has on both
@@ -318,10 +318,12 @@ def _remote(client: DatasetReader, dataset_id: Any) -> dict[str | None, Any]:
     from `drift()`'s orphan list — hiding the one example a reader of this file cannot
     see at all. It surfaces as an orphan keyed `None`, which is exactly what it is.
     """
-    return {
-        (example.inputs or {}).get("question"): example
-        for example in client.list_examples(dataset_id=dataset_id)
-    }
+    return {(example.inputs or {}).get("question"): example for example in rows}
+
+
+def _remote(client: DatasetReader, dataset_id: Any) -> dict[str | None, Any]:
+    """`_by_question` over the rows LangSmith currently holds."""
+    return _by_question(client.list_examples(dataset_id=dataset_id))
 
 
 def drift(client: DatasetReader | None = None) -> list[str]:
@@ -346,15 +348,46 @@ def drift(client: DatasetReader | None = None) -> list[str]:
     invisible at all: `evaluate()` grades it, and its scores land in an experiment
     aggregate alongside examples you can read in this file. So it is reported here, and
     `--upload` is not its remedy.
+
+    **Duplicates are reported too, and they are the one kind of drift this gate could
+    not see at all.** Question text is the dataset's only cross-side identity and
+    nothing enforces that it is unique, so a question uploaded twice collapses to one
+    entry in `_by_question` — the map both this function and `sync()` are built on —
+    while `evaluate()` grades both copies and weights that question double in the
+    experiment mean. Counting the raw rows before collapsing them is what makes it
+    visible; `--upload` cannot fix it either, since `sync()` never deletes.
     """
     client = client or Client()
     if not client.has_dataset(dataset_name=DATASET_NAME):
         return [f"the dataset {DATASET_NAME!r} does not exist yet — run `--upload`"]
 
-    existing = _remote(client, client.read_dataset(dataset_name=DATASET_NAME).id)
+    # The ROWS, before they are collapsed by question. Question text is the only
+    # identity an example has on both sides, and nothing enforces that it is unique:
+    # `_by_question` keeps one row per question, so a second upload of the same
+    # question is invisible to every comparison built on that map — including this
+    # gate. It is emphatically not invisible to `evaluate()`, which grades both copies,
+    # bills for both, and averages both into the experiment. So count first, collapse
+    # second.
+    rows = list(
+        client.list_examples(
+            dataset_id=client.read_dataset(dataset_name=DATASET_NAME).id
+        )
+    )
+    existing = _by_question(rows)
     local = {e["inputs"]["question"]: e["outputs"] for e in EXAMPLES}
 
+    uploads: dict[str | None, int] = {}
+    for row in rows:
+        question = (row.inputs or {}).get("question")
+        uploads[question] = uploads.get(question, 0) + 1
+
     differences = [
+        f"uploaded {count} times, and `--upload` will NOT remove the extras — a sweep "
+        f"grades and bills for every copy: {question!r}"
+        for question, count in uploads.items()
+        if count > 1
+    ]
+    differences += [
         f"not uploaded: {question!r}" for question in local if question not in existing
     ]
     differences += [

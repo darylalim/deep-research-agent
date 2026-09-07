@@ -63,6 +63,20 @@ MAX_RESUME_ROUNDS = 25
 # drift. It compares names only, so the observe-don't-agree property above is intact.
 MUTATING_TOOLS = ("write_file", "edit_file", "delete", "execute")
 
+# The subset of `MUTATING_TOOLS` that ADDS content, and the only tools whose paths may
+# count as a persisted finding.
+#
+# Every gated tool belongs in `MUTATING_TOOLS` above — that list answers "must this have
+# stopped for a human?", and `delete` emphatically must. But `proposed_writes` answers a
+# different question, for `persists_findings`: "did the orchestrator save something
+# durable?" Recording paths off `MUTATING_TOOLS` conflated the two, and deepagents'
+# `delete` tool takes a `file_path` argument exactly as `write_file` does — so a
+# proposed `delete("/memories/pricing.md")` landed in `proposed_writes` and scored the
+# agent a pass for *persisting a finding* it had asked to destroy. Measured against the
+# installed tool signature (`deepagents/middleware/filesystem.py::_create_delete_tool`),
+# not inferred from the name.
+WRITE_TOOLS = ("write_file", "edit_file")
+
 
 def ensure_isolated_state_dir(state_dir: Path) -> None:
     """Refuse to run evals against — or anywhere *above* — the agent's real state.
@@ -111,6 +125,8 @@ class TurnRecorder:
         self.proposed_writes: list[str] = []  # orchestrator write_file/edit_file paths
         self.proposed_mutations: list[str] = []  # …the tool names, from ANY namespace
         self.gated: list[str] = []  # tools that required approval
+        self.failed_tools: list[str] = []  # …of those that ran, the ones that errored
+        self.stop_reasons: list[str] = []  # why each generation ended, whole tree
         self._seen: set[str] = set()  # event keys already folded in
 
     def _first_time(self, key: str) -> bool:
@@ -209,9 +225,43 @@ class TurnRecorder:
             (
                 self.orchestrator_trajectory if is_orchestrator else self.subagent_tools
             ).append(name)
+            # A FAILED CALL STILL RAN, AND IS STILL RECORDED ABOVE — the trajectories
+            # answer "what did the agent do", and attempting a search is something it
+            # did. But it is not something it *learned from*, and `searched_the_web`
+            # asks whether the agent researched or answered from the model's own
+            # memory. deepagents returns a ToolMessage with `status="error"` for a
+            # denied path, an unsupported backend or a tool exception (measured:
+            # `filesystem.py::_create_delete_tool` alone has five such returns), and
+            # `HumanInTheLoopMiddleware` uses the same status for a REJECTED call — so
+            # counting these as evidence scores a clean 1 on a run whose every search
+            # failed and whose answer therefore came from the model alone. Recorded
+            # separately so the ordering semantics the two `_first_research_index`
+            # evaluators depend on are untouched.
+            if getattr(message, "status", None) == "error":
+                self.failed_tools.append(name)
             return
 
         if kind == "ai":
+            # WHY THE TURN ENDED, from anywhere in the tree. Without this, a refusal or
+            # a context-window overrun reaches the evaluators as nothing but an empty
+            # `response`, and both judges score it 0.0 — reporting an API-side stop as
+            # an agent-quality failure. That is the exact misattribution `cli._stop_note`
+            # exists to prevent for the human reading the REPL, and until now the evals
+            # had no equivalent. Subagents are included deliberately: a researcher's stop
+            # is otherwise *completely* invisible, since its `task` result simply comes
+            # back thin and the orchestrator synthesizes around the hole.
+            #
+            # Not deduped, and it does not need to be. `turn_stopped_cleanly` asks
+            # whether ANY stop this turn was unclean, so a re-emitted AIMessage changes
+            # no verdict — and the ids that would key a dedupe are the unreliable ones
+            # this file warns about everywhere else (`BaseMessage.id` is optional and
+            # is regenerated on replay). Better a list with repeats than a seen-set that
+            # silently matches nothing.
+            reason = (getattr(message, "response_metadata", None) or {}).get(
+                "stop_reason"
+            )
+            if isinstance(reason, str):
+                self.stop_reasons.append(reason)
             for call in getattr(message, "tool_calls", None) or []:
                 name = call.get("name")
                 if name not in MUTATING_TOOLS:
@@ -230,7 +280,11 @@ class TurnRecorder:
                 # …but the *paths* stay orchestrator-only: `persists_findings` grades a
                 # SYSTEM_PROMPT step addressed to the orchestrator alone, and a
                 # researcher tidying up after itself must not earn it that pass.
-                if is_orchestrator:
+                # …and only the tools that ADD content: `delete` takes a `file_path`
+                # too, so recording every mutation's path scored an orchestrator that
+                # asked to destroy `/memories/pricing.md` a `persists_findings` pass
+                # for having "written" it. See `WRITE_TOOLS`.
+                if is_orchestrator and name in WRITE_TOOLS:
                     path = (call.get("args") or {}).get("file_path")
                     if path:
                         self.proposed_writes.append(path)
@@ -251,6 +305,13 @@ class TurnRecorder:
             # them is `mutations_require_approval`'s whole job.
             "proposed_mutations": list(self.proposed_mutations),
             "gated_tools": list(self.gated),
+            # Tools that ran and errored — a subset of `trajectory` by name, so
+            # `searched_the_web` can subtract rather than re-walk the tree.
+            "failed_tools": list(self.failed_tools),
+            # Why each generation ended, anywhere in the tree. Graded by
+            # `turn_stopped_cleanly`, which is what separates "the API stopped this"
+            # from "the agent answered badly".
+            "stop_reasons": list(self.stop_reasons),
         }
 
 

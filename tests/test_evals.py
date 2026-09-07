@@ -21,18 +21,23 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Interrupt
 
 from deep_research.agent import GATED_TOOLS
-from deep_research.cli import render_turn
+from deep_research.cli import _SILENT_STOPS, render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
 from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
+    _COMPLETED_RUN_KEYS,
+    ALL_EVALUATORS,
+    UNCLEAN_STOPS,
     _coverage_score,
     checks_memory_first,
+    claims_are_cited,
     delegates_breadth,
     mutations_require_approval,
     persists_findings,
     plans_with_todos,
     response_cites_sources,
     searched_the_web,
+    turn_stopped_cleanly,
 )
 from evals.harness import (
     LIVE_STATE_DIR,
@@ -728,3 +733,361 @@ def test_harness_refuses_a_state_dir_that_merely_contains_the_live_one():
     for ancestor in (LIVE_STATE_DIR.parent, *LIVE_STATE_DIR.parents):
         with pytest.raises(RuntimeError, match="contains"):
             ensure_isolated_state_dir(ancestor)
+
+
+# --- What a broken MEASUREMENT looks like ------------------------------------
+#
+# Everything above asks whether the AGENT behaved. Everything below asks whether the
+# instrument reading it can be trusted, which is a different question and the one this
+# suite was weakest on: every defect these pin was found while all 30 tests were green.
+
+
+def test_the_completed_run_keys_match_what_the_recorder_emits():
+    """`_COMPLETED_RUN_KEYS` is a hand-copy, so it is compared against the real thing.
+
+    `evals.evaluators` deliberately does not import `evals.harness` — that module
+    refuses to import at all unless the state dir is already isolated, and an evaluator
+    has no business requiring that. So the key list is written out by hand, and a
+    hand-copy of a shape defined elsewhere is precisely what this repo keeps getting
+    wrong (`cli._LS_EMPTY`, `_SILENT_STOPS`). Same remedy: build the real object and
+    compare, rather than trusting the copy.
+    """
+    emitted = set(TurnRecorder().actions()) | {"response"}
+    assert emitted == set(_COMPLETED_RUN_KEYS), (
+        "harness.TurnRecorder.actions() and evaluators._COMPLETED_RUN_KEYS have "
+        f"drifted: recorder-only {sorted(emitted - set(_COMPLETED_RUN_KEYS))}, "
+        f"evaluator-only {sorted(set(_COMPLETED_RUN_KEYS) - emitted)}. `_ungradable` "
+        "decides whether a run produced any observations by testing for these keys, so "
+        "a stale list makes a completed run look crashed, or a crashed one gradable."
+    )
+
+
+@pytest.mark.parametrize("evaluator", ALL_EVALUATORS, ids=lambda f: f.__name__)
+def test_no_evaluator_grades_a_run_whose_target_crashed(evaluator):
+    """A crashed run must produce a NON-verdict, never a score.
+
+    `langsmith/evaluation/_runner.py::_forward` catches the target's exception, logs it,
+    and returns the row anyway — so `research()` raising still reaches every evaluator,
+    with no outputs. Each one has a vacuous branch for the honest empty case, and the
+    crashed row fell into it: `mutations_require_approval` returned "no mutation
+    proposed — nothing to approve" and scored **1**, a clean pass on the one invariant
+    this repo calls silent and unrecoverable.
+
+    Parametrized over `ALL_EVALUATORS` rather than listing them, so an evaluator added
+    without the guard fails here instead of quietly grading crashes. Both judges are
+    included and neither reaches the API: the guard returns first, which is also the
+    reason it must stay the first statement in those two functions.
+
+    Verify it bites: delete the `_ungradable` guard from any one evaluator.
+    """
+    raised = SimpleNamespace(
+        outputs={"output": None}, inputs={}, error="RuntimeError: boom"
+    )
+    assert evaluator(raised, {"outputs": {}})["score"] is None
+    # …and the same when the row carries no error but no observations either.
+    assert evaluator({"outputs": {"output": None}}, {"outputs": {}})["score"] is None
+
+
+def test_a_plan_made_after_the_research_started_is_not_a_plan():
+    """The ordering `plans_with_todos` exists to check, which nothing checked.
+
+    Deleting the `[:start]` slice from both this evaluator and `checks_memory_first`
+    left the whole suite green — the fixtures all happened to put the tool first, so
+    "before the first research action" and "anywhere in the trajectory" were
+    indistinguishable. SYSTEM_PROMPT step 1 is about ordering; a todo list written
+    after the first `task` is bookkeeping, not a plan.
+    """
+    expects_plan = {"outputs": {"expects_plan": True}}
+    late = {"outputs": {"orchestrator_trajectory": ["task", "write_todos"]}}
+    early = {"outputs": {"orchestrator_trajectory": ["write_todos", "task"]}}
+    assert plans_with_todos(late, expects_plan)["score"] == 0
+    assert plans_with_todos(early, expects_plan)["score"] == 1
+
+
+def test_memory_read_after_the_research_started_is_not_checking_memory_first():
+    """The twin of the test above, and the same deleted slice passes both."""
+    late = {"outputs": {"orchestrator_trajectory": ["tavily_search", "ls"]}}
+    early = {"outputs": {"orchestrator_trajectory": ["ls", "tavily_search"]}}
+    assert checks_memory_first(late, {})["score"] == 0
+    assert checks_memory_first(early, {})["score"] == 1
+
+
+def test_a_grade_that_counts_nothing_while_listing_misses_scores_zero():
+    """`_coverage_score(0, N)` returned a perfect 1.0 for every N.
+
+    That is the landing pad for a truncated judge grade: with the count cut away,
+    `.get(...) or 0` hands this function a zero total beside a list of real misses, and
+    the worse the grade the better the score. A missing count next to present misses is
+    a broken reading, not an empty report.
+    """
+    assert _coverage_score(0, 0) == 1.0  # nothing to attribute — vacuously perfect
+    assert _coverage_score(0, 5) == 0.0  # …but not while it is listing five misses
+
+
+def test_asking_to_delete_a_memory_is_not_persisting_a_finding():
+    """`delete` takes a `file_path`, exactly as `write_file` does.
+
+    So recording a path for every `MUTATING_TOOLS` call scored an orchestrator that
+    asked to DESTROY `/memories/pricing.md` a `persists_findings` pass for having
+    written it. `delete` must stay in `proposed_mutations` — that is what
+    `mutations_require_approval` grades, and it is the only gated tool that destroys
+    data — so the narrowing belongs on the path branch alone.
+    """
+    recorder = TurnRecorder()
+    recorder.absorb(
+        ORCHESTRATOR,
+        _updates(
+            "model",
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "delete",
+                        "args": {"file_path": "/memories/pricing.md"},
+                        "id": "del-1",
+                    }
+                ],
+            ),
+        ),
+    )
+    outputs = recorder.actions()
+    assert outputs["proposed_mutations"] == ["delete"]  # still gated, still measured
+    assert outputs["proposed_writes"] == []  # …but nothing was persisted
+    assert persists_findings({"outputs": outputs}, {})["score"] == 0
+
+
+def test_searches_that_all_failed_are_not_evidence_that_it_researched():
+    """A failed call still RAN — but it taught the agent nothing.
+
+    deepagents returns a `status="error"` ToolMessage for a denied path, an unsupported
+    backend or a tool exception, and `HumanInTheLoopMiddleware` uses the same status for
+    a rejected call. Counting those as searches scored a clean 1 on a run whose every
+    search failed and whose answer therefore came from the model's own memory — the
+    exact thing this metric exists to rule out. The trajectories still record it,
+    because the ordering the two evaluators above depend on must not change.
+    """
+    recorder = TurnRecorder()
+    recorder.absorb(
+        SUBAGENT,
+        _updates(
+            "tools",
+            ToolMessage(
+                "Error: request failed",
+                tool_call_id="s1",
+                name="tavily_search",
+                status="error",
+            ),
+        ),
+    )
+    failed_only = recorder.actions()
+    assert failed_only["trajectory"] == ["tavily_search"]  # it ran…
+    assert failed_only["failed_tools"] == ["tavily_search"]  # …and it failed
+    assert searched_the_web({"outputs": failed_only}, {})["score"] == 0
+
+    # Positive control: one search that actually returned is enough.
+    recorder.absorb(
+        SUBAGENT,
+        _updates("tools", ToolMessage("hits", tool_call_id="s2", name="tavily_search")),
+    )
+    assert searched_the_web({"outputs": recorder.actions()}, {})["score"] == 1
+
+
+def test_an_api_stop_is_reported_as_a_stop_and_not_as_a_bad_answer():
+    """The misattribution `cli._stop_note` prevents at the REPL, prevented in the evals.
+
+    A refusal or a context-window overrun ends the turn with HTTP 200 and no prose, so
+    `render_turn` yields `''`, so both judges score 0.0 and `response_cites_sources`
+    scores 0. Read off a sweep that is indistinguishable from an agent that researched
+    badly, and it sends the next person to fix a prompt when the remedy is a fresh
+    thread. Subagent stops count too — a researcher's refusal is otherwise invisible.
+    """
+    clean = TurnRecorder()
+    clean.absorb(
+        ORCHESTRATOR,
+        _updates(
+            "model", AIMessage("done", response_metadata={"stop_reason": "end_turn"})
+        ),
+    )
+    assert turn_stopped_cleanly({"outputs": clean.actions()}, {})["score"] == 1
+
+    refused = TurnRecorder()
+    refused.absorb(
+        SUBAGENT,
+        _updates("model", AIMessage("", response_metadata={"stop_reason": "refusal"})),
+    )
+    graded = turn_stopped_cleanly({"outputs": refused.actions()}, {})
+    assert graded["score"] == 0
+    assert "refusal" in graded["comment"]
+
+
+def test_every_stop_the_cli_calls_silent_is_also_graded_as_unclean():
+    """`UNCLEAN_STOPS` is DERIVED from `cli._SILENT_STOPS`, not copied beside it.
+
+    That table is already compared against `anthropic.types.StopReason` by set equality
+    in `test_cli_parsing.py`, so deriving from it means an SDK bump that adds a silent
+    stop reaches this evaluator too. A second hand-written list would be one more thing
+    to keep true by hand — and this repo has already missed exactly that once, when
+    `model_context_window_exceeded` arrived in anthropic 0.120.
+    """
+    assert set(_SILENT_STOPS) <= UNCLEAN_STOPS
+    # …plus the one that is not silent: prose that trails off mid-sentence.
+    assert "max_tokens" in UNCLEAN_STOPS
+    assert "end_turn" not in UNCLEAN_STOPS
+
+
+def test_the_discriminating_branches_are_asserted_in_both_directions():
+    """Each of these was pinned in ONE direction only, so each could be deleted green.
+
+    A "scores 1 when it should" assertion cannot tell a working evaluator from one that
+    returns 1 unconditionally; this repo's own CLAUDE.md records the same lesson about
+    a `disabled=` assertion that passed on an empty thread. The negative half is the
+    half that bites.
+    """
+    # searched_the_web: 1 is pinned elsewhere; this is the 0.
+    assert searched_the_web({"outputs": {"trajectory": ["task"]}}, {})["score"] == 0
+    # response_cites_sources: both halves.
+    assert (
+        response_cites_sources({"outputs": {"response": "no links here"}}, {})["score"]
+        == 0
+    )
+    cited = {"outputs": {"response": "ships in 3.14 (https://docs.python.org/3.14/)"}}
+    assert response_cites_sources(cited, {})["score"] == 1
+    # persists_findings: a write is not enough — it has to be under /memories/.
+    assert (
+        persists_findings({"outputs": {"proposed_writes": ["/report.md"]}}, {})["score"]
+        == 0
+    )
+    assert (
+        persists_findings({"outputs": {"proposed_writes": ["/memories/x.md"]}}, {})[
+            "score"
+        ]
+        == 1
+    )
+    # delegates_breadth: the default floor is 1, so an example asserting nothing still
+    # demands one delegation.
+    assert (
+        delegates_breadth(
+            {"outputs": {"orchestrator_trajectory": []}}, {"outputs": {}}
+        )["score"]
+        == 0
+    )
+
+
+def test_every_example_has_a_distinct_question():
+    """Question text is the dataset's only cross-side identity, and nothing enforced it.
+
+    `_by_question` keeps one row per question, so a copy-pasted duplicate collapses on
+    every comparison built on that map — including the `drift()` gate — while
+    `evaluate()` grades both copies, bills for both, and weights that question double
+    in the experiment mean.
+    """
+    questions = [example["inputs"]["question"] for example in EXAMPLES]
+    assert len(set(questions)) == len(questions), (
+        "two examples in evals/dataset.py share a question: "
+        f"{sorted({q for q in questions if questions.count(q) > 1})}"
+    )
+
+
+def test_drift_reports_a_question_uploaded_twice():
+    """The one kind of drift the gate could not see, because it collapsed it first."""
+    doubled = _uploaded_from_local()
+    doubled.append(doubled[0])
+    differences = drift(_FakeClient(doubled))
+    assert any("uploaded 2 times" in difference for difference in differences), (
+        differences
+    )
+
+
+class _StubJudge:
+    """A `JUDGE` stand-in whose `with_structured_output(...).invoke(...)` is fixed.
+
+    Offline by construction, and it asserts the one call-site detail the truncation
+    check depends on: `include_raw=True`. Without it `.invoke()` returns the parsed
+    grade alone, `raw` is gone, and `stop_reason` is unreadable — so the guard would
+    silently never fire while every assertion about a *clean* grade still passed.
+    """
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> _StubJudge:
+        assert kwargs.get("include_raw") is True, (
+            "the truncation guard reads raw.response_metadata, which only exists when "
+            "with_structured_output is called with include_raw=True"
+        )
+        return self
+
+    def invoke(self, messages: Any) -> dict:
+        return self._payload
+
+
+def _judge_reply(grade: dict, stop_reason: str = "end_turn") -> dict:
+    return {
+        "raw": AIMessage("", response_metadata={"stop_reason": stop_reason}),
+        "parsed": grade,
+        "parsing_error": None,
+    }
+
+
+def test_a_judge_grade_cut_off_at_max_tokens_is_refused_rather_than_scored(monkeypatch):
+    """The judge's own answer running out of tokens must not read as a good report.
+
+    Both grades are TypedDicts, so `with_structured_output` routes to
+    `JsonOutputParser`, whose `parse_json_markdown` defaults to `parse_partial_json` —
+    it CLOSES unterminated JSON instead of raising. Right for streaming a partial
+    object into a UI, catastrophic in a grader. Measured on the installed parser: a
+    grade of 12 claims / 9 uncited, cut after the second entry, parses cleanly and
+    scores **0.83** where the truth is 0.25.
+
+    The bias only runs one way — truncation drops uncited claims, never adds them — and
+    it is worst exactly where the metric matters most, since each `_UncitedClaim`
+    demands a verbatim quote and a justification, so the worse the citation discipline
+    the longer the honest grade and the likelier the cut.
+
+    The fixture below IS the repaired shape, not a hypothetical one.
+    """
+    repaired = {
+        "reasoning": "Several figures carry no source.",
+        "substantive_claims": 12,
+        "uncited_claims": [{"claim": "first"}, {"claim": "second"}],
+    }
+
+    monkeypatch.setattr(
+        "evals.evaluators.JUDGE", _StubJudge(_judge_reply(repaired, "max_tokens"))
+    )
+    graded = claims_are_cited(
+        {"outputs": {"response": "a cited report"}}, {"outputs": {}}
+    )
+    assert graded["score"] is None, (
+        "a grade the judge never finished writing was scored as if it had: this is the "
+        "0.83-for-0.25 inflation, and it lands on badly-cited reports by construction"
+    )
+    assert "cut off" in graded["comment"]
+
+    # Positive control: the identical grade, finished, still scores the proportion —
+    # so the guard is refusing truncation rather than refusing everything.
+    monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(_judge_reply(repaired)))
+    finished = claims_are_cited(
+        {"outputs": {"response": "a cited report"}}, {"outputs": {}}
+    )
+    assert finished["score"] == pytest.approx(10 / 12)
+
+
+def test_a_judge_grade_with_no_count_cannot_collect_a_vacuous_perfect_score(
+    monkeypatch,
+):
+    """The same failure landing one field earlier, which is the worse of the two.
+
+    Truncated inside `reasoning`, the grade comes back with no `substantive_claims` at
+    all. `.get(...) or 0` turned that into a zero total, and `_coverage_score` returned
+    1.0 for a zero total — so the *most* truncated grade scored a flawless 100%. Two
+    independent guards now stop it: the missing count is refused here, and
+    `_coverage_score` no longer rewards a zero total that has misses beside it.
+    """
+    monkeypatch.setattr(
+        "evals.evaluators.JUDGE",
+        _StubJudge(_judge_reply({"reasoning": "The answer makes many claims"})),
+    )
+    graded = claims_are_cited({"outputs": {"response": "a report"}}, {"outputs": {}})
+    assert graded["score"] is None
+    assert "substantive_claims" in graded["comment"]

@@ -73,13 +73,14 @@ uv run ty check                  # type check (Astral's ty)
   `uv run pytest` or the CI `lint` job is where it surfaces, detached from the edit that
   caused it. If you edit Python outside `Edit`/`Write`, run the three steps yourself:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
-- **Tests** live in `tests/` (pytest) — 8 files, ~4,100 lines, and the offline suite runs
+- **Tests** live in `tests/` (pytest) — 8 files, ~4,700 lines, and the offline suite runs
   in **~4s**. Where things are: `test_cli_hitl.py` (1,329 lines, the largest — the HITL
   decision protocol, `ActivityFeed`, duplicate interrupts, command dispatch),
   `test_cli_parsing.py` (`render_turn` / `_text_of` / the stop-reason table),
   `test_agent_wiring.py` (the gate, the backend contract, the served graph),
   `test_webui.py` + `test_streamlit_page.py` (the browser renderer and its rerun state
-  machine), `test_evals.py` (evaluators and harness), `test_config.py` (the model
+  machine), `test_evals.py` (evaluators, harness, and — see *When the INSTRUMENT is
+  broken* — whether the evaluators themselves can be trusted), `test_config.py` (the model
   payload), `test_live.py` (marked `live`, deselected by default).
   The offline suite is deliberately narrow —
   it targets the branching logic in `cli.py` and the load-bearing wiring
@@ -1135,7 +1136,14 @@ assumes otherwise:
   lists in its `tools` — and its tool messages stream out *before* the parent's `task`
   result. Flatten the two and a researcher tidying up after itself scores the
   **orchestrator** a pass on check-memory / persist. It would read as "the prompt fix
-  worked" when it had not. Only `searched_the_web` counts the whole tree, deliberately.
+  worked" when it had not. **Three** metrics count the whole tree, deliberately, each
+  for its own reason: `searched_the_web` (a search is evidence wherever it happened),
+  `mutations_require_approval` (subagents inherit `interrupt_on`, so "nothing durable is
+  written without a human decision" has to hold for them too) and `turn_stopped_cleanly`
+  (a researcher's refusal is otherwise invisible — its `task` result just comes back
+  thin). This sentence read "Only `searched_the_web`" for a long time after the other two
+  arrived, which is how a governing rule goes stale: it was written once, and the
+  exceptions were added one at a time, each correct in isolation.
   (Through 0.6.x subagents got a `TodoListMiddleware` too, which put `write_todos` — the
   very defect `plans_with_todos` exists to watch — inside that blind spot. 0.7 removed it
   and `agent.py` restores it for the orchestrator alone, so that one is now structurally
@@ -1402,6 +1410,91 @@ two-delegation comparison, so the documented smoke run costs more than it used t
 old behaviour was never a designed property and could not be relied on; if you want the
 cheap one specifically, the control is last, and there is no flag for picking an example
 by name.
+
+### When the INSTRUMENT is broken, every metric reads fine
+
+Everything above this heading is about catching the agent misbehaving. This section is
+about the other half, and it is the half the suite was weakest on: **each defect below
+was found while all 30 eval tests were green, and each one made a broken run look like a
+good one.** Read them as one failure repeated, because they are: *unknown must not mean
+benign*, the rule `GATED_TOOLS` and `_SILENT_STOPS` already enforce for the agent, was
+not being enforced for the evaluators themselves.
+
+- **A truncated judge grade was silently repaired and then scored.** `JUDGE` was capped
+  at `max_tokens=1024`, and because both grades are `TypedDict`s,
+  `with_structured_output` routes to `JsonOutputParser` → `parse_json_markdown` →
+  **`parse_partial_json`**, which *closes* unterminated JSON instead of raising.
+  Measured on the installed parser: a `_CitationGrade` of 12 claims / 9 uncited, cut
+  after the second entry, parses cleanly and scores **0.83** where the truth is 0.25 —
+  no exception, and a comment that reads like any other. The bias runs one way only
+  (truncation drops uncited claims, never adds them) and is worst exactly where the
+  metric matters most, since each `_UncitedClaim` demands a verbatim quote plus a
+  justification, so the worse the citation discipline the longer the honest grade and
+  the likelier the cut. Now `max_tokens=8192` **and** `include_raw=True`, with a
+  `stop_reason == "max_tokens"` returning a non-verdict — the ceiling alone would only
+  move the cliff. Note what this was: a *robustness* feature (repair partial JSON so a
+  streaming UI can render it) doing its job in the one place repair is the wrong answer.
+- **`strict=True` was decoration.** `ChatAnthropic.with_structured_output`'s own
+  docstring says "Additional keyword arguments are ignored", and its body only
+  interpolates `kwargs` into tracing metadata. It read like a validation guarantee and
+  was not one. Deleted.
+- **A crashed run was graded like a clean one.**
+  `langsmith/evaluation/_runner.py::_forward` catches the target's exception, logs it,
+  and **returns the row anyway** — so `research()` raising still reaches every
+  evaluator, with no outputs. Nothing read `run.error`, so those rows fell into the
+  *vacuous* branch each evaluator has for the honest empty case, and
+  `mutations_require_approval` returned "no mutation proposed — nothing to approve" and
+  scored **1**: a clean pass, on the one invariant this file calls silent and
+  unrecoverable, for a run that never happened. `_ungradable` now returns a
+  `score=None` non-verdict (a legal `SCORE_TYPE`, and excluded from the aggregate — "no
+  data", not "passed"), and it is the FIRST statement in every evaluator, ahead of the
+  `expects_plan` / `expects_persist` exemptions, which would otherwise hand out the
+  same free pass.
+- **`_coverage_score(0, N)` returned 1.0 for every N** — the landing pad for the two
+  above. A grade whose count was truncated away hit `.get(...) or 0`, and a zero total
+  scored vacuously perfect: the *most* truncated grade scored 100%. Both ends are
+  closed now (the call sites raise `total` to at least the number of misses; the
+  function floors a zero total with misses at 0.0), deliberately belt-and-braces,
+  because this is a pure function with its own test and its contract should hold alone.
+- **`delete` counted as persisting a finding.** deepagents' `delete` tool takes a
+  `file_path` exactly as `write_file` does, and `TurnRecorder` recorded the path of
+  every `MUTATING_TOOLS` call — so an orchestrator asking to DESTROY
+  `/memories/pricing.md` scored a `persists_findings` pass for having written it. Split
+  into `WRITE_TOOLS`: `delete` must stay in `proposed_mutations` (it is the only gated
+  tool that destroys data) but must never reach `proposed_writes`. The two lists answer
+  different questions and had been sharing one.
+- **A search that errored counted as research.** A `ToolMessage` is recorded for every
+  call that ran, failed or not — right for the trajectories, wrong for
+  `searched_the_web`, which asks whether the agent researched or answered out of the
+  model's own memory. A run whose every `tavily_search` came back `status="error"`
+  scored a clean 1. Failures are now recorded separately and subtracted there, leaving
+  the trajectory ordering the two `_first_research_index` evaluators depend on
+  untouched.
+- **Nothing graded WHY a turn ended, so the API's fault read as the agent's.** A
+  refusal, a context-window overrun or a `max_tokens` truncation all reach the
+  evaluators as nothing but a thin `response` — both judges score 0.0,
+  `response_cites_sources` scores 0, and off a sweep that is indistinguishable from an
+  agent that researched badly. `cli._stop_note` closes exactly this misattribution for
+  the human at the REPL; the evals had no equivalent, so the one place it is
+  *aggregated across runs* was the one place it was invisible. `turn_stopped_cleanly`
+  is the new metric, and `UNCLEAN_STOPS` is **derived from** `cli._SILENT_STOPS` rather
+  than copied beside it — that table is already compared against
+  `anthropic.types.StopReason` by set equality, so an SDK bump reaches the eval too.
+- **A duplicated question was invisible to the pre-spend gate.** Question text is the
+  dataset's only cross-side identity and nothing enforced uniqueness, so a second copy
+  collapsed in `_by_question` — the map both `drift()` and `sync()` are built on —
+  while `evaluate()` graded both, billed both, and weighted that question double in the
+  experiment mean. `drift()` now counts the raw rows before collapsing them.
+
+**Two lessons worth more than the fixes.** First, *the tests that missed all of this
+asked what the evaluators return, never what they return when there is nothing to
+read* — the same shape as every earlier miss in this file. Second, the ordering that
+`plans_with_todos` and `checks_memory_first` exist to check was pinned by **nothing**:
+deleting the `[:start]` slice from both left the whole suite green, because every
+fixture happened to put the tool first, so "before the first research action" and
+"anywhere in the trajectory" were indistinguishable. All twelve new guards were
+verified by breaking the source and watching the matching test go red; that script is
+the only reason this list is trustworthy rather than plausible.
 
 ## Extending it (where things go)
 
