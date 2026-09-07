@@ -14,6 +14,7 @@ Everything here runs without keys or network.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -22,7 +23,7 @@ from langgraph.types import Interrupt
 from deep_research.agent import GATED_TOOLS
 from deep_research.cli import render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
-from evals.dataset import EXAMPLES
+from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
     _coverage_score,
     checks_memory_first,
@@ -504,6 +505,75 @@ def test_every_delegation_band_in_the_dataset_is_satisfiable():
         assert ceiling >= outputs.get("min_delegations", 1), example["inputs"][
             "question"
         ]
+
+
+class _FakeClient:
+    """Enough LangSmith for `drift()`. The real client would need credentials and a
+    network, and what is under test here is a comparison, not an API."""
+
+    def __init__(self, uploaded: list[tuple[str, dict]]) -> None:
+        self._uploaded = [
+            SimpleNamespace(inputs={"question": q}, outputs=o, id=f"id{i}")
+            for i, (q, o) in enumerate(uploaded)
+        ]
+
+    def has_dataset(self, dataset_name: str | None = None) -> bool:
+        return True
+
+    def read_dataset(self, dataset_name: str | None = None) -> Any:
+        return SimpleNamespace(id="ds")
+
+    def list_examples(self, dataset_id: Any = None) -> list[Any]:
+        return list(self._uploaded)
+
+
+def _uploaded_from_local() -> list[tuple[str, dict]]:
+    return [(e["inputs"]["question"], dict(e["outputs"])) for e in EXAMPLES]
+
+
+def test_drift_is_silent_when_the_upload_matches_the_file():
+    assert drift(_FakeClient(_uploaded_from_local())) == []
+
+
+def test_drift_compares_outputs_because_the_count_does_not_move():
+    """The case that actually occurred, one commit apart, in this repo.
+
+    Adding `max_delegations` changed three examples and left the count at 9. A check on
+    `example_count` passes there while all three direct-path ceilings do not exist
+    remotely — and `delegates_breadth` reads a missing key as "no ceiling", so the sweep
+    scores exactly as it did before the column was added, silently and for real money.
+    """
+    stale = _uploaded_from_local()
+    changed = next(i for i, (_, o) in enumerate(stale) if "max_delegations" in o)
+    question, outputs = stale[changed]
+    outputs.pop("max_delegations")
+    stale[changed] = (question, outputs)
+
+    assert len(stale) == len(EXAMPLES)  # the count is no help at all
+    differences = drift(_FakeClient(stale))
+    assert len(differences) == 1
+    assert "outputs differ" in differences[0]
+
+
+def test_drift_reports_a_remote_only_example_that_sync_would_never_remove():
+    """Wider than the comparison `sync()` makes, deliberately.
+
+    `sync()` adds and updates but never deletes, so an example uploaded out of band is
+    invisible to it by design. It is not invisible to a *run*: `evaluate()` grades it,
+    and its scores land in the experiment aggregate beside examples you can read in
+    `dataset.py`. So `--upload` is not its remedy, and the message must not claim it is.
+    """
+    extra = [*_uploaded_from_local(), ("a question nobody committed", {})]
+    differences = drift(_FakeClient(extra))
+    assert len(differences) == 1
+    assert "a question nobody committed" in differences[0]
+    assert "will NOT remove it" in differences[0]
+
+
+def test_drift_reports_an_example_that_was_never_uploaded():
+    differences = drift(_FakeClient(_uploaded_from_local()[1:]))
+    assert len(differences) == 1
+    assert differences[0].startswith("not uploaded:")
 
 
 def test_the_direct_path_examples_assert_a_ceiling():

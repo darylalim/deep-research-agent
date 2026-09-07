@@ -64,7 +64,8 @@ asserts nothing, one that the direct-path examples nonetheless have one.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, Protocol
 
 from langsmith import Client
 
@@ -287,6 +288,90 @@ EXAMPLES: list[dict[str, Any]] = [
 ]
 
 
+class DatasetReader(Protocol):
+    """The slice of `langsmith.Client` that reading the dataset actually uses.
+
+    A Protocol rather than `Client` so the comparison in `drift()` can be tested
+    offline against a fake. The two alternatives were both worse: widening the
+    parameter to `Any` gives up checking at the real call sites in order to
+    accommodate the tests, and a `# ty: ignore` would be the only one in first-party
+    code — see CLAUDE.md on why that count is deliberately zero and what it costs to
+    reintroduce one.
+    """
+
+    def has_dataset(self, *, dataset_name: str) -> bool: ...
+
+    def read_dataset(self, *, dataset_name: str) -> Any: ...
+
+    def list_examples(self, *, dataset_id: Any) -> Iterable[Any]: ...
+
+
+def _remote(client: DatasetReader, dataset_id: Any) -> dict[str | None, Any]:
+    """Map question text -> the uploaded example.
+
+    Keyed on the question because that is the only identity an example has on both
+    sides: LangSmith assigns the ids, so a local entry has none to match on.
+
+    `None` is an admitted key, not an oversight: an uploaded example with no `question`
+    input is possible (nothing stops one being added through the LangSmith UI) and it
+    is itself drift. Narrowing the annotation by filtering it out here would delete it
+    from `drift()`'s orphan list — hiding the one example a reader of this file cannot
+    see at all. It surfaces as an orphan keyed `None`, which is exactly what it is.
+    """
+    return {
+        (example.inputs or {}).get("question"): example
+        for example in client.list_examples(dataset_id=dataset_id)
+    }
+
+
+def drift(client: DatasetReader | None = None) -> list[str]:
+    """Every way the uploaded dataset differs from `EXAMPLES`, as plain sentences.
+
+    `--run` without `--limit` hands `evaluate()` the dataset NAME, so the sweep grades
+    whatever LangSmith holds — never what you just edited. That is silent, and it costs
+    a sweep to learn. Nothing else notices: the evaluators read the *example's* outputs,
+    so a missing column falls back to its default and grades against the wrong bar
+    without erroring, which is the same hazard `sync()` exists to close from the writing
+    side.
+
+    **Compare the outputs, never the count.** Measured, in this repo, one commit apart:
+    adding `max_delegations` changed three examples and left the count at 9. A
+    count check passes there while all three direct-path ceilings silently do not
+    exist remotely — `delegates_breadth` reads a missing key as "no ceiling" — so the
+    sweep scores exactly as it did before the column was added.
+
+    Deliberately a WIDER comparison than the one `sync()` makes, and the difference is
+    orphans. `sync()` adds and updates but never deletes, so a remote example that is
+    not in `EXAMPLES` is invisible to it, by design. To a *run* that example is not
+    invisible at all: `evaluate()` grades it, and its scores land in an experiment
+    aggregate alongside examples you can read in this file. So it is reported here, and
+    `--upload` is not its remedy.
+    """
+    client = client or Client()
+    if not client.has_dataset(dataset_name=DATASET_NAME):
+        return [f"the dataset {DATASET_NAME!r} does not exist yet — run `--upload`"]
+
+    existing = _remote(client, client.read_dataset(dataset_name=DATASET_NAME).id)
+    local = {e["inputs"]["question"]: e["outputs"] for e in EXAMPLES}
+
+    differences = [
+        f"not uploaded: {question!r}" for question in local if question not in existing
+    ]
+    differences += [
+        f"outputs differ for {question!r}: "
+        f"uploaded {existing[question].outputs or {}}, local {outputs}"
+        for question, outputs in local.items()
+        if question in existing and (existing[question].outputs or {}) != outputs
+    ]
+    differences += [
+        f"uploaded but absent from EXAMPLES, and `--upload` will NOT remove it — "
+        f"delete it in LangSmith if the sweep should not grade it: {question!r}"
+        for question in existing
+        if question not in local
+    ]
+    return differences
+
+
 def sync(client: Client | None = None) -> str:
     """Create the dataset if absent, add new examples, and reconcile changed ones.
 
@@ -304,10 +389,7 @@ def sync(client: Client | None = None) -> str:
             dataset_name=DATASET_NAME, description=DATASET_DESCRIPTION
         )
 
-    existing = {
-        (example.inputs or {}).get("question"): example
-        for example in client.list_examples(dataset_id=dataset.id)
-    }
+    existing = _remote(client, dataset.id)
 
     fresh = [e for e in EXAMPLES if e["inputs"]["question"] not in existing]
     stale = [

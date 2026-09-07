@@ -48,7 +48,8 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        help="only evaluate the first N examples (47k-1M tokens each, measured)",
+        help="only evaluate the first N examples in evals/dataset.py order "
+        "(47k-1M tokens each, measured — the first is not the cheapest)",
     )
     args = parser.parse_args()
     if not (args.upload or args.run):
@@ -56,7 +57,7 @@ def main() -> None:
     # `--limit 0` used to be the most expensive way to ask for nothing: the guard
     # below was `if args.limit:`, so a falsy zero fell through to the *whole*
     # dataset. Measured, by doing it: one example got through before the kill, at
-    # 232,865 tokens / $0.51. A negative limit reached `islice` and died there with
+    # 232,865 tokens / $0.51. A negative limit reached the slice and died there with
     # a raw ValueError. Both are argument errors; say so before spending anything.
     if args.limit is not None and args.limit < 1:
         parser.error(f"--limit must be at least 1 (got {args.limit})")
@@ -79,8 +80,6 @@ def main() -> None:
         prefix="deep_research_evals_"
     )
 
-    from itertools import islice
-
     from langsmith import Client, evaluate
 
     from . import dataset
@@ -92,16 +91,48 @@ def main() -> None:
     if not args.run:
         return
 
+    # REFUSE BEFORE SPENDING. `evaluate()` below is handed the dataset NAME, so the
+    # sweep grades whatever LangSmith holds — not what `evals/dataset.py` says. Editing
+    # EXAMPLES and running without `--upload` is a documented, ordinary invocation, and
+    # the failure is silent: evaluators read the *example's* outputs, so a column added
+    # locally and never uploaded falls back to its default and grades against the wrong
+    # bar. Checked even after `--upload`, because `sync()` never deletes and so cannot
+    # clear a remote-only example that the run would still grade. One list call against
+    # a sweep measured in dollars.
+    differences = dataset.drift()
+    if differences:
+        raise SystemExit(
+            "the uploaded dataset is not what evals/dataset.py describes:\n"
+            + "\n".join(f"  - {difference}" for difference in differences)
+            + "\n\nThis sweep would grade the uploaded examples and bill you for it. "
+            "Publish local edits with `--upload`, or check out the revision the "
+            "dataset was uploaded from — `sync()` updates and never deletes, so "
+            "uploading a stale local copy would overwrite newer outputs. Which side "
+            "is stale is not something this can know, so neither is assumed."
+        )
+
     evaluators = CODE_EVALUATORS if args.code_only else ALL_EVALUATORS
     # `evaluate` takes a dataset name or an iterable of examples; the latter is how
     # a smoke run stays *smaller*. Not cheap — one example measured 47k-1M tokens.
     data: Any = dataset.DATASET_NAME
     if args.limit is not None:
+        # Sliced in `EXAMPLES` order, not in whatever order LangSmith returns. The
+        # server order is unspecified and is not the order anyone reads in
+        # `dataset.py`, so "the first N" named a set nobody could predict — and since
+        # the dataset grew to span a measured 21x cost range, an unpredictable pick is
+        # also an unpredictable bill. `drift()` above has already established the two
+        # sides agree, so every question resolves; the default is belt-and-braces.
         client = Client()
-        data = list(
-            islice(client.list_examples(dataset_name=dataset.DATASET_NAME), args.limit)
+        order = {e["inputs"]["question"]: i for i, e in enumerate(dataset.EXAMPLES)}
+        remote = sorted(
+            client.list_examples(dataset_name=dataset.DATASET_NAME),
+            key=lambda e: order.get((e.inputs or {}).get("question"), len(order)),
         )
+        data = remote[: args.limit]
 
+    # `len(dataset.EXAMPLES)` is the right count for the by-name case only because the
+    # drift gate above has just proved the two sides identical. It used to be a guess
+    # that happened to be right, and printed "running 9 example(s)" over a sweep of 5.
     count = len(data) if isinstance(data, list) else len(dataset.EXAMPLES)
     print(
         f"running {count} example(s) with {len(evaluators)} evaluator(s); "

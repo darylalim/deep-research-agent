@@ -30,7 +30,7 @@ uv run --group ui streamlit run streamlit_app.py   # the SAME agent in a browser
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
-uv run python -m evals --run --limit 1   # one example: 47k-1M tokens (see *What a sweep costs*)
+uv run python -m evals --run --limit 1   # FIRST example in dataset.py: 47k-1M tokens (see *What a sweep costs*)
 uv run python -m evals --run --code-only # trajectory metrics only — skips the judges, NOT the agent
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
@@ -1377,6 +1377,31 @@ between them (band semantics, missing-ceiling silence, ceiling-present-on-direct
 floor is an example that can never pass and nothing else would notice until a paid sweep
 scored it 0 for a reason having nothing to do with the agent. All four were verified red by
 breaking the source.
+
+**`--run` refuses to start when the uploaded dataset is not what `evals/dataset.py`
+says, and the check compares OUTPUTS, never the count.** `evaluate()` is handed the
+dataset *name*, so a sweep grades whatever LangSmith holds — and `--upload` and `--run`
+are documented as separate commands, so editing `EXAMPLES` and running is an ordinary
+invocation with a silent, billable failure at the end of it. Counting is not enough, and
+this repo has the counterexample: adding `max_delegations` changed three examples and
+left the count at **9**, so a count check passes while all three direct-path ceilings do
+not exist remotely — `delegates_breadth` reads a missing key as "no ceiling" and the
+sweep scores exactly as it did before the column was added. `dataset.drift()` is
+deliberately a *wider* comparison than `sync()`'s, because `sync()` adds and updates but
+never deletes: an example uploaded out of band is invisible to it by design, and is very
+much not invisible to a run that grades it. So `--upload` is not that one's remedy, and
+the message says so rather than recommending the wrong fix. It takes a `DatasetReader`
+Protocol rather than a `Client` so the comparison is testable offline — the alternative
+was a `# ty: ignore`, and this repo has none.
+
+**`--limit N` slices in `EXAMPLES` order, and that is a behaviour change worth knowing
+about.** LangSmith's own order is unspecified; measured here it is the exact *reverse*
+of the file, so `--limit 1` used to grade the control — the cheapest example — purely by
+accident of upload order. It now grades the FIRST question in `dataset.py`, which is a
+two-delegation comparison, so the documented smoke run costs more than it used to. The
+old behaviour was never a designed property and could not be relied on; if you want the
+cheap one specifically, the control is last, and there is no flag for picking an example
+by name.
 
 ## Extending it (where things go)
 
