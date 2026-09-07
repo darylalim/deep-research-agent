@@ -21,8 +21,11 @@ instructions — which is why the control example sets all three to their low ba
 
 Two properties of those columns govern every judgment call below, and both are
 asymmetric. `min_delegations` is a FLOOR, so setting it low costs signal while setting
-it high scores a *correct* agent down — every borderline bar here therefore resolves
-downward. And `expects_plan=False` / `expects_persist=False` make their evaluators
+it high scores a *correct* agent down — genuine uncertainty about a bar therefore
+resolves downward. The one deliberate exception is the packaging example's bar of 3,
+which is an assertion rather than an estimate and carries its own fallback in place;
+nothing else here sits above what its trajectory plainly requires. And
+`expects_plan=False` / `expects_persist=False` make their evaluators
 return 1 unconditionally: a False bar cannot be wrong, only uninformative. Vacuous is
 safe; that is the whole reason the direct-path examples exempt planning rather than
 asserting it.
@@ -33,9 +36,19 @@ while the SQLite and OpenTelemetry examples below assume that same shape does *n
 out. Both are anchored on a single named document deliberately, to make the direct path
 the natural one. Their columns cannot be wrong — they are unfalsifiable — so if
 `orchestrator_trajectory` shows a `task` on either, the WORDING needs another pass, not
-the bars. The cost of the exemptions is real and accepted: `plans_with_todos` is now
-vacuous on 3 of 9 examples, and it is the metric carrying 15 runs of history behind its
-~80% figure, so future movement in it is harder to read than it was at 1 of 5.
+the bars.
+
+Count the vacuity in BOTH directions, because it is easy to tally only the boolean
+columns and conclude the delegation bar still has teeth everywhere: `min_delegations=0`
+makes `delegates_breadth` return 1 unconditionally too, on exactly the same examples.
+So after the direct-path additions `plans_with_todos` AND `delegates_breadth` are each
+vacuous on the same 3 of 9, where each was 1 of 5. `plans_with_todos` is the one that
+costs something — it carries the longest measurement history of any metric here, so
+future movement in it is harder to read. Accepted rather than papered over with a bar
+SYSTEM_PROMPT explicitly exempts. The consequence nobody should have to rediscover: on
+those three examples, over-orchestration is unmeasurable. `delegates_breadth` is a
+floor with no ceiling, so 0, 1 and 5 dispatches all score 1 — which is why the control
+below can call fanning out "over-orchestrating" while nothing checks it.
 """
 
 from __future__ import annotations
@@ -106,9 +119,13 @@ EXAMPLES: list[dict[str, Any]] = [
         },
     },
     {
-        # GAP B: the only bar above 2 in the dataset. Every other non-control example
-        # asks for exactly two delegations, so an agent hard-capped at two dispatches
-        # scored a clean 5 of 5 and `delegates_breadth` was never exercised higher.
+        # GAP B: the highest bar here, and the reason it exists. BEFORE this example
+        # every non-control question asked for exactly two delegations, so an agent
+        # hard-capped at two dispatches scored a clean 5 of 5 and `delegates_breadth`
+        # was never exercised higher. It is also the deliberate exception to the
+        # resolve-downward rule in the module docstring — an assertion, not an
+        # estimate, which is why the fallback below is written down rather than left
+        # to be rediscovered from a failed sweep.
         # Three legs, three primary sources (docs.pypi.org, PEP 740, pip's docs), three
         # vocabularies. This is the sharpest column assertion here and its failure mode
         # is known in advance: a PEP 740 attestation is signed with the SAME OIDC
@@ -136,9 +153,14 @@ EXAMPLES: list[dict[str, Any]] = [
         # GAP D: the hedging judge, which has never been tested on a hedge.
         # `answers_the_question` was rebuilt because it read an honest caveat as a
         # refusal to answer — and nothing in the dataset was shaped to produce one. Here
-        # the honest answer IS a qualified no: no provider commits to bit-exact
-        # reproducibility, and the public explanations of the residual variation
-        # disagree. The hedge is the substance, not a wrapper around it.
+        # The DESIGN ASSUMPTION — labelled as one, because the docstring above forbids
+        # inventing facts about live services and this is exactly that kind of claim:
+        # providers do not commit to bit-exact reproducibility, and the public accounts
+        # of the residual variation do not agree, so the honest answer is a qualified no
+        # and the hedge is the substance rather than a wrapper around it. If the first
+        # sweep instead produces a flat sourced summary, the assumption was wrong and
+        # GAP D is still open. Nothing detects that: the score is 1 either way, so read
+        # the prose, not the metric.
         #
         # The bar is 1, not 2, and that is a deliberate downgrade from what the
         # candidate was proposed at. The two legs are asymmetric — a vendor-docs survey
@@ -162,19 +184,24 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     {
         # GAP A: claim density on the direct-search path. That path is this agent's
-        # documented blind spot — measured 0 of 5 lookups checked `/memories/` first,
-        # and the one answer the orchestrator researched itself scored 25% citation
-        # coverage against 83-100% on delegated ones. Naming the direct path in
-        # SYSTEM_PROMPT steps 2 and 4 fixed it (77% -> 98% mean). But the control below
-        # is the only other `min_delegations=0` example and its whole answer is two
-        # facts, so `claims_are_cited` has a granularity of 0.5 there and a regression
-        # of that fix would barely move the number. This carries a dozen attributable
-        # figures off one decade-stable page.
+        # documented blind spot: memory checks and citation coverage both collapsed
+        # there until SYSTEM_PROMPT steps 2 and 4 named the path explicitly. CLAUDE.md,
+        # *What the evals found*, carries the measured before and after — deliberately
+        # not restated here, because a second copy of a number is how the last one
+        # drifted (`evals/__main__.py` states the same rule). What matters for this
+        # example is the shape of what that fix left ungraded: before it, the only
+        # direct-path example was the control, whose whole answer is two facts, so
+        # `claims_are_cited` has a granularity of 0.5 there and a regression would
+        # barely move the number. This carries a dozen attributable figures off one
+        # decade-stable page.
         #
-        # `expects_persist=True` is the first live `persists_findings` bar on the direct
-        # path, and it may well fail: step 5 has never been named for that path the way
-        # steps 2 and 4 now are. A failure is a finding about the prompt, not a mis-set
-        # column — do not flip it, and do not act on one run (write_todos took 15).
+        # `expects_persist=True` puts a live `persists_findings` bar on the direct path
+        # for the first time — this example and the OpenTelemetry one below, jointly;
+        # neither is first on its own. It may well fail, because step 5 has never been
+        # named for that path the way steps 2 and 4 now are. That is a finding about the
+        # prompt, not a mis-set column: do not flip it, and do not act on a single run
+        # (CLAUDE.md's write_todos study is the cautionary case — two samples of one
+        # question disagreed, and only the pooled figure meant anything).
         "inputs": {
             "question": (
                 "What hard upper limits does SQLite publish in its own "
@@ -192,17 +219,21 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     {
         # The second direct-path example, and the second one is the point: at n=1 a
-        # direct-path failure cannot be told from noise, and this repo has already
-        # redesigned around n=5 noise once (the plan/persist anti-correlation that
-        # evaporated at n=10). It also gives `checks_memory_first` a third observation
-        # on the path measured at 0 of 5, and gives `mutations_require_approval` — which
-        # is vacuous unless a mutation is proposed — its first teeth there.
+        # direct-path failure cannot be told from noise, and this repo has already very
+        # nearly redesigned around a five-run result that evaporated at ten (CLAUDE.md,
+        # *A tempting hypothesis that the data killed*). It takes `checks_memory_first`
+        # to three observations on the direct path, and — together with the SQLite
+        # example above, not ahead of it — is what puts a proposed mutation on that path
+        # at all, which is the precondition for `mutations_require_approval` being
+        # anything but vacuous there.
         #
         # What neither GAP A example buys, so nobody claims it later: attribution
         # DISCRIMINATION. The judge treats attribution as inherited, and both answers
         # sit on one source family, so a single trailing spec URL can score ~100%
         # whether the agent was disciplined or lazy. They raise claim COUNT, which is
-        # what example 5's two facts could not supply.
+        # what the control's two facts could not supply. (Name the control, never its
+        # index: this commit inserted four examples above it and every positional
+        # reference in the file went stale at once.)
         "inputs": {
             "question": (
                 "In OpenTelemetry tracing, what is a span, what fields does the "

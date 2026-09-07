@@ -1195,6 +1195,14 @@ assumes otherwise:
   self-inflicted, in the list headed *measured, not inferred*. n=2 against n=3 at 2.45x
   spread decides nothing.
 
+  **All five of those sweeps ran the 5-example dataset, and that is no longer what a
+  sweep is.** It is **9** as of the direct-path and breadth additions in
+  `evals/dataset.py`, one of which asks for three delegations and therefore sits at the
+  expensive end of the 21x range — so budget appreciably more than a linear 1.8x, and do
+  **not** compare a 9-example total against the five figures above. That comparison reads
+  an 80% dataset-size increase as a model or prompt regression, which is precisely the
+  misattribution the paragraph above was written to correct, one variable over.
+
 The dataset (`evals/dataset.py`) is deliberately **reference-free**: examples carry a
 structural expectation (`min_delegations`) rather than a hand-written gold answer, because
 inventing facts about live services and grading against them is worse than not grading.
