@@ -339,7 +339,8 @@ drives them:
   brand-new uuid on the resume. A message-id seen-set matches neither, so every replayed
   result gets through: the feed reprinted a finished researcher's line once per approval
   round, and `TurnRecorder` counted one delegation as two, which would let
-  `delegates_breadth` pass an example demanding more than actually happened. A tool call
+  `delegates_breadth` pass an example demanding more than actually happened — and, now
+  that it is a *band*, fail one that stayed inside its `max_delegations` ceiling. A tool call
   executes exactly once; its id is the honest key.
 
 - **A rejection reaches the stream as `status="error"`.** `HumanInTheLoopMiddleware` answers a
@@ -1349,6 +1350,33 @@ defect for an agent defect — check the instrument before you tune the agent.
 This is the `create_deep_agent()` lesson again, and it is the second time it has bitten in
 this repo: **the harness injects prompts and middleware you never wrote.** "The repo
 doesn't configure X" is not evidence that X is unconfigured — grep the installed package.
+
+**`delegates_breadth` grades a BAND, and the ceiling half exists because a floor could not
+see over-orchestration at all.** At `min_delegations=0` the test `delegated >= 0` holds for
+0, 1 or 5 dispatches, so the three direct-path examples scored 1 however the agent behaved.
+Two things were invisible under that. The control's comment in `dataset.py` had always
+called spinning up a subagent for "what is the latest Python release" *over-orchestrating*
+— a sentence describing nothing checkable. And a GAP A example that fanned out silently
+stopped being a direct-path example: `RESEARCHER_PROMPT` independently supplies citation
+discipline, so the run graded the delegated path that already measures 83-100% while the
+direct-path gap the example was added for stayed open, at a clean score of 1. A code review
+found this; it was not caught by a sweep, because a sweep could not fail on it.
+
+**A missing `max_delegations` means NO ceiling — deliberately the mirror image of the
+unknown-means-fail rule that governs `GATED_TOOLS`, `_SILENT_STOPS` and
+`test_every_mutating_tool_the_model_is_offered_is_gated`.** Those must refuse what they do
+not recognise, because guessing wrong costs unreviewed damage. An eval bar inverts the
+asymmetry: one that fires on behaviour nobody asserted scores a *correct* agent down, which
+`dataset.py` names as the worst thing an example can do. Silence means "no assertion", never
+"assume zero" — and every example written before the column existed depends on that. The
+unknown-means-fail instinct still applies, one level up, in the **dataset** rather than the
+evaluator: `test_the_direct_path_examples_assert_a_ceiling` is what stops the column being
+quietly dropped from the three examples whose whole value rests on it. Three tests hold this
+between them (band semantics, missing-ceiling silence, ceiling-present-on-direct-path), plus
+`test_every_delegation_band_in_the_dataset_is_satisfiable`, since a ceiling below its own
+floor is an example that can never pass and nothing else would notice until a paid sweep
+scored it 0 for a reason having nothing to do with the agent. All four were verified red by
+breaking the source.
 
 ## Extending it (where things go)
 

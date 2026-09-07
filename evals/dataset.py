@@ -11,8 +11,8 @@ The right way to add references later is the one the `langsmith-dataset` skill
 describes: run the agent, read the trace, curate the answers you have actually
 verified, and upload those as `outputs`. Traces first, gold second.
 
-The three structural columns — `min_delegations`, `expects_plan`, `expects_persist`
-— are assertions about *judgment*, not just tool use, and they exist because
+The four structural columns — `min_delegations`, `max_delegations`, `expects_plan`,
+`expects_persist` — are assertions about *judgment*, not just tool use, and they exist because
 `SYSTEM_PROMPT` grants exemptions rather than issuing blanket rules: delegate
 breadth **but** handle a single quick lookup yourself; plan first **unless** one
 search settles it; persist durable findings **but not** ephemeral ones. Applying
@@ -45,10 +45,21 @@ So after the direct-path additions `plans_with_todos` AND `delegates_breadth` ar
 vacuous on the same 3 of 9, where each was 1 of 5. `plans_with_todos` is the one that
 costs something — it carries the longest measurement history of any metric here, so
 future movement in it is harder to read. Accepted rather than papered over with a bar
-SYSTEM_PROMPT explicitly exempts. The consequence nobody should have to rediscover: on
-those three examples, over-orchestration is unmeasurable. `delegates_breadth` is a
-floor with no ceiling, so 0, 1 and 5 dispatches all score 1 — which is why the control
-below can call fanning out "over-orchestrating" while nothing checks it.
+SYSTEM_PROMPT explicitly exempts.
+
+`max_delegations` is what stops that vacuity being total, and it is the reason the
+column exists. A floor alone cannot see over-orchestration — at `min_delegations=0`,
+0, 1 and 5 dispatches all score 1 — so the control's comment could call fanning out
+"over-orchestrating" while nothing checked it, and a direct-path example that fanned
+out silently became a *delegated*-path example, grading the path that already measures
+well while the gap it was added for stayed open, at a clean 1. The three
+`min_delegations=0` examples therefore carry ceilings; nothing else does, because a
+ceiling nobody has an argument for is a bar waiting to fail a correct agent. Absent
+means NO ceiling, never zero — the mirror of the unknown-means-fail rule that governs
+`GATED_TOOLS`, and inverted on purpose: a gate must refuse what it does not recognise,
+an eval bar must not assert what nobody claimed. `delegates_breadth`'s docstring
+carries the full argument, and two tests hold the ends — one that a missing ceiling
+asserts nothing, one that the direct-path examples nonetheless have one.
 """
 
 from __future__ import annotations
@@ -213,6 +224,11 @@ EXAMPLES: list[dict[str, Any]] = [
         },
         "outputs": {
             "min_delegations": 0,
+            # One `task` is defensible context hygiene — a researcher absorbing one
+            # document read. Two is not, on a question one page answers: it is the
+            # fan-out that converts this into a delegated-path example and quietly
+            # reopens the gap it was added to close.
+            "max_delegations": 1,
             "expects_plan": False,
             "expects_persist": True,
         },
@@ -244,6 +260,7 @@ EXAMPLES: list[dict[str, Any]] = [
         },
         "outputs": {
             "min_delegations": 0,
+            "max_delegations": 1,  # same argument as the SQLite example above
             "expects_plan": False,
             "expects_persist": True,
         },
@@ -258,6 +275,11 @@ EXAMPLES: list[dict[str, Any]] = [
         },
         "outputs": {
             "min_delegations": 0,
+            # Zero, and this is the one example where the repo had already committed to
+            # the judgement in prose: the comment above has always called delegating
+            # here over-orchestration. It described nothing checkable until the ceiling
+            # existed.
+            "max_delegations": 0,
             "expects_plan": False,
             "expects_persist": False,
         },

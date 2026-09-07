@@ -196,7 +196,11 @@ class TurnRecorder:
             # fresh id. So the old message-id dedupe never matched, and `task` was counted
             # twice for one delegation: `delegates_breadth` would pass an example needing
             # three delegations on two real ones, and `searched_the_web`'s count inflates
-            # the same way.
+            # the same way. Since `delegates_breadth` became a BAND rather than a floor,
+            # that hazard cuts both ways — an inflated count can now break a
+            # `max_delegations` ceiling and FAIL an agent that behaved correctly, which
+            # is the failure this dataset treats as the worst kind. Same fix, second
+            # reason: count real events, not emissions.
             call_id = getattr(message, "tool_call_id", None)
             if call_id and not self._first_time(f"result:{call_id}"):
                 return

@@ -22,6 +22,7 @@ from langgraph.types import Interrupt
 from deep_research.agent import GATED_TOOLS
 from deep_research.cli import render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
+from evals.dataset import EXAMPLES
 from evals.evaluators import (
     _coverage_score,
     checks_memory_first,
@@ -438,6 +439,86 @@ def test_delegates_breadth_takes_its_bar_from_the_example():
 
     fanned = {"outputs": {"orchestrator_trajectory": ["task", "task"]}}
     assert delegates_breadth(fanned, {"outputs": {"min_delegations": 2}})["score"] == 1
+
+
+def test_delegates_breadth_is_a_band_and_says_which_side_failed():
+    """The ceiling is what makes over-orchestration observable at all.
+
+    At `min_delegations=0` with no ceiling, `delegated >= 0` holds for any number of
+    dispatches, so the three direct-path examples scored 1 however the agent behaved —
+    including when it fanned out and thereby stopped grading the direct path they exist
+    to measure. Verified by deleting the ceiling branch: the `over` case below goes
+    green while the defect is live.
+    """
+    direct = {"outputs": {"orchestrator_trajectory": ["tavily_search"]}}
+    fanned = {"outputs": {"orchestrator_trajectory": ["task", "task"]}}
+
+    over = delegates_breadth(
+        fanned, {"outputs": {"min_delegations": 0, "max_delegations": 1}}
+    )
+    assert over["score"] == 0
+    assert "OVER-ORCHESTRATED" in over["comment"]
+
+    # Sitting exactly on either bound passes; the band is inclusive.
+    assert (
+        delegates_breadth(
+            fanned, {"outputs": {"min_delegations": 2, "max_delegations": 2}}
+        )["score"]
+        == 1
+    )
+    assert (
+        delegates_breadth(
+            direct, {"outputs": {"min_delegations": 0, "max_delegations": 0}}
+        )["score"]
+        == 1
+    )
+
+    # A bare 0 cannot separate the two failures, and they want opposite fixes — so the
+    # comment has to name the side, not just the number.
+    under = delegates_breadth(direct, {"outputs": {"min_delegations": 2}})
+    assert under["score"] == 0
+    assert "UNDER-DELEGATED" in under["comment"]
+
+
+def test_a_missing_ceiling_asserts_nothing():
+    """Absent means NO ceiling, never zero.
+
+    Deliberately the mirror of the unknown-means-fail rule that governs `GATED_TOOLS`
+    and `_SILENT_STOPS`: a gate must refuse what it does not recognise, but an eval bar
+    that fires on behaviour nobody asserted scores a *correct* agent down. Every
+    example written before the column existed relies on this.
+    """
+    fanned = {"outputs": {"orchestrator_trajectory": ["task"] * 5}}
+    assert delegates_breadth(fanned, {"outputs": {"min_delegations": 2}})["score"] == 1
+
+
+def test_every_delegation_band_in_the_dataset_is_satisfiable():
+    """A ceiling below its own floor is an example that can never pass, and nothing
+    else would notice until a paid sweep scored it 0 for a reason having nothing to do
+    with the agent."""
+    for example in EXAMPLES:
+        outputs = example["outputs"]
+        ceiling = outputs.get("max_delegations")
+        if ceiling is None:
+            continue
+        assert ceiling >= outputs.get("min_delegations", 1), example["inputs"][
+            "question"
+        ]
+
+
+def test_the_direct_path_examples_assert_a_ceiling():
+    """This is where unknown-means-fail belongs: in the dataset, not the evaluator.
+
+    `min_delegations=0` is unfalsifiable on its own, so a direct-path example with no
+    ceiling grades nothing about the path it was added for — it scores 1 whether the
+    agent stayed direct or fanned out into the delegated path that already measures
+    well. The ceiling is the only thing making those examples assertions rather than
+    free passes, so dropping it has to be loud.
+    """
+    direct = [e for e in EXAMPLES if e["outputs"].get("min_delegations") == 0]
+    assert direct, "no direct-path examples left — this test has gone vacuous"
+    for example in direct:
+        assert "max_delegations" in example["outputs"], example["inputs"]["question"]
 
 
 def test_evaluators_accept_both_the_object_and_dict_run_shapes():

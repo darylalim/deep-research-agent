@@ -125,17 +125,63 @@ def checks_memory_first(run: Any, example: Any) -> dict[str, Any]:
 
 
 def delegates_breadth(run: Any, example: Any) -> dict[str, Any]:
-    """SYSTEM_PROMPT step 3: fan independent sub-questions out to `researcher`.
+    """SYSTEM_PROMPT step 3: fan out the breadth the question has, and no more.
 
-    The bar comes from the example (`min_delegations`), because a single quick
-    lookup is *supposed* to skip delegation — the prompt says so explicitly.
+    A BAND, not a floor. `min_delegations` sets the floor, per-example because a single
+    quick lookup is *supposed* to skip delegation — the prompt says so explicitly.
+    `max_delegations` is an optional ceiling, and it exists because the floor alone
+    could not see over-orchestration at all: at `min_delegations=0`, `delegated >= 0`
+    holds for 0, 1 or 5 dispatches, so the three direct-path examples scored 1 however
+    the agent behaved. The control's comment in `dataset.py` has always called spinning
+    up a subagent for it "over-orchestrating" — that sentence described a property
+    nothing checked until this ceiling existed. Worse, on the two GAP A examples a
+    fan-out silently converts them into *delegated*-path examples, grading the path
+    that already measures well while the direct-path gap they were added for stays
+    open, at a clean score of 1.
+
+    **A MISSING `max_delegations` MEANS NO CEILING — deliberately the opposite of the
+    unknown-means-fail rule governing `GATED_TOOLS` and `_SILENT_STOPS`.** A safety
+    gate must refuse what it does not recognise, because the cost of guessing wrong is
+    unreviewed damage. An eval bar is the mirror image: one that fires on behaviour
+    nobody asserted scores a *correct* agent down, which `dataset.py` names as the worst
+    thing an example can do. Silence here means "no assertion", never "assume zero". The
+    unknown-means-fail instinct still applies, one level up — see
+    `test_the_direct_path_examples_assert_a_ceiling`, which is what stops the column
+    being quietly dropped from the examples that need it.
+
+    The comment names WHICH side failed. A bare 0 cannot separate an agent that would
+    not delegate from one that would not stop, and those want opposite fixes.
+
+    One consequence for `harness.TurnRecorder`, because it inverts a hazard already
+    recorded there: its `task` dedupe (on `tool_call_id`, never `BaseMessage.id`) used
+    to matter in one direction only — a double-counted dispatch could *pass* an example
+    demanding more breadth than actually happened. With a ceiling, an inflated count can
+    now also *fail* an agent that behaved correctly. The recorder has to count real
+    events, and this is a second, opposite reason why.
     """
     trajectory = _outputs(run).get("orchestrator_trajectory", [])
-    required = _outputs(example).get("min_delegations", 1)
+    outputs = _outputs(example)
+    required = outputs.get("min_delegations", 1)
+    ceiling = outputs.get("max_delegations")  # None — and absent — mean "no ceiling".
     delegated = trajectory.count("task")
+
+    if delegated < required:
+        return {
+            "score": 0,
+            "comment": f"{delegated} `task` dispatch(es), expected >= {required} — "
+            "UNDER-DELEGATED: the question's breadth was never fanned out",
+        }
+    if ceiling is not None and delegated > ceiling:
+        return {
+            "score": 0,
+            "comment": f"{delegated} `task` dispatch(es), expected <= {ceiling} — "
+            "OVER-ORCHESTRATED: on a direct-path example this also means the run "
+            "graded the delegated path, not the one the example exists to measure",
+        }
+    band = f">= {required}" if ceiling is None else f"{required}-{ceiling}"
     return {
-        "score": int(delegated >= required),
-        "comment": f"{delegated} `task` dispatch(es), expected >= {required}",
+        "score": 1,
+        "comment": f"{delegated} `task` dispatch(es), expected {band}",
     }
 
 
