@@ -1446,10 +1446,18 @@ not being enforced for the evaluators themselves.
   `mutations_require_approval` returned "no mutation proposed — nothing to approve" and
   scored **1**: a clean pass, on the one invariant this file calls silent and
   unrecoverable, for a run that never happened. `_ungradable` now returns a
-  `score=None` non-verdict (a legal `SCORE_TYPE`, and excluded from the aggregate — "no
-  data", not "passed"), and it is the FIRST statement in every evaluator, ahead of the
-  `expects_plan` / `expects_persist` exemptions, which would otherwise hand out the
-  same free pass.
+  `score=None` non-verdict, and it is the FIRST statement in every evaluator, ahead of
+  the `expects_plan` / `expects_persist` exemptions, which would otherwise hand out the
+  same free pass. **Two things about it are worth stating precisely, because the first
+  draft got both slightly wrong.** `score=None` is a legal `SCORE_TYPE`
+  (`langsmith/schemas.py:33`) — but whether LangSmith *excludes* it from an experiment
+  mean is server-side, is not readable in `_runner.py`, and **nothing here has measured
+  it**; the intent is "no data", and if it renders as a 0 this trades a false pass for a
+  false failure, which is better and still wrong. And the guard checks the ONE output
+  key its caller grades, not "any harness key": the any-key form let a row holding just
+  a `response` reach `mutations_require_approval` and collect the same vacuous 1 it was
+  written to stop, one level down. A guard justified by what the fixtures happen to
+  contain is a guard bent to suit its tests.
 - **`_coverage_score(0, N)` returned 1.0 for every N** — the landing pad for the two
   above. A grade whose count was truncated away hit `.get(...) or 0`, and a zero total
   scored vacuously perfect: the *most* truncated grade scored 100%. Both ends are
@@ -1462,7 +1470,13 @@ not being enforced for the evaluators themselves.
   `/memories/pricing.md` scored a `persists_findings` pass for having written it. Split
   into `WRITE_TOOLS`: `delete` must stay in `proposed_mutations` (it is the only gated
   tool that destroys data) but must never reach `proposed_writes`. The two lists answer
-  different questions and had been sharing one.
+  different questions and had been sharing one. **`WRITE_TOOLS` and `NON_WRITE_TOOLS`
+  must PARTITION `MUTATING_TOOLS`**, which is the second half of the fix and was missing
+  from the first: a hand-curated subset with nothing pinning it is exactly how `delete`
+  slipped in, so leaving the new list unguarded would have reopened the same hole facing
+  the other way — a content-adding tool from a future upgrade silently scoring 0 on
+  `persists_findings` for a run that really did persist. Same shape as `READ_ONLY_TOOLS`
+  in `test_agent_wiring.py`: unknown has to be classified by a person.
 - **A search that errored counted as research.** A `ToolMessage` is recorded for every
   call that ran, failed or not — right for the trajectories, wrong for
   `searched_the_web`, which asks whether the agent researched or answered out of the
@@ -1480,6 +1494,16 @@ not being enforced for the evaluators themselves.
   is the new metric, and `UNCLEAN_STOPS` is **derived from** `cli._SILENT_STOPS` rather
   than copied beside it — that table is already compared against
   `anthropic.types.StopReason` by set equality, so an SDK bump reaches the eval too.
+  Its test names `_SILENT_STOPS.keys()` rather than asserting a subset, because a subset
+  holds for a hand-copy listing today's members — and, the sharper case, if that table
+  were ever refactored from `dict[str, StopNote]` to a collection of `StopNote`s,
+  `frozenset(...)` would yield objects, every membership test would be False, this
+  metric would return 1 forever, and a subset assertion would still pass because both
+  sides changed together. Note also that **`stop_reasons` counts EMISSIONS, not
+  generations**: the middleware re-emits the proposing AIMessage on every resume round,
+  so one `end_turn` genuinely appears twice. The verdict therefore reads the SET, and
+  the comment must never report a count — it did, briefly, announcing one generation
+  as two.
 - **A duplicated question was invisible to the pre-spend gate.** Question text is the
   dataset's only cross-side identity and nothing enforced uniqueness, so a second copy
   collapsed in `_by_question` — the map both `drift()` and `sync()` are built on —
@@ -1495,6 +1519,22 @@ fixture happened to put the tool first, so "before the first research action" an
 "anywhere in the trajectory" were indistinguishable. All twelve new guards were
 verified by breaking the source and watching the matching test go red; that script is
 the only reason this list is trustworthy rather than plausible.
+
+**A code review of the fixes above found seven more, which is the third lesson.** A
+pass that hardens an instrument is itself an instrument, and it was wrong in the same
+way twice over: `_ungradable` originally accepted *any* harness key (letting a
+prose-only row collect the vacuous pass one level down), `WRITE_TOOLS` shipped as an
+unpinned hand-curated subset (the exact shape that let `delete` in), the new
+`UNCLEAN_STOPS` test asserted a subset that a hand-copy satisfies, the emission list
+was reported as a generation count, and the second judge's `_graded` path — including
+its `count_key` literal, a typo in which would silently make the metric a permanent
+non-verdict across a paid sweep — had no test at all. Two claims also had to be walked
+back rather than fixed: `score=None` being excluded from the aggregate was asserted
+from a type signature and is still unmeasured, and the import-cost objection to
+`from deep_research.cli import _SILENT_STOPS` did not survive checking — `evals.harness`
+refuses at the repo root with or without it, so that edge causes nothing; it costs
+~0.4 s of import time inside a sweep measured in minutes. Nine further guards, all
+verified red by breaking the source.
 
 ## Extending it (where things go)
 

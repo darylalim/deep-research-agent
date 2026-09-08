@@ -77,6 +77,21 @@ MUTATING_TOOLS = ("write_file", "edit_file", "delete", "execute")
 # not inferred from the name.
 WRITE_TOOLS = ("write_file", "edit_file")
 
+# Mutating tools that deliberately do NOT add content, so a path they touch must never
+# reach `proposed_writes`. Spelled out rather than inferred as "the rest", so that a
+# tool arriving from a deepagents upgrade has to be CLASSIFIED by a person instead of
+# silently defaulting either way — the same shape as `READ_ONLY_TOOLS` in
+# `test_agent_wiring.py`, and for the same reason. Defaulting to "write" reopens the
+# `delete` false positive; defaulting to "not a write" gives a content-adding tool a
+# silent false NEGATIVE on `persists_findings`, which is worse for being invisible.
+NON_WRITE_TOOLS = ("delete", "execute")
+
+# The key `research()` adds beside `TurnRecorder.actions()`. A constant so the
+# evaluators' `_COMPLETED_RUN_KEYS` can be checked against BOTH halves of what a
+# completed run carries, rather than deriving the recorder half and hand-stating this
+# one — which is the half that would then drift unnoticed.
+RESPONSE_KEY = "response"
+
 
 def ensure_isolated_state_dir(state_dir: Path) -> None:
     """Refuse to run evals against — or anywhere *above* — the agent's real state.
@@ -251,12 +266,25 @@ class TurnRecorder:
             # is otherwise *completely* invisible, since its `task` result simply comes
             # back thin and the orchestrator synthesizes around the hole.
             #
-            # Not deduped, and it does not need to be. `turn_stopped_cleanly` asks
-            # whether ANY stop this turn was unclean, so a re-emitted AIMessage changes
-            # no verdict — and the ids that would key a dedupe are the unreliable ones
-            # this file warns about everywhere else (`BaseMessage.id` is optional and
-            # is regenerated on replay). Better a list with repeats than a seen-set that
-            # silently matches nothing.
+            # NOT DEDUPED, AND IT CANNOT HONESTLY BE. `HumanInTheLoopMiddleware`
+            # re-emits the proposing AIMessage on every resume round, so this list
+            # really does repeat — measured: one generation, two entries. The ids that
+            # would key a dedupe are the unreliable ones this file warns about
+            # everywhere else (`BaseMessage.id` is optional and is regenerated on
+            # replay), and deduping on the VALUE would erase a genuine second
+            # generation that stopped the same way. So the repeats are kept, and
+            # `turn_stopped_cleanly` reads the SET — which is why it must never report
+            # a count of these as a count of generations.
+            #
+            # Nor is `cli.ActivityFeed`'s `RemoveMessage` guard needed here, though the
+            # rule that motivates it is real: `PatchToolCallsMiddleware.before_agent`
+            # replays an entire thread on the turn after one abandoned at an approval
+            # prompt, and every message in that replay is an `ai` or `tool` message this
+            # would happily absorb. It cannot reach this recorder, because `research()`
+            # runs exactly ONE turn per thread and `_reset_state()` drops the checkpoint
+            # database before it — so there is never a prior turn to replay. A guard
+            # here would be unreachable code with an unfailable test. If this harness
+            # ever runs two turns on one thread, add it first.
             reason = (getattr(message, "response_metadata", None) or {}).get(
                 "stop_reason"
             )
@@ -391,4 +419,4 @@ def research(inputs: dict[str, Any]) -> dict[str, Any]:
         # been shown. Any other definition makes the citation metrics fiction.
         final_state = agent.get_state(config).values
 
-    return {"response": render_turn(final_state), **recorder.actions()}
+    return {RESPONSE_KEY: render_turn(final_state), **recorder.actions()}

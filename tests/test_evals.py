@@ -27,8 +27,10 @@ from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
     _COMPLETED_RUN_KEYS,
     ALL_EVALUATORS,
+    CODE_EVALUATORS,
     UNCLEAN_STOPS,
     _coverage_score,
+    answers_the_question,
     checks_memory_first,
     claims_are_cited,
     delegates_breadth,
@@ -42,6 +44,9 @@ from evals.evaluators import (
 from evals.harness import (
     LIVE_STATE_DIR,
     MUTATING_TOOLS,
+    NON_WRITE_TOOLS,
+    RESPONSE_KEY,
+    WRITE_TOOLS,
     TurnRecorder,
     _approve_all,
     _reset_state,
@@ -752,7 +757,7 @@ def test_the_completed_run_keys_match_what_the_recorder_emits():
     wrong (`cli._LS_EMPTY`, `_SILENT_STOPS`). Same remedy: build the real object and
     compare, rather than trusting the copy.
     """
-    emitted = set(TurnRecorder().actions()) | {"response"}
+    emitted = set(TurnRecorder().actions()) | {RESPONSE_KEY}
     assert emitted == set(_COMPLETED_RUN_KEYS), (
         "harness.TurnRecorder.actions() and evaluators._COMPLETED_RUN_KEYS have "
         f"drifted: recorder-only {sorted(emitted - set(_COMPLETED_RUN_KEYS))}, "
@@ -908,7 +913,23 @@ def test_an_api_stop_is_reported_as_a_stop_and_not_as_a_bad_answer():
             "model", AIMessage("done", response_metadata={"stop_reason": "end_turn"})
         ),
     )
-    assert turn_stopped_cleanly({"outputs": clean.actions()}, {})["score"] == 1
+    graded_clean = turn_stopped_cleanly({"outputs": clean.actions()}, {})
+    assert graded_clean["score"] == 1
+    # And it must not report a count: `stop_reasons` counts EMISSIONS, and the
+    # middleware re-emits the proposing AIMessage on every resume round, so one
+    # generation was being announced as two.
+    clean.absorb(
+        ORCHESTRATOR,
+        _updates(
+            "HumanInTheLoopMiddleware.after_model",
+            AIMessage("done", response_metadata={"stop_reason": "end_turn"}),
+        ),
+    )
+    assert clean.actions()["stop_reasons"] == ["end_turn", "end_turn"]
+    assert (
+        "2 generation"
+        not in turn_stopped_cleanly({"outputs": clean.actions()}, {})["comment"]
+    )
 
     refused = TurnRecorder()
     refused.absorb(
@@ -929,9 +950,17 @@ def test_every_stop_the_cli_calls_silent_is_also_graded_as_unclean():
     to keep true by hand — and this repo has already missed exactly that once, when
     `model_context_window_exceeded` arrived in anthropic 0.120.
     """
-    assert set(_SILENT_STOPS) <= UNCLEAN_STOPS
-    # …plus the one that is not silent: prose that trails off mid-sentence.
-    assert "max_tokens" in UNCLEAN_STOPS
+    # `.keys()` rather than `set(_SILENT_STOPS)`, deliberately. A subset assertion is
+    # satisfied by a hand-copy that happens to list today's members, so it does not pin
+    # the property this docstring claims. Worse, if `_SILENT_STOPS` were ever refactored
+    # from `dict[str, StopNote]` to a collection of StopNote objects, `frozenset(...)`
+    # would yield StopNotes, every `stop in UNCLEAN_STOPS` would be False,
+    # `turn_stopped_cleanly` would return 1 forever — and a subset assertion would still
+    # pass, because both sides changed together. Naming `.keys()` is what goes red there.
+    assert set(_SILENT_STOPS.keys()) | {"max_tokens"} == UNCLEAN_STOPS
+    assert all(isinstance(stop, str) for stop in UNCLEAN_STOPS)
+    # The members themselves are deliberately NOT written down — that list grows with
+    # the SDK, and a copy of it here is one more thing to keep true by hand.
     assert "end_turn" not in UNCLEAN_STOPS
 
 
@@ -1091,3 +1120,114 @@ def test_a_judge_grade_with_no_count_cannot_collect_a_vacuous_perfect_score(
     graded = claims_are_cited({"outputs": {"response": "a report"}}, {"outputs": {}})
     assert graded["score"] is None
     assert "substantive_claims" in graded["comment"]
+
+
+def test_the_write_tools_are_a_classified_subset_of_the_mutating_ones():
+    """The mirror of `test_the_evals_mutation_list_covers_every_gated_tool`.
+
+    That test forces `MUTATING_TOOLS` to cover `GATED_TOOLS`, so a tool arriving from a
+    deepagents upgrade — exactly how `delete` arrived in 0.7 — lands in both lists under
+    a red test. Nothing then classified it as content-adding or not, and defaulting
+    either way is a silent mis-grade: as a write it reopens the `delete` false positive
+    (`persists_findings` credits a destroyed note); as a non-write a genuinely
+    content-adding tool gives a false NEGATIVE, scoring 0 on a run that *did* persist.
+
+    Requiring the two lists to PARTITION `MUTATING_TOOLS` is what makes the choice a
+    person's. The same shape as `READ_ONLY_TOOLS` in `test_agent_wiring.py`.
+    """
+    assert set(WRITE_TOOLS) <= set(MUTATING_TOOLS)
+    assert set(WRITE_TOOLS) | set(NON_WRITE_TOOLS) == set(MUTATING_TOOLS), (
+        "every mutating tool must be classified as adding content or not — "
+        f"unclassified: {sorted(set(MUTATING_TOOLS) - set(WRITE_TOOLS) - set(NON_WRITE_TOOLS))}"
+    )
+    assert not set(WRITE_TOOLS) & set(NON_WRITE_TOOLS)
+
+
+@pytest.mark.parametrize("evaluator", CODE_EVALUATORS, ids=lambda f: f.__name__)
+def test_every_code_evaluator_reads_a_key_the_harness_emits(evaluator):
+    """The positive half of the `_ungradable` guard, and it is not decoration.
+
+    Each evaluator names the ONE output key it grades. A typo in that literal turns its
+    metric into a permanent non-verdict — every run "not measured", across a whole paid
+    sweep, with no test going red, because the crashed-run test expects exactly that
+    answer. Driving every evaluator against a complete (if empty) recorder output is
+    what pins each literal against a key the harness really emits.
+    """
+    outputs = {**TurnRecorder().actions(), RESPONSE_KEY: "some prose"}
+    assert evaluator({"outputs": outputs}, {"outputs": {}})["score"] is not None
+
+
+def test_the_other_judge_is_driven_through_the_same_truncation_guard(monkeypatch):
+    """`answers_the_question` shares `_graded` and had none of its tests.
+
+    Its `count_key="question_parts"` literal was never driven, so a typo there would
+    have made it a permanent non-verdict across a paid sweep with nothing going red —
+    the failure the parametrized code-evaluator test above exists to catch, one layer up
+    in the judges where that test cannot reach without a stub.
+    """
+    run = {"outputs": {"response": "a long answer"}}
+    grade = {
+        "reasoning": "One leg is missing.",
+        "question_parts": 4,
+        "unanswered_parts": [{"part": "the second half"}],
+    }
+
+    monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(_judge_reply(grade)))
+    assert answers_the_question(run, {"outputs": {}})["score"] == pytest.approx(3 / 4)
+
+    monkeypatch.setattr(
+        "evals.evaluators.JUDGE", _StubJudge(_judge_reply(grade, "max_tokens"))
+    )
+    assert answers_the_question(run, {"outputs": {}})["score"] is None
+
+    # …and the `count_key` literal itself: a grade with no part count is refused.
+    monkeypatch.setattr(
+        "evals.evaluators.JUDGE", _StubJudge(_judge_reply({"reasoning": "x"}))
+    )
+    refused = answers_the_question(run, {"outputs": {}})
+    assert refused["score"] is None
+    assert "question_parts" in refused["comment"]
+
+
+def test_a_contradictory_grade_never_prints_a_negative_claim_count(monkeypatch):
+    """What the `max(total, len(misses))` floors are actually for.
+
+    `_coverage_score` clamps the score at 0.0 either way, so the floors change no
+    number — which makes them look like dead belt-and-braces. They are not: without
+    them a judge reporting 3 claims and 5 misses prints "-2/3 claims cited", a comment
+    that reads as a bug in the evaluator rather than as an incoherent grade.
+    """
+    monkeypatch.setattr(
+        "evals.evaluators.JUDGE",
+        _StubJudge(
+            _judge_reply(
+                {
+                    "reasoning": "contradictory",
+                    "substantive_claims": 3,
+                    "uncited_claims": [{"claim": str(i)} for i in range(5)],
+                }
+            )
+        ),
+    )
+    graded = claims_are_cited({"outputs": {"response": "prose"}}, {"outputs": {}})
+    assert graded["score"] == 0.0
+    assert graded["comment"].startswith("0/5 claims cited")
+
+
+def test_a_run_missing_ONLY_this_metrics_observation_is_not_graded():
+    """The guard checks the caller's key, not "any harness key" — and that is the point.
+
+    The first version of `_ungradable` asked whether the run carried *some* completed-run
+    key, which a row holding just a `response` satisfies. `mutations_require_approval`
+    then read `proposed_mutations=[]`, hit its vacuous branch, and scored a clean 1 on
+    the safety invariant for a run whose mutations were never observed — the same free
+    pass the guard was added to close, surviving one level down. The docstring even
+    justified the weaker form by pointing at these fixtures, which is production
+    semantics bent to suit a test.
+    """
+    prose_only = {"outputs": {"response": "an answer, and no recorded actions"}}
+    assert mutations_require_approval(prose_only, {})["score"] is None
+    assert persists_findings(prose_only, {})["score"] is None
+    assert searched_the_web(prose_only, {})["score"] is None
+    # …while the metric that really does only need the prose still grades it.
+    assert response_cites_sources(prose_only, {})["score"] == 0

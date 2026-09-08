@@ -64,14 +64,21 @@ URL = re.compile(r"https?://[^\s)\]>,]+")
 UNCLEAN_STOPS = frozenset(_SILENT_STOPS) | {"max_tokens"}
 
 # Every key a COMPLETED run carries: all of `harness.TurnRecorder.actions()`, plus the
-# `response` that `research()` adds beside it.
+# `response` that `research()` adds beside it. This is the module's declaration of what
+# a finished run looks like; `_ungradable` checks the ONE key its caller needs, not this
+# whole set (see its docstring for why the any-key form was wrong).
 #
-# Written out rather than imported because `evals.harness` refuses to import at all
-# unless the state dir is already isolated, and an evaluator has no business requiring
-# that. So it is a hand-copy — and hand-copies in this repo get compared against the
-# real thing rather than trusted: `test_the_completed_run_keys_match_what_the_recorder_emits`
-# builds an actual `TurnRecorder` and asserts set equality, the same way `cli._LS_EMPTY`
-# is checked against deepagents' real formatter.
+# Written out rather than imported from `evals.harness`, which refuses to import at all
+# unless the state dir is already isolated — a precondition an evaluator has no business
+# carrying. Note the distinction, since the `deep_research.cli` import above blurs it:
+# importing `cli` freezes `config.STATE_DIR` at whatever the environment says, which is
+# harmless; importing `harness` *raises* unless that value is a throwaway, which is not.
+#
+# So it is a hand-copy, and hand-copies here get compared against the real thing rather
+# than trusted — `test_the_completed_run_keys_match_what_the_recorder_emits` builds an
+# actual `TurnRecorder` and imports `harness.RESPONSE_KEY` for the other half, so
+# NEITHER half is asserted against itself. Same treatment as `cli._LS_EMPTY` against
+# deepagents' real formatter.
 _COMPLETED_RUN_KEYS = frozenset(
     {
         "response",
@@ -133,17 +140,32 @@ def _inputs(record: Any) -> dict[str, Any]:
 def _not_measured(reason: str) -> dict[str, Any]:
     """A non-verdict: this metric has no reading, as distinct from a bad one.
 
-    `score=None` is a legal `SCORE_TYPE` (`langsmith/schemas.py`:
-    `Union[StrictBool, StrictInt, StrictFloat, None]`) and is left OUT of the
-    experiment's aggregate — which is the wanted semantics exactly. A 0 would say the
-    agent failed; a 1 would say it passed; neither is true when nothing was observed,
-    and both corrupt the mean that a sweep is read from.
+    `score=None` is a legal `SCORE_TYPE` — `langsmith/schemas.py` line 33,
+    `Union[StrictBool, StrictInt, StrictFloat, None]` — so the feedback is accepted and
+    carries its comment. **What has NOT been verified here is how LangSmith aggregates
+    it**, and the distinction matters enough to write down: the intent is that a
+    non-verdict is excluded from the experiment mean rather than counted, but that
+    happens server-side, `langsmith/evaluation/_runner.py` contains no local handling of
+    a `None` score to read, and nothing in this repo measures it. If it turns out to
+    render as a 0, a crashed run swaps a false pass for a false failure — better, but
+    still wrong, and this docstring is where to record the number once someone has one.
+
+    What IS certain is that the old behaviour was wrong in the worst direction: a 1 on
+    every vacuous branch said the agent *passed* a check that was never run.
     """
     return {"score": None, "comment": f"not measured — {reason}"}
 
 
-def _ungradable(run: Any) -> str:
-    """Why this run carries no observations at all, or `''` if it does.
+def _ungradable(run: Any, observation: str) -> str:
+    """Why this metric has nothing to read on this run, or `''` if it has.
+
+    `observation` is the output key the CALLER needs — not any key, and that is the
+    whole point. An earlier version asked only whether the run carried *some* harness
+    key, which let a row holding just a `response` reach `mutations_require_approval`,
+    return "no mutation proposed — nothing to approve", and score a clean 1 on the
+    safety invariant, for a run whose mutations were never observed. That is the same
+    vacuous pass this guard was added to close, surviving one level down. Each
+    evaluator therefore names the observation it actually grades.
 
     **A run whose target CRASHED is still handed to every evaluator.**
     `langsmith/evaluation/_runner.py::_forward` catches the exception, logs it, and
@@ -160,19 +182,23 @@ def _ungradable(run: Any) -> str:
     mutation proposed — nothing to approve" and scored **1**. The one invariant this
     repo calls silent and unrecoverable reported a clean pass on a run that never ran.
 
-    Keyed on the presence of the harness's own keys rather than on any single one,
-    because the tests build partial `outputs` on purpose (one evaluator's key, nothing
-    else) and a completed run always carries several. `run.error` is checked first and
-    is the authoritative signal; the key test is what catches a row that failed without
-    one.
+    `run.error` is checked first and is the authoritative signal; the missing-key test
+    is what catches a row that failed without one, or one recorded before the harness
+    emitted this observation at all.
+
+    A typo in an `observation` literal turns its metric into a permanent non-verdict
+    across a whole paid sweep, which is why every evaluator is driven in the *scoring*
+    direction too — see `test_every_code_evaluator_reads_a_key_the_harness_emits`. A
+    guard nothing exercises positively is a guard that can silently answer "no data"
+    forever.
     """
     error = getattr(run, "error", None)
     if error is None and isinstance(run, dict):
         error = run.get("error")
     if error:
         return f"the target raised: {error}"
-    if not _COMPLETED_RUN_KEYS & set(_outputs(run)):
-        return "the run produced no outputs"
+    if observation not in _outputs(run):
+        return f"the run recorded no {observation}"
     return ""
 
 
@@ -197,11 +223,12 @@ def plans_with_todos(run: Any, example: Any) -> dict[str, Any]:
     """
     # Before the exemption, deliberately: a crashed run must not collect the pass that
     # `expects_plan=False` hands out. Same ordering in every evaluator below.
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "orchestrator_trajectory"):
         return _not_measured(reason)
-    trajectory = _outputs(run).get("orchestrator_trajectory", [])
     if not _outputs(example).get("expects_plan", True):
         return {"score": 1, "comment": "single lookup — no plan required"}
+
+    trajectory = _outputs(run).get("orchestrator_trajectory", [])
 
     start = _first_research_index(trajectory)
     planned = "write_todos" in trajectory[:start]
@@ -217,7 +244,7 @@ def plans_with_todos(run: Any, example: Any) -> dict[str, Any]:
 
 def checks_memory_first(run: Any, example: Any) -> dict[str, Any]:
     """SYSTEM_PROMPT step 2: look in `/memories/` before researching from scratch."""
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "orchestrator_trajectory"):
         return _not_measured(reason)
     trajectory = _outputs(run).get("orchestrator_trajectory", [])
     start = _first_research_index(trajectory)
@@ -267,7 +294,7 @@ def delegates_breadth(run: Any, example: Any) -> dict[str, Any]:
     now also *fail* an agent that behaved correctly. The recorder has to count real
     events, and this is a second, opposite reason why.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "orchestrator_trajectory"):
         return _not_measured(reason)
     trajectory = _outputs(run).get("orchestrator_trajectory", [])
     outputs = _outputs(example)
@@ -312,7 +339,7 @@ def searched_the_web(run: Any, example: Any) -> dict[str, Any]:
     another: which namespace a failure happened in is not recorded, so "N of them
     inside a subagent" would be arithmetic nobody can check.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "trajectory"):
         return _not_measured(reason)
     outputs = _outputs(run)
     failed = outputs.get("failed_tools", []).count("tavily_search")
@@ -337,7 +364,7 @@ def persists_findings(run: Any, example: Any) -> dict[str, Any]:
     `/memories/` is routed to the Store, so an approved memory write leaves
     `state["files"]` empty — measured.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "proposed_writes"):
         return _not_measured(reason)
     if not _outputs(example).get("expects_persist", True):
         return {"score": 1, "comment": "ephemeral finding — persisting not required"}
@@ -393,7 +420,7 @@ def mutations_require_approval(run: Any, example: Any) -> dict[str, Any]:
     # The vacuous "nothing to approve" branch below is why this guard is not optional
     # here: a crashed run proposes nothing either, and scored a clean 1 on the one
     # invariant whose failure this repo calls silent and unrecoverable.
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "proposed_mutations"):
         return _not_measured(reason)
     outputs = _outputs(run)
     proposed = Counter(outputs.get("proposed_mutations", []))
@@ -421,7 +448,7 @@ def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
     wrote down. A report saved to a file with the URLs in it does not count: the
     user reading the terminal never opens that file.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "response"):
         return _not_measured(reason)
     urls = URL.findall(_outputs(run).get("response", ""))
     return {
@@ -460,14 +487,21 @@ def turn_stopped_cleanly(run: Any, example: Any) -> dict[str, Any]:
     a 1: silence means no assertion, the same rule as a missing `max_delegations`, and
     it keeps this metric readable against runs recorded before it existed.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "stop_reasons"):
         return _not_measured(reason)
     stops = _outputs(run).get("stop_reasons", [])
     unclean = sorted({stop for stop in stops if stop in UNCLEAN_STOPS})
     if not unclean:
+        # The DISTINCT stops, never `len(stops)`. That list counts emissions, not
+        # generations: `HumanInTheLoopMiddleware` re-emits the proposing AIMessage on
+        # every resume round, so one generation that ended `end_turn` was reported as
+        # "all 2 generation(s) ended normally" — measured. A number a reader cannot
+        # check is worse than no number, especially on the metric whose whole job is to
+        # say what the API did.
         return {
             "score": 1,
-            "comment": f"all {len(stops)} generation(s) ended normally",
+            "comment": "every generation ended normally"
+            + (f" ({', '.join(sorted(set(stops)))})" if stops else ""),
         }
     return {
         "score": 0,
@@ -632,7 +666,7 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
     proportion — see `_coverage_score` for why that is load-bearing rather than
     cosmetic.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "response"):
         return _not_measured(reason)
     prose = _outputs(run).get("response", "")
     if not prose.strip():
@@ -676,9 +710,9 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
         return _not_measured(refusal)
 
     uncited = grade.get("uncited_claims") or []
-    # Never fewer claims than the judge just listed as uncited. A contradictory grade
-    # (or one whose count was truncated away) must not divide its own misses out of
-    # existence — see `_coverage_score`, which holds the same line from the other side.
+    # Never fewer claims than the judge just listed as uncited. `_coverage_score` clamps
+    # the SCORE either way, so this is what keeps the COMMENT coherent: a contradictory
+    # grade of 3 claims with 5 misses would otherwise print "-2/3 claims cited (0%)".
     total = max(grade.get("substantive_claims") or 0, len(uncited))
     score = _coverage_score(total, len(uncited))
     cited = total - len(uncited)
@@ -700,7 +734,7 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
     honest caveat is not a refusal to answer, and a judge made to quote the passage
     that comes nearest to answering cannot mistake one for the other.
     """
-    if reason := _ungradable(run):
+    if reason := _ungradable(run, "response"):
         return _not_measured(reason)
     response = _outputs(run).get("response", "")
     if not response.strip():
@@ -731,9 +765,12 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
         return _not_measured(refusal)
 
     missing = grade.get("unanswered_parts") or []
-    # At least one part, and never fewer than the judge just listed as unanswered —
-    # the same guard `claims_are_cited` carries, for the same reason.
-    parts = max(grade.get("question_parts") or 1, 1, len(missing))
+    # `or 1` already floors the count at one, so the literal `1` inside `max` was a
+    # second spelling of the same guard and is gone. The `len(missing)` term is the
+    # real one, and it is not about the SCORE — `_coverage_score` clamps at 0.0 either
+    # way, so both forms return 0.0. It is about the COMMENT: without it, a judge
+    # reporting 3 parts and 5 misses prints "-2/3 of the question answered".
+    parts = max(grade.get("question_parts") or 1, len(missing))
     score = _coverage_score(parts, len(missing))
     summary = "; ".join(item.get("part", "?") for item in missing[:4])
     return {

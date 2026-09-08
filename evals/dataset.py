@@ -64,6 +64,7 @@ asserts nothing, one that the direct-path examples nonetheless have one.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any, Protocol
 
@@ -306,6 +307,16 @@ class DatasetReader(Protocol):
     def list_examples(self, *, dataset_id: Any) -> Iterable[Any]: ...
 
 
+def _question(example: Any) -> str | None:
+    """The question an uploaded example is keyed on.
+
+    One definition, because it is the dataset's entire cross-side identity: `sync()`
+    reconciles on it, `drift()` compares and counts on it, and a second spelling is a
+    second chance to get `None` handling wrong.
+    """
+    return (example.inputs or {}).get("question")
+
+
 def _by_question(rows: Iterable[Any]) -> dict[str | None, Any]:
     """Map question text -> the uploaded example.
 
@@ -318,7 +329,7 @@ def _by_question(rows: Iterable[Any]) -> dict[str | None, Any]:
     from `drift()`'s orphan list — hiding the one example a reader of this file cannot
     see at all. It surfaces as an orphan keyed `None`, which is exactly what it is.
     """
-    return {(example.inputs or {}).get("question"): example for example in rows}
+    return {_question(example): example for example in rows}
 
 
 def _remote(client: DatasetReader, dataset_id: Any) -> dict[str | None, Any]:
@@ -376,10 +387,7 @@ def drift(client: DatasetReader | None = None) -> list[str]:
     existing = _by_question(rows)
     local = {e["inputs"]["question"]: e["outputs"] for e in EXAMPLES}
 
-    uploads: dict[str | None, int] = {}
-    for row in rows:
-        question = (row.inputs or {}).get("question")
-        uploads[question] = uploads.get(question, 0) + 1
+    uploads = Counter(_question(row) for row in rows)
 
     differences = [
         f"uploaded {count} times, and `--upload` will NOT remove the extras — a sweep "
