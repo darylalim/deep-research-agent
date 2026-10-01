@@ -87,7 +87,7 @@ network means putting real auth in front of it first.
 
 ```
 create_deep_agent(
-    model         = ChatAnthropic("claude-opus-5")     # no temperature — Opus 5 rejects it
+    model         = ChatAnthropic("claude-opus-5-5")   # no temperature — Opus 5.5 rejects it
     tools         = [tavily_search]                    # orchestrator can search directly
     subagents     = [researcher]                       # …or delegate breadth via `task`
     backend       = CompositeBackend(

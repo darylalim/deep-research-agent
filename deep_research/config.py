@@ -16,11 +16,17 @@ from langchain_anthropic import ChatAnthropic
 load_dotenv()
 
 # --- Model -----------------------------------------------------------------
-# Default to Claude Opus 5, the current most-capable Opus-tier model.
-# IMPORTANT: Opus 5 rejects `temperature` / `top_p` / `top_k` with a 400 — the same
-# rule that held on Opus 4.8, and the reason no sampling parameter is set anywhere
-# in this file. `ChatAnthropic` omits those params when they are left unset.
-MODEL_NAME = os.environ.get("DEEP_RESEARCH_MODEL", "claude-opus-5")
+# Default to Claude Opus 5.5, the current Opus — same capabilities as Opus 5 at a
+# lower price ($4/$20 vs $5/$25 per MTok).
+# IMPORTANT: Opus 5.5 rejects `temperature` / `top_p` / `top_k` with a 400 — the same
+# rule that held on Opus 5 and 4.8, and the reason no sampling parameter is set
+# anywhere in this file. `ChatAnthropic` omits those params when they are left unset.
+MODEL_NAME = os.environ.get("DEEP_RESEARCH_MODEL", "claude-opus-5-5")
+# Set EXPLICITLY because Opus 5.5 moved the default down a level: it runs `medium`
+# when unset, where Opus 5 ran `high`. Swapping the model id alone would have quietly
+# made every research turn shallower. `high` keeps the depth the evals were measured
+# at, so a before/after sweep isolates the model change; move it only on eval evidence.
+EFFORT = "high"
 # 64k, not 32k, because on Opus 5 `max_tokens` now has to cover the model's THINKING
 # as well as its answer — see the `thinking` note in `build_model`. `streaming=True`
 # is what makes a ceiling this high safe.
@@ -111,6 +117,7 @@ def build_model() -> ChatAnthropic:
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
         streaming=True,
+        effort=EFFORT,
         # `display="summarized"` is REQUIRED, not cosmetic: Opus 5's default
         # ("omitted") returns thinking blocks with no `thinking` text, which then
         # cannot be replayed — and every tool result replays the assistant message

@@ -106,6 +106,16 @@ class TestBuildModel:
         )
         assert payload.get("thinking") == {"type": "adaptive", "display": "summarized"}
 
+    def test_effort_is_sent_explicitly_at_high(self) -> None:
+        # Opus 5.5 defaults to `medium` effort when none is sent — one level below
+        # Opus 5's `high` — so an unset effort would silently make every research turn
+        # shallower on the model upgrade. Assert on the request PAYLOAD, not the field:
+        # what matters is that `output_config.effort` actually reaches the API.
+        payload = config.build_model()._get_request_payload(
+            [{"role": "user", "content": "hi"}]
+        )
+        assert payload.get("output_config", {}).get("effort") == "high"
+
     def test_max_tokens_leaves_room_for_thinking_and_the_answer(self) -> None:
         # On Opus 5 `max_tokens` caps thinking PLUS the answer, and this agent's answer
         # is a long cited report. Too tight a ceiling truncates it mid-sentence with

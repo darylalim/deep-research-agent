@@ -833,7 +833,7 @@ gets exactly the silent blank line the tuple exists to prevent.
 
 ## Model constraint (real gotcha)
 
-The default model is `claude-opus-5`, built in `config.py::build_model()` **with
+The default model is `claude-opus-5-5` (at an explicit `effort="high"` — Opus 5.5 defaults to `medium`), built in `config.py::build_model()` **with
 no `temperature`/`top_p`/`top_k`** — Opus 5 returns a 400 if any sampling param
 is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
