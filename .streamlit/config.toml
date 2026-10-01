@@ -36,28 +36,82 @@ linkUnderline = true
 # load-bearing rather than decorative — a reviewer has to actually read a diff in it.
 codeFontSize = "0.85rem"
 
+# Light: the same rules as dark (below), on warm paper with ink-coloured text.
+# Teal is for action and blue for information in BOTH modes, so switching modes
+# changes how light the page is and nothing else; the approval controls don't change hue.
+#
+# - The primary is a deeper teal than dark's, for the same two-sided test: 5.47:1 for
+#   white button text, 5.24:1 against the page. On a light page the two pull the same
+#   way, so this band is wide and comfortable rather than narrow.
+# - The link teal is a shade darker than the primary (6.1:1). A citation is body text
+#   and needs the margin; a button has its own fill to stand on.
+# - Every semantic colour clears 4.5:1 on every text surface — page, secondary, code
+#   well and all three sidebar surfaces — not just the page. Red, orange and yellow
+#   were darkened a step to get there; tuned for white, they fade on warm off-white.
 [theme.light]
-primaryColor = "#4338ca"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f4f4f5"
-codeBackgroundColor = "#f4f4f5"
-textColor = "#18181b"
-linkColor = "#4338ca"
-borderColor = "#e4e4e7"
+primaryColor = "#0f766e"
+backgroundColor = "#fbfaf7"
+secondaryBackgroundColor = "#f1efea"
+codeBackgroundColor = "#f5f3ee"
+textColor = "#1f2328"
+linkColor = "#0f6b63"
+borderColor = "#ddd8cf"
+redColor = "#b8322b"
+orangeColor = "#a34d0b"
+yellowColor = "#7d6000"
+greenColor = "#1f7a46"
+blueColor = "#2457b5"
+violetColor = "#6b45c2"
+grayColor = "#5c636e"
 
+# Dark: a reading room, not a dashboard. Every pairing below was computed against WCAG,
+# not eyeballed — rerun the numbers before nudging any of them.
+#
+# - ACTION IS TEAL; INFORMATION STAYS BLUE. The primary colour paints exactly the
+#   controls that move a turn forward — the approval `segmented_control`, Send, the
+#   chat input's focus ring. `st.info` (the "Turn abandoned" notice, an approval's
+#   description) is blue. An indigo primary sat next to that blue, so "something to
+#   read" and "something to decide" looked alike at the one screen where the difference
+#   matters. Teal is also clear of red (failures) and orange (a researcher's silent stop).
+# - The primary has to pass TWO tests at once, which pins it to a narrow lightness
+#   band: white button text on it (4.71:1, need 4.5) and the control against the page
+#   (3.81:1 on background / 3.43:1 on secondary, need 3). A lighter teal reads better on
+#   its own and fails the first test. The old `#818cf8` managed only ~3:1 for its label.
+# - Off-white, warm text (`#e7e3da`, 14:1), not `#fafafa`. Reports are read for minutes
+#   at a time, and pure white on near-black glows at the edges of each letter (halation).
+# - Links are a light teal (10:1). Citations are the densest links in the app, so they
+#   have to stand out from body text by hue as well as by underline.
+# - Code wells sit BETWEEN the page and secondary surfaces, so an approval preview reads
+#   as an inset document rather than one more widget.
+# - Semantic colours are set rather than derived, because the feed relies on them:
+#   `:red[failed]`, `:orange[researcher · stop]`, and `:gray[...]` for a search that
+#   errored. That gray dims the failed search without making it hard to read (6.9:1).
 [theme.dark]
-primaryColor = "#818cf8"
-backgroundColor = "#18181b"
-secondaryBackgroundColor = "#27272a"
-codeBackgroundColor = "#27272a"
-textColor = "#fafafa"
-linkColor = "#a5b4fc"
-borderColor = "#3f3f46"
+primaryColor = "#1b8178"
+backgroundColor = "#14171c"
+secondaryBackgroundColor = "#1d2128"
+codeBackgroundColor = "#191c22"
+textColor = "#e7e3da"
+linkColor = "#6fd3c6"
+borderColor = "#2b313b"
+redColor = "#f2777a"
+orangeColor = "#f0a35e"
+yellowColor = "#e6c86e"
+greenColor = "#7cc79a"
+blueColor = "#7aa9f0"
+violetColor = "#b49cf0"
+grayColor = "#9aa1ac"
 
 [theme.light.sidebar]
-backgroundColor = "#fafafa"
-borderColor = "#e4e4e7"
+backgroundColor = "#f4f2ed"
+secondaryBackgroundColor = "#ebe8e1"
+codeBackgroundColor = "#efece6"
+borderColor = "#ddd8cf"
 
+# The sidebar holds settings and the memory browser, not the work, so it is darker
+# than the page and sinks back.
 [theme.dark.sidebar]
-backgroundColor = "#0f0f11"
-borderColor = "#27272a"
+backgroundColor = "#0f1115"
+secondaryBackgroundColor = "#181b21"
+codeBackgroundColor = "#15181d"
+borderColor = "#232830"
