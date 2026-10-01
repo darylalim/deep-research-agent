@@ -28,6 +28,7 @@ from streamlit.testing.v1 import AppTest
 
 from deep_research import turns as turns_module
 from deep_research import webui
+from deep_research.turns import FeedEvent
 
 # **Absolute, deliberately.** Streamlit 1.62 changed how `AppTest.from_file`
 # resolves a relative path: it used to be relative to the working directory (so
@@ -395,6 +396,52 @@ class TestGivingUpOnAnInterruptActuallyGivesUp:
         assert page.session_state["pending"] == []
         assert "abandoned" in (page.session_state["notice"] or "").lower()
         assert not page.chat_input[0].disabled
+
+
+class TestTheWorkLogSitsBesideTheDecision:
+    """The reviewer sees what led to an action without a click between the two.
+
+    An approval is a rerun, so the live `st.status` feed is already gone when the form
+    appears; the page replays it. It used to replay into a collapsed expander ABOVE the
+    form, because the centered layout had no room for both. Wide, it goes in a column
+    beside the form, open.
+    """
+
+    @staticmethod
+    def _feed_with(*events: FeedEvent) -> webui.StreamlitFeed:
+        feed = webui.StreamlitFeed()
+        feed.events.extend(events)
+        return feed
+
+    def test_the_log_is_drawn_open_beside_the_form(self) -> None:
+        page = _page(
+            pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
+            feed=self._feed_with(FeedEvent("search", text="opus 5 pricing")),
+        )
+
+        assert not page.exception, page.exception
+        assert len(page.columns) == 2, "work log and form are not side by side"
+        log, review = page.columns
+        # Not in an expander: the replayed search is visible with nothing to open.
+        assert not page.expander, "the work log is collapsed behind a click again"
+        assert any("opus 5 pricing" in m.value for m in log.markdown)
+        # The decision controls are in the OTHER column, so the two really are beside
+        # each other rather than both stacked into the first.
+        assert review.button_group, "the decision controls left the review column"
+        assert not log.button_group
+
+    def test_an_empty_log_leaves_the_form_full_width(self) -> None:
+        # A recovered approval (fresh tab, restart) has a new, empty feed. Splitting the
+        # screen for it would strand the form in three-fifths of the page beside a box
+        # with nothing in it.
+        page = _page(
+            pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
+            feed=webui.StreamlitFeed(),
+        )
+
+        assert not page.exception, page.exception
+        assert not page.columns
+        assert page.button_group, "the approval form did not render at all"
 
 
 class TestTheApprovalScreenIsEscapable:

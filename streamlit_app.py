@@ -51,11 +51,21 @@ from deep_research.turns import (
     thread_sections,
 )
 
+# WIDE, because "centered" caps the page at ~730px whatever the display: at 1920px it
+# used ~40% of the width, squeezed a report's comparison tables into a horizontal scroll,
+# and clipped the approval preview a reviewer is meant to read in full. A capped,
+# centered reading column was tried and rejected — `st.chat_input` is bottom-pinned and
+# takes no alignment, so the input sat visibly off-axis from the transcript above it.
 st.set_page_config(
     page_title="Deep research agent",
     page_icon=":material/travel_explore:",
-    layout="centered",
+    layout="wide",
 )
+
+# The approval screen's work log scrolls inside this height rather than pushing the
+# decision controls below the fold. Streamlit advises against scroll areas much taller
+# than 500px, which on a phone (where the two columns stack) would trap the page scroll.
+WORK_LOG_HEIGHT_PX = 480
 
 # --- credentials -------------------------------------------------------------------
 # Checked up front rather than failing later, inside a turn, with an opaque 401.
@@ -310,15 +320,23 @@ def approval_panel() -> None:
     entirely.
     """
     with st.chat_message("assistant"):
-        # The work this turn already did, above the thing it is asking permission for.
+        st.markdown("**The agent is waiting on you.**")
+        # The work this turn already did, BESIDE the thing it is asking permission for.
         # Not decoration: an approval is a rerun, and a rerun discards everything the
         # `st.status` box drew — so without this replay the reviewer decides whether to
         # allow a `write_file` having just lost sight of every search that produced it.
-        # Collapsed, because the proposed action is what they are here to read.
+        #
+        # Side by side, open, now that the page is wide. In the centered layout it was a
+        # collapsed expander above the form, since there was no room to show both; that
+        # left the evidence one click away from the decision it bears on. Below 640px the
+        # columns stack, which puts the log back above the form — the old order.
         if st.session_state.feed and st.session_state.feed.events:
-            with st.expander("Work log", icon=":material/manage_search:"):
+            log, review = st.columns([2, 3], gap="medium")
+            with log.container(border=True, height=WORK_LOG_HEIGHT_PX):
+                st.caption(":material/manage_search: Work log")
                 st.session_state.feed.replay()
-        st.markdown("**The agent is waiting on you.**")
+        else:
+            review = st.container()
 
         def abandon() -> None:
             """Draw the escape hatch, and take it if it is clicked.
@@ -364,9 +382,11 @@ def approval_panel() -> None:
             # click per run, and app-scoped even from inside this fragment.
             st.rerun()
 
-        if decisions := webui.approval_form(
-            st.session_state.pending, secondary_action=abandon
-        ):
+        with review:
+            decisions = webui.approval_form(
+                st.session_state.pending, secondary_action=abandon
+            )
+        if decisions:
             # A rejected call reaches the stream as a ToolMessage with `status="error"`
             # carrying the human's own reason, so nothing downstream can tell a rejection
             # from a crash. Tell the feed, or it reports an honoured decision as a bug.

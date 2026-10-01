@@ -510,7 +510,13 @@ Two things follow that are easy to get wrong:
   replays them too**. Found live: an approval is a rerun, so the `st.status` box is
   gone by the time the form appears, and the first build asked the reviewer to allow a
   `write_file` having just lost sight of every search that produced it. The gate is
-  only worth having if the person at it can see what led there.
+  only worth having if the person at it can see what led there. It replays into a
+  bounded-height column **beside** the form, open — the page is `layout="wide"` for
+  this and for a report's tables, after "centered" was measured using ~40% of a
+  1920px display. A capped, centered reading column was tried and rejected, because
+  the bottom-pinned `st.chat_input` takes no alignment and sat off-axis from it.
+  `TestTheWorkLogSitsBesideTheDecision` pins the split, and that an empty feed (a
+  recovered approval) does not split the screen for nothing.
 - **The answer still comes from the checkpoint.** The transcript is
   `thread_sections(agent.get_state(config).values)` — the shared half of `render_thread`,
   which the export button and `evals/harness.py` also use. Building bubbles from stream
