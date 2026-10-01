@@ -99,6 +99,10 @@ dev = [
     # is an install that bypasses the lock. Capping a `0.0.x` tool at its real breaking
     # boundary would mean `<0.0.64` and an edit per release, which buys churn, not safety.
     "ty>=0.0.63",
+    # Lets `streamlit run` reload on save through native file-system events instead of
+    # polling (it prints a "for better performance, install watchdog" hint without it).
+    # Dev-only: the app behaves the same either way, and it is not a runtime dependency.
+    "watchdog>=6.0.0",
 ]
 
 # The single source of the project's version: hatchling greps this file for a
