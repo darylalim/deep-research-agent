@@ -270,6 +270,16 @@ class TestAQuestionCannotSlipPastATurnInFlight:
     turns a swallowed question into a notice rather than a silent drop. So the two tests
     split what each can honestly prove — the invariant through the real widget, the
     branch through a stubbed one.
+
+    **Streamlit 1.64 then closed it a second time, in the test harness.** `AppTest`'s
+    `Widget.set_value` now calls `_assert_can_interact` and raises `AppTestError` on a
+    disabled widget ("A browser user cannot interact with a disabled widget"), so the
+    first test went red on that upgrade too — again with the page behaving correctly.
+    It now assigns `_value` directly, which skips only that client-side refusal:
+    `_widget_state` still ships the value to the server on `.run()`. That is a closer
+    model of the case this class exists for than `set_value` ever was — a value that
+    reaches the server for a widget the user could not have typed into — and it keeps
+    the test on the real widget path rather than collapsing it into the stubbed one.
     """
 
     def test_a_queued_question_never_disturbs_the_turn_in_flight(self) -> None:
@@ -278,11 +288,13 @@ class TestAQuestionCannotSlipPastATurnInFlight:
             pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
             feed=webui.StreamlitFeed(),
         )
-        assert page.chat_input[0].disabled, (
-            "precondition: the input is already disabled"
-        )
+        chat = page.chat_input[0]
+        assert chat.disabled, "precondition: the input is already disabled"
 
-        page.chat_input[0].set_value("a brand new question").run()
+        # Not `set_value`: since 1.64 that refuses a disabled widget in the harness,
+        # before the value could reach the page. See the class docstring.
+        chat._value = "a brand new question"
+        page.run()
 
         assert not page.exception, page.exception
         assert page.session_state["payload"] is None, (

@@ -774,6 +774,14 @@ return a value — reproducing what 1.57-1.61 do — because without the stub it
 on an empty branch, every assertion satisfied by Streamlit having dropped the value
 rather than by the guard. That is this file's recurring failure mode, one version later.
 
+**Streamlit 1.64 closed it again, in `AppTest` itself.** `Widget.set_value` now raises
+`AppTestError` on a disabled widget, so the real-widget test went red on that upgrade
+with the page behaving correctly. It now assigns `chat_input[0]._value` directly, which
+skips only that client-side refusal: the value still ships to the server, where 1.62's
+`disabled` enforcement discards it. Verified that this is a real delivery rather than a
+no-op — the same assignment reaches the script when the input is enabled. Do not
+"fix" it back to `set_value`, and do not fold it into the stubbed test.
+
 **Do not over-trust it on the fragments.** Measured: interacting with a widget *inside* a
 fragment makes `AppTest` re-run the whole app rather than simulating a fragment-scoped
 rerun. That is convenient — every pre-existing assertion kept working when the memory
