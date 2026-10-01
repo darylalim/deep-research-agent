@@ -8,4 +8,4 @@ cross-session memory, and gates file writes behind human approval.
 Run it: `streamlit run streamlit_app.py` (the page lives at the repo root).
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
