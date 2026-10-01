@@ -1,57 +1,30 @@
 # Deep Research Agent
 
-A **deep research agent** built with [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
-(LangChain 1.0 + LangGraph), served as a [Streamlit](https://streamlit.io) app. Ask it a
-research question; it plans the work, delegates focused web searches to a subagent,
-synthesizes a cited answer, keeps durable findings across sessions, and asks for your
-approval before writing files.
+A research agent built on [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
+(LangChain 1.0 + LangGraph) and served as a [Streamlit](https://streamlit.io) app.
 
-## What's wired up
+Ask it a question and it will:
 
-| Capability | How | Where |
-| --- | --- | --- |
-| **Planning** | `write_todos`, via langchain's `TodoListMiddleware` | — |
-| **Web search** | Tavily (`tavily_search`) | `deep_research/tools.py` |
-| **Subagent orchestration** | A `researcher` subagent, delegated to via the `task` tool | `deep_research/subagents.py` |
-| **Persistent memory** | `SqliteStore` behind a `/memories/` route (cross-session) | `deep_research/agent.py` |
-| **Durable thread state + interrupts** | `SqliteSaver` checkpointer (survives restarts) | `deep_research/agent.py` |
-| **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `delete` / `execute` | `deep_research/agent.py` + `turns.py` |
-| **The app** | Streamlit chat with a live work log and in-page approvals | `streamlit_app.py` + `deep_research/webui.py` |
-| **Observability** | LangSmith tracing via env vars | `.env` |
-
-### The persistence model (two layers)
-
-Deep Agents separates two kinds of state, and this project uses a disk-backed
-option for each so **everything survives a restart** with no database server:
-
-- **Checkpointer (`SqliteSaver`)** — the conversation, todo list, and any
-  *pending* approval for a given `thread_id`. Stored in
-  `.deep_research/checkpoints.sqlite`.
-- **Store (`SqliteStore`)** — long-term memory shared across every thread.
-  A `CompositeBackend` routes only the `/memories/` path prefix here; all other
-  agent files stay in the ephemeral (but checkpointed) per-thread state. Stored
-  in `.deep_research/memories.sqlite`.
-
-So a fact the agent writes to `/memories/topic.md` in one session is readable in
-the next; a scratch draft it writes to `/report.md` lives only in that thread.
+1. Plan the work as a todo list.
+2. Check its long-term memory for earlier findings.
+3. Search the web itself, or hand sub-questions to parallel `researcher` subagents.
+4. Write a report with inline citations.
+5. Ask for your approval before saving anything to memory.
 
 ## Setup
 
-Requires **Python ≥ 3.11** and [uv](https://docs.astral.sh/uv/).
+Requires **Python 3.11+** and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# 1. Install dependencies into a local venv
-uv sync
-
-# 2. Provide credentials
-cp .env.example .env
-# then edit .env and fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
-# (LangSmith keys are optional but recommended)
+uv sync                 # install dependencies into ./.venv
+cp .env.example .env    # then fill in your keys
 ```
 
-Keys you need:
-- `ANTHROPIC_API_KEY` — Claude model access ([console.anthropic.com](https://console.anthropic.com))
-- `TAVILY_API_KEY` — web search, free tier available ([app.tavily.com](https://app.tavily.com))
+| Key | Required | Purpose |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | Yes | Claude model access ([console.anthropic.com](https://console.anthropic.com)) |
+| `TAVILY_API_KEY` | Yes | Web search, free tier available ([app.tavily.com](https://app.tavily.com)) |
+| `LANGSMITH_API_KEY` | No | Tracing, and required to run `evals/` ([smith.langchain.com](https://smith.langchain.com)) |
 
 ## Run
 
@@ -59,73 +32,55 @@ Keys you need:
 uv run streamlit run streamlit_app.py   # http://localhost:8501
 ```
 
-Ask a question in the chat box. While the agent works you watch its plan, each
-delegated sub-question, and every search query appear live; when it finishes, the cited
-answer lands in the transcript with that work log collapsed above it.
+- **Live work log.** As the agent works you see its plan, each delegated sub-question, and
+  every search query. The finished answer appears with the log collapsed above it.
+- **Approvals.** When the agent wants to write, edit or delete a file, the turn pauses and
+  shows the full proposed change. Choose **Approve**, **Edit**, **Reject** (with an optional
+  reason) or **Respond**. Nothing is preselected, and invalid edit JSON is never treated as
+  approval. **Abandon this turn** is always available.
+- **Sidebar.** Switch threads, export the thread as Markdown, and browse durable memory.
 
-When the agent wants to write a file, the turn pauses and an approval card shows the
-**full** proposed content. You pick **Approve**, **Edit** (prefilled with the real
-arguments, so narrowing a path is an edit rather than a retype), **Reject** (with an
-optional reason for the agent), or **Respond** (answer on the tool's behalf). Nothing is
-preselected, and unparsable edit JSON is never treated as approval. **Abandon this
-turn** is always available as a way out.
+Threads and pending approvals are saved to disk, so restarting the app resumes where you
+left off.
 
-The sidebar holds:
+> [!WARNING]
+> The app binds to `localhost` only (`.streamlit/config.toml`). It has no authentication,
+> and anyone who can reach it can spend your API keys and approve file writes. Put real
+> auth in front of it before exposing it on a network.
 
-- **Thread** — conversations are checkpointed per thread and survive a restart, so
-  reopening the app resumes the `main` thread exactly where you left off, including a
-  pending approval.
-- **Export transcript** — every question in the thread with its cited answer, as a
-  markdown download.
-- **Durable memory** — everything under `/memories/`, read straight from the Store.
+## How it works
 
-It binds to `localhost` only (`.streamlit/config.toml`). The page has no authentication
-and its visitor can approve file writes and spend your API keys, so putting it on a
-network means putting real auth in front of it first.
-
-## How it fits together
-
-```
+```python
 create_deep_agent(
-    model         = ChatAnthropic("claude-opus-5-5")   # no temperature — Opus 5.5 rejects it
-    tools         = [tavily_search]                    # orchestrator can search directly
-    subagents     = [researcher]                       # …or delegate breadth via `task`
-    backend       = CompositeBackend(
-                        default = StateBackend,         # ephemeral, per-thread (checkpointed)
-                        routes  = {"/memories/": StoreBackend},  # durable, cross-session
-                    )
-    interrupt_on  = {write_file, edit_file, delete, execute}  # human approval (needs a checkpointer)
-    checkpointer  = SqliteSaver(...)                    # durable thread state + interrupts
-    store         = SqliteStore(...)                    # durable long-term memory
+    model        = ChatAnthropic("claude-opus-5-5"),      # no sampling params: Opus 5 rejects them
+    tools        = [tavily_search],                       # quick lookups by the orchestrator
+    subagents    = [researcher],                          # breadth, delegated via `task`
+    middleware   = [TodoListMiddleware()],                # provides `write_todos`
+    backend      = CompositeBackend(
+                       default = StateBackend(),          # per-thread scratch space
+                       routes  = {"/memories/": StoreBackend(...)},  # shared across threads
+                   ),
+    interrupt_on = GATED_TOOLS,                           # human approval; needs a checkpointer
+    checkpointer = SqliteSaver(...),                      # .deep_research/checkpoints.sqlite
+    store        = SqliteStore(...),                      # .deep_research/memories.sqlite
 )
 ```
 
-The page drives the human-in-the-loop protocol: it streams the turn to exhaustion, and if
-anything paused on a gated tool it shows an approval card for each pending action,
-collects one decision per action, and resumes. Resuming can hit the next gated tool, so
-it loops until the turn finishes. Because Streamlit reruns the script on every
-interaction, that loop is unrolled across reruns via `st.session_state` rather than
-written as a `while` loop.
+State is kept in two SQLite files, so no database server is needed:
 
-A turn can carry **more than one** interrupt — the orchestrator dispatches each
-`task` call as its own concurrent graph task and every subagent inherits
-`interrupt_on`, so two `researcher`s fanned out in one turn can each raise their
-own. The resume value is therefore a mapping of interrupt id → that interrupt's
-decisions:
+| Layer | Holds | Scope |
+| --- | --- | --- |
+| **Checkpointer** | Conversation, todo list, pending approvals | One thread |
+| **Store** | Files under `/memories/` | Every thread |
 
-```python
-Command(resume={interrupt_id: {"decisions": [...]}, ...})
-```
+A note written to `/memories/topic.md` is readable in later sessions. A file written
+anywhere else lives only in its thread.
 
-A flat `Command(resume={"decisions": [...]})` makes LangGraph raise `RuntimeError:
-When there are multiple pending interrupts, you must specify the interrupt id when
-resuming`. The mapping form is also correct for the single-interrupt case, so there
-is one code path.
-
-The options it offers aren't fixed — the interrupt carries a per-tool
-`allowed_decisions`, and the middleware rejects anything outside it, so the controls
-are built from that (`approve` / `edit` / `reject` / `respond`, minus whatever the tool
-forbids).
+The page drives the approval loop: it streams a turn to the end, shows a form for every
+pending action, then resumes with `Command(resume={interrupt_id: {"decisions": [...]}})`.
+Resuming can hit another gated tool, so this repeats until the turn finishes. Parallel
+researchers can each pause in the same turn, which is why decisions are keyed by interrupt
+id.
 
 ## Project layout
 
@@ -134,34 +89,38 @@ deep_research/
 ├── config.py       # env loading, model, state paths, key checks
 ├── tools.py        # Tavily web-search tool
 ├── subagents.py    # the `researcher` subagent
-├── agent.py        # build_agent() assembles the agent; open_agent() adds disk persistence
-├── turns.py        # what a turn did and what the user may see: feed, approvals, answer
-└── webui.py        # Streamlit rendering + approval widgets (reuses turns.py's rules)
-streamlit_app.py    # `streamlit run streamlit_app.py` — the page and its rerun state machine
-.streamlit/         # theme (light AND dark, so the mode stays the reader's choice)
-evals/              # LangSmith evaluations of the agent's actual behaviour
+├── agent.py        # assembles the agent and its persistence
+├── turns.py        # what a turn did: activity feed, approvals, answer, stop reasons
+└── webui.py        # Streamlit rendering and approval widgets
+streamlit_app.py    # the page and its rerun state machine
+evals/              # LangSmith evaluations of the agent's behaviour
+tests/              # offline test suite
+.streamlit/         # server binding and light/dark themes
 ```
+
+## Development
+
+```bash
+uv run pytest                  # offline tests, no keys or network
+uv run pytest -m live          # tests against the real APIs
+uv run ruff check && uv run ruff format
+uv run ty check                # type check
+uv run python -m evals --upload           # sync the eval dataset to LangSmith
+uv run python -m evals --run --limit 1    # run the agent on one example (costs tokens)
+```
+
+See [`CLAUDE.md`](CLAUDE.md) for design decisions and the reasoning behind them.
 
 ## Extending it
 
-- **Add a tool** — build it in `tools.py`, then add it to the orchestrator's
-  `tools=[...]` in `agent.py` (or to a subagent's `tools` in `subagents.py`).
-- **Add a subagent** — return another `SubAgent` dict from `subagents.py` and
-  include it in `subagents=[...]`. Give it its own tools and system prompt.
-- **Gate more tools** — add tool names to `GATED_TOOLS` in `agent.py`. Use an
-  `InterruptOnConfig` value (e.g. `{"allowed_decisions": ["approve", "reject"]}`)
-  to restrict the available decisions per tool.
-- **Go to production memory** — swap `SqliteStore` for `PostgresStore` (and
-  `SqliteSaver` for a Postgres checkpointer) in `agent.py`.
-- **Change what the app shows** — `deep_research/webui.py` for rendering,
-  `streamlit_app.py` for the page's sequence. A new kind of feed line means a new
-  `FeedEvent` kind emitted by `turns.ActivityFeed` *plus* a branch in
-  `webui.render_event`, which is an if/elif chain that draws nothing for a kind it
-  doesn't know — so `turns.FEED_KINDS` is the list it is checked against, and
-  `tests/test_webui.py` goes red if the two disagree.
+| To | Do this |
+| --- | --- |
+| **Add a tool** | Build it in `tools.py`, then add it to `tools=[...]` in `agent.py` or to a subagent in `subagents.py`. |
+| **Add a subagent** | Return another `SubAgent` dict from `subagents.py` and add it to `subagents=[...]`. |
+| **Gate a tool** | Add its name to `GATED_TOOLS` in `agent.py`. Use an `InterruptOnConfig` to limit the allowed decisions. |
+| **Use Postgres** | Swap `SqliteStore` and `SqliteSaver` for their Postgres versions in `agent.py`. |
+| **Add a feed line** | Add a kind to `turns.FEED_KINDS`, emit it from `turns.ActivityFeed`, and render it in `webui.render_event`. |
 
 ## License
 
-[MIT](LICENSE) — the same license as the upstream stack this builds on
-(`deepagents`, `langchain`, `langgraph`). Use, fork, and vendor the wiring
-patterns freely.
+[MIT](LICENSE)
