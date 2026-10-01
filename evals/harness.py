@@ -16,7 +16,7 @@ live run, not inferred from the source:
    `SYSTEM_PROMPT` step 5 tells the agent to persist findings under `/memories/`.
    So an unattended run that does not answer the interrupt gets back a state with
    `__interrupt__`, no report, and would silently score zero. `_approve_all`
-   mirrors the resume protocol in `cli.py` — including the id-keyed resume mapping,
+   mirrors the app's resume protocol — including the id-keyed resume mapping,
    which is required because concurrent subagents can each raise their own.
 
 3. **A unique `thread_id` is not isolation.** `/memories/` is routed to the Store,
@@ -34,8 +34,8 @@ from typing import Any
 from langgraph.types import Command
 
 from deep_research.agent import open_agent
-from deep_research.cli import render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
+from deep_research.turns import render_turn
 
 # The agent's real, on-disk state — the user's actual conversation history and
 # long-term memory. An eval run wipes its state dir between examples, so pointing
@@ -124,7 +124,7 @@ class TurnRecorder:
     """Accumulates one turn's *actions* from `stream(..., subgraphs=True)` chunks.
 
     Actions only — deliberately not prose. The response is rendered from the final
-    state by `cli.render_turn` instead, because the stream carries assistant messages
+    state by `turns.render_turn` instead, because the stream carries assistant messages
     from inside the subagents too, and the user never sees a word of those. Grading a
     transcript built from the stream would credit the agent for citations that only a
     researcher subagent ever wrote down.
@@ -172,8 +172,8 @@ class TurnRecorder:
                     # DEDUPE BY INTERRUPT ID, or the safety metric is defeated. With
                     # `subgraphs=True` an interrupt raised inside a subagent is emitted
                     # TWICE — once at the subagent's namespace, once bubbled to the root —
-                    # with the same `Interrupt.id` (this is why `cli._collect_decisions`
-                    # dedupes before prompting). Counting both inflates `gated`, and since
+                    # with the same `Interrupt.id` (this is why `turns.pending_reviews`
+                    # dedupes before the approval form is drawn). Counting both inflates `gated`, and since
                     # `mutations_require_approval` compares MULTISETS, the surplus entry
                     # silently absorbs a *genuinely ungated* mutation of the same name:
                     # two proposed `write_file`s, one interrupt emitted twice, and a file
@@ -260,8 +260,8 @@ class TurnRecorder:
             # WHY THE TURN ENDED, from anywhere in the tree. Without this, a refusal or
             # a context-window overrun reaches the evaluators as nothing but an empty
             # `response`, and both judges score it 0.0 — reporting an API-side stop as
-            # an agent-quality failure. That is the exact misattribution `cli._stop_note`
-            # exists to prevent for the human reading the REPL, and until now the evals
+            # an agent-quality failure. That is the exact misattribution `turns._stop_note`
+            # exists to prevent for the human using the app, and until now the evals
             # had no equivalent. Subagents are included deliberately: a researcher's stop
             # is otherwise *completely* invisible, since its `task` result simply comes
             # back thin and the orchestrator synthesizes around the hole.
@@ -276,7 +276,7 @@ class TurnRecorder:
             # `turn_stopped_cleanly` reads the SET — which is why it must never report
             # a count of these as a count of generations.
             #
-            # Nor is `cli.ActivityFeed`'s `RemoveMessage` guard needed here, though the
+            # Nor is `turns.ActivityFeed`'s `RemoveMessage` guard needed here, though the
             # rule that motivates it is real: `PatchToolCallsMiddleware.before_agent`
             # replays an entire thread on the turn after one abandoned at an approval
             # prompt, and every message in that replay is an `ai` or `tool` message this
@@ -349,7 +349,7 @@ def _approve_all(interrupts: list[Any]) -> dict[str, Any]:
     Keyed, not flat: a turn can hold several interrupts at once (each fanned-out
     subagent inherits `interrupt_on` and raises its own), and LangGraph rejects a
     resume value that does not say which interrupt each decision belongs to. The
-    mapping form is also correct for the single-interrupt case — same as `cli.py`.
+    mapping form is also correct for the single-interrupt case — same as the app.
     """
     resume: dict[str, Any] = {}
     for pending in interrupts:
@@ -414,9 +414,9 @@ def research(inputs: dict[str, Any]) -> dict[str, Any]:
                 f"still interrupting after {MAX_RESUME_ROUNDS} approvals — bailing out"
             )
 
-        # Rendered by the CLI's own function, off the orchestrator's final state —
-        # so `response` is, byte for byte, what a human running the REPL would have
-        # been shown. Any other definition makes the citation metrics fiction.
+        # Rendered by the app's own function, off the orchestrator's final state —
+        # so `response` is, byte for byte, what a human using the app would have been
+        # shown (`test_render_turn_is_the_answer_the_page_draws` pins that). Any other definition makes the citation metrics fiction.
         final_state = agent.get_state(config).values
 
     return {RESPONSE_KEY: render_turn(final_state), **recorder.actions()}

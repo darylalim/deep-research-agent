@@ -1,10 +1,10 @@
 # Deep Research Agent
 
 A **deep research agent** built with [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
-(LangChain 1.0 + LangGraph). Ask it a research question; it plans the work,
-delegates focused web searches to a subagent, synthesizes a cited answer, keeps
-durable findings across sessions, and asks for your approval before writing
-files or running commands.
+(LangChain 1.0 + LangGraph), served as a [Streamlit](https://streamlit.io) app. Ask it a
+research question; it plans the work, delegates focused web searches to a subagent,
+synthesizes a cited answer, keeps durable findings across sessions, and asks for your
+approval before writing files.
 
 ## What's wired up
 
@@ -15,8 +15,8 @@ files or running commands.
 | **Subagent orchestration** | A `researcher` subagent, delegated to via the `task` tool | `deep_research/subagents.py` |
 | **Persistent memory** | `SqliteStore` behind a `/memories/` route (cross-session) | `deep_research/agent.py` |
 | **Durable thread state + interrupts** | `SqliteSaver` checkpointer (survives restarts) | `deep_research/agent.py` |
-| **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `delete` / `execute` | `deep_research/agent.py` + `cli.py` |
-| **Browser UI** | Streamlit chat with a live work log and in-page approvals | `streamlit_app.py` + `deep_research/webui.py` |
+| **Human-in-the-loop** | `interrupt_on` gates `write_file` / `edit_file` / `delete` / `execute` | `deep_research/agent.py` + `turns.py` |
+| **The app** | Streamlit chat with a live work log and in-page approvals | `streamlit_app.py` + `deep_research/webui.py` |
 | **Observability** | LangSmith tracing via env vars | `.env` |
 
 ### The persistence model (two layers)
@@ -56,78 +56,32 @@ Keys you need:
 ## Run
 
 ```bash
-uv run python -m deep_research
+uv run streamlit run streamlit_app.py   # http://localhost:8501
 ```
 
-Then chat:
+Ask a question in the chat box. While the agent works you watch its plan, each
+delegated sub-question, and every search query appear live; when it finishes, the cited
+answer lands in the transcript with that work log collapsed above it.
 
-```
-you > What are the leading approaches to long-context retrieval in 2025, and their tradeoffs?
-… working (planning, searching, synthesizing)…
+When the agent wants to write a file, the turn pauses and an approval card shows the
+**full** proposed content. You pick **Approve**, **Edit** (prefilled with the real
+arguments, so narrowing a path is an edit rather than a retype), **Reject** (with an
+optional reason for the agent), or **Respond** (answer on the tool's behalf). Nothing is
+preselected, and unparsable edit JSON is never treated as approval. **Abandon this
+turn** is always available as a way out.
 
-  ⏸  Approval required — write_file
-     args: {"file_path": "/memories/long-context-retrieval.md", ...}
-     [a]pprove / [e]dit / [r]eject / re[s]pond (default a) > a
+The sidebar holds:
 
-agent > <synthesized, cited answer>
-```
-
-In-session commands: `/help`, `/thread <id>` (switch conversations), `/exit`.
-
-Because state is persistent, quitting and re-running `python -m deep_research`
-resumes the `main` thread exactly where you left off — including a pending
-approval.
-
-## Run it in the browser (optional)
-
-```bash
-uv run --group ui streamlit run streamlit_app.py   # http://localhost:8501
-```
-
-The same agent, same threads, same `.deep_research/` databases — the REPL and the
-browser are two views of one conversation, so a thread you start in one continues in
-the other, including one left paused at an approval. Use them one at a time: only the
-checkpointer's sqlite file is in WAL mode, so simultaneous writers can collide.
+- **Thread** — conversations are checkpointed per thread and survive a restart, so
+  reopening the app resumes the `main` thread exactly where you left off, including a
+  pending approval.
+- **Export transcript** — every question in the thread with its cited answer, as a
+  markdown download.
+- **Durable memory** — everything under `/memories/`, read straight from the Store.
 
 It binds to `localhost` only (`.streamlit/config.toml`). The page has no authentication
 and its visitor can approve file writes and spend your API keys, so putting it on a
 network means putting real auth in front of it first.
-
-What the browser adds is room the terminal doesn't have:
-
-- **A per-answer work log.** The plan, each delegated sub-question and every search
-  query, collapsed into an expander under the answer it produced.
-- **Readable approvals.** A `write_file` shows its full contents in a scrolling code
-  block — the terminal elides at 40 lines, and an elided review is one that gets
-  rubber-stamped. Choosing *edit* prefills the real arguments so narrowing a path is an
-  edit rather than a retype.
-- **A memory browser.** Everything under `/memories/`, read straight from the Store.
-- **Export** as a markdown download — the same bytes `/export` writes.
-
-Nothing about *what the agent is* lives here: `streamlit_app.py` is a page script, and
-`deep_research/webui.py` imports its display rules from `cli.py` rather than restating
-them (`StreamlitFeed` subclasses `ActivityFeed` and overrides rendering only). Add a
-tool or subagent in `agent.py` and all three front doors gain it.
-
-The `ui` dependency group is kept out of the default install, so `uv run --group ui`
-pulls it in on demand.
-
-## Serve it over HTTP (optional)
-
-The same agent can run behind the LangGraph API server instead of the terminal, so
-you can drive it from [LangGraph Studio](https://smith.langchain.com/studio) or the
-[deep-agents-ui](https://github.com/langchain-ai/deep-agents-ui) web app:
-
-```bash
-uv run --group serve langgraph dev   # serves http://127.0.0.1:2024, opens Studio
-```
-
-Then point the UI at deployment URL `http://127.0.0.1:2024`, assistant id `research`.
-`deep_research/graph.py` builds the *same* agent as the CLI (same tools, subagent,
-prompt, and human-in-the-loop gate — both share `agent.build_agent`), but lets the
-server own persistence, so its `/memories/` store is separate from the CLI's
-`.deep_research/`. The `serve` dependency-group stays out of the default install to
-keep CI lean; `uv run --group serve` pulls it in on demand.
 
 ## How it fits together
 
@@ -146,10 +100,12 @@ create_deep_agent(
 )
 ```
 
-The CLI drives the human-in-the-loop protocol: `invoke()` returns with an
-`__interrupt__` when a gated tool is proposed; the CLI shows each pending action,
-collects one decision for it, and resumes. Resuming can hit the next gated tool,
-so it loops until the turn finishes.
+The page drives the human-in-the-loop protocol: it streams the turn to exhaustion, and if
+anything paused on a gated tool it shows an approval card for each pending action,
+collects one decision per action, and resumes. Resuming can hit the next gated tool, so
+it loops until the turn finishes. Because Streamlit reruns the script on every
+interaction, that loop is unrolled across reruns via `st.session_state` rather than
+written as a `while` loop.
 
 A turn can carry **more than one** interrupt — the orchestrator dispatches each
 `task` call as its own concurrent graph task and every subagent inherits
@@ -167,8 +123,8 @@ resuming`. The mapping form is also correct for the single-interrupt case, so th
 is one code path.
 
 The options it offers aren't fixed — the interrupt carries a per-tool
-`allowed_decisions`, and the middleware rejects anything outside it, so the menu is
-built from that (`approve` / `edit` / `reject` / `respond`, minus whatever the tool
+`allowed_decisions`, and the middleware rejects anything outside it, so the controls
+are built from that (`approve` / `edit` / `reject` / `respond`, minus whatever the tool
 forbids).
 
 ## Project layout
@@ -179,13 +135,11 @@ deep_research/
 ├── tools.py        # Tavily web-search tool
 ├── subagents.py    # the `researcher` subagent
 ├── agent.py        # build_agent() assembles the agent; open_agent() adds disk persistence
-├── graph.py        # langgraph dev / Studio / web-UI entry point (server owns persistence)
-├── cli.py          # interactive REPL + human-in-the-loop resume loop
-├── webui.py        # Streamlit rendering + approval widgets (reuses cli.py's rules)
-└── __main__.py     # `python -m deep_research`
-streamlit_app.py    # `streamlit run streamlit_app.py` — the browser front door
+├── turns.py        # what a turn did and what the user may see: feed, approvals, answer
+└── webui.py        # Streamlit rendering + approval widgets (reuses turns.py's rules)
+streamlit_app.py    # `streamlit run streamlit_app.py` — the page and its rerun state machine
 .streamlit/         # theme (light AND dark, so the mode stays the reader's choice)
-langgraph.json      # registers the `research` graph for `langgraph dev`
+evals/              # LangSmith evaluations of the agent's actual behaviour
 ```
 
 ## Extending it
@@ -199,12 +153,12 @@ langgraph.json      # registers the `research` graph for `langgraph dev`
   to restrict the available decisions per tool.
 - **Go to production memory** — swap `SqliteStore` for `PostgresStore` (and
   `SqliteSaver` for a Postgres checkpointer) in `agent.py`.
-- **Change what the browser UI shows** — `deep_research/webui.py`. A new kind of feed
-  line means a new `FeedEvent` kind emitted by `cli.ActivityFeed` *plus* a branch in
-  both `ActivityFeed._emit` (terminal) and `webui.render_event` (browser). Both are
-  if/elif chains that draw nothing for a kind they don't know, so `cli.FEED_KINDS` is
-  the list they are checked against and `tests/test_webui.py` goes red if either is
-  missed.
+- **Change what the app shows** — `deep_research/webui.py` for rendering,
+  `streamlit_app.py` for the page's sequence. A new kind of feed line means a new
+  `FeedEvent` kind emitted by `turns.ActivityFeed` *plus* a branch in
+  `webui.render_event`, which is an if/elif chain that draws nothing for a kind it
+  doesn't know — so `turns.FEED_KINDS` is the list it is checked against, and
+  `tests/test_webui.py` goes red if the two disagree.
 
 ## License
 

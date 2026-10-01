@@ -2,7 +2,7 @@
 
 `test_webui.py` covers the rendering and the approval widgets; this file covers the
 thing they sit inside — the four `st.session_state` keys (payload / question / feed /
-pending) that unroll `cli.main`'s interrupt/resume loop across Streamlit reruns. That
+pending) that unroll the interrupt/resume loop across Streamlit reruns. That
 loop had no tests at all in its first version, and a code review found three separate
 defects in it, every one invisible in a screenshot.
 
@@ -18,16 +18,15 @@ replaces `_stream_turn`, so the graph is never actually run.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Interrupt
-
-pytest.importorskip("streamlit")
-
 from streamlit.testing.v1 import AppTest
 
-from deep_research import cli as cli_module
+from deep_research import turns as turns_module
 from deep_research import webui
 
 # **Absolute, deliberately.** Streamlit 1.62 changed how `AppTest.from_file`
@@ -87,7 +86,7 @@ class TestThePayloadIsConsumedBeforeStreaming:
             seen.append(st.session_state.payload)
             return []
 
-        monkeypatch.setattr(cli_module, "_stream_turn", record)
+        monkeypatch.setattr(turns_module, "_stream_turn", record)
         _page(
             payload={"messages": [{"role": "user", "content": "q"}]},
             question="q",
@@ -103,7 +102,7 @@ class TestThePayloadIsConsumedBeforeStreaming:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            cli_module,
+            turns_module,
             "_stream_turn",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
@@ -183,7 +182,7 @@ class TestPendingApprovalsSurviveTheSession:
                 Interrupt(id="stale", value={"action_requests": [_WRITE]})
             ],
         )
-        monkeypatch.setattr(cli_module, "_stream_turn", lambda *a, **k: [live])
+        monkeypatch.setattr(turns_module, "_stream_turn", lambda *a, **k: [live])
 
         page = _page(
             payload={"messages": [{"role": "user", "content": "q"}]},
@@ -220,7 +219,7 @@ class TestTheApprovalPanelEscalatesToTheTurnLoop:
             resumed.append(payload)
             return []
 
-        monkeypatch.setattr(cli_module, "_stream_turn", record)
+        monkeypatch.setattr(turns_module, "_stream_turn", record)
         page = _page(
             pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
             feed=webui.StreamlitFeed(),
@@ -392,8 +391,7 @@ class TestTheApprovalScreenIsEscapable:
         # so a tool gated with decisions this UI cannot render would disable it forever
         # — while `busy` has already disabled the chat input and the thread field and
         # `st.stop()` ends the page. Without this button the session has no control left
-        # that can move it forward. `cli.main` abandons the same turn via its broad
-        # `except`.
+        # that can move it forward.
         page = _page(
             pending=[Interrupt(id="i1", value={"action_requests": [_WRITE]})],
             feed=webui.StreamlitFeed(),
@@ -423,7 +421,7 @@ class TestTheApprovalScreenIsEscapable:
         unless the store has something in it. Each stub removes the unrelated condition
         that was satisfying the assertion, leaving `busy` as the only thing that can.
         """
-        monkeypatch.setattr(cli_module, "export_markdown", lambda *a, **k: "# report")
+        monkeypatch.setattr(turns_module, "export_markdown", lambda *a, **k: "# report")
         monkeypatch.setattr(
             webui, "cached_memory_files", lambda _a: [("/memories/x.md", "body")]
         )
@@ -442,7 +440,7 @@ class TestTheApprovalScreenIsEscapable:
         # The positive control for the test above: with nothing pending, every one of
         # them is enabled. Without this, "disabled" assertions could all be passing
         # because the widgets are disabled unconditionally.
-        monkeypatch.setattr(cli_module, "export_markdown", lambda *a, **k: "# report")
+        monkeypatch.setattr(turns_module, "export_markdown", lambda *a, **k: "# report")
         monkeypatch.setattr(
             webui, "cached_memory_files", lambda _a: [("/memories/x.md", "body")]
         )
@@ -453,6 +451,110 @@ class TestTheApprovalScreenIsEscapable:
         assert not page.sidebar.text_input[0].disabled
         assert not page.sidebar.download_button[0].disabled
         assert not page.sidebar.selectbox[0].disabled
+
+
+class _CheckpointAgent:
+    """An agent whose checkpoint holds `messages` — just enough for the page.
+
+    `_stream_turn` is stubbed in every test that uses this, so the graph never runs;
+    what the page reads afterwards is `get_state`, which is where a turn's answer and
+    its stop reason both come from.
+    """
+
+    def __init__(self, messages: list[Any]) -> None:
+        self._messages = messages
+
+    def get_state(self, _config: Any) -> SimpleNamespace:
+        return SimpleNamespace(values={"messages": self._messages}, interrupts=())
+
+
+def _finished_turn(monkeypatch: pytest.MonkeyPatch, *messages: Any) -> AppTest:
+    """Run one turn to completion against a checkpoint holding `messages`."""
+    agent = _CheckpointAgent(list(messages))
+    monkeypatch.setattr(webui, "open_cached_agent", lambda: (agent, None))
+    monkeypatch.setattr(turns_module, "_stream_turn", lambda *a, **k: [])
+    page = _page(
+        payload={"messages": [{"role": "user", "content": "q"}]},
+        question="q",
+        feed=webui.StreamlitFeed(),
+    )
+    assert not page.exception, page.exception
+    return page
+
+
+REPORT = "Opus 5 costs $5/Mtok in. ([docs](https://docs.anthropic.com/pricing))"
+
+
+def _stopped(reason: str) -> AIMessage:
+    return AIMessage(content="", response_metadata={"stop_reason": reason})
+
+
+class TestASilentStopIsExplained:
+    """A turn the API ended with no prose must not reach the user as silence.
+
+    `refusal` and `model_context_window_exceeded` are each HTTP 200 with empty content:
+    nothing raises, and the message lands in the checkpoint carrying no prose. Without a
+    note the page can only say the agent finished "without saying anything", which
+    describes the symptom, hides the cause, and reads as a bug in this app.
+    """
+
+    def test_a_refusal_with_no_answer_is_named(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _finished_turn(monkeypatch, HumanMessage("q"), _stopped("refusal"))
+        notice = page.session_state["notice"] or ""
+
+        assert "the model declined this request" in notice
+        assert "rephrasing or narrowing" in notice
+        assert "without saying anything" not in notice
+
+    def test_an_overrun_gets_its_own_remedy_not_the_refusal_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The half a shared code path gets wrong for free. Detecting the stop but reusing
+        # the refusal's advice sends the user to rewrite a question that was never the
+        # problem, and says nothing about the thread that actually filled up.
+        page = _finished_turn(
+            monkeypatch, HumanMessage("q"), _stopped("model_context_window_exceeded")
+        )
+        notice = page.session_state["notice"] or ""
+
+        assert "this turn exceeded the model's context window" in notice
+        assert "starting a fresh thread resets it" in notice
+        assert "rephrasing" not in notice
+
+    def test_a_stopped_branch_does_not_suppress_the_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The note goes BESIDE the answer, never instead of it. A turn can refuse one
+        # branch and answer on another; the note is what explains why the answer is
+        # thinner than the question.
+        page = _finished_turn(
+            monkeypatch, HumanMessage("q"), _stopped("refusal"), AIMessage(REPORT)
+        )
+
+        assert page.session_state["notice"] is None
+        assert "the model declined" in page.session_state["refusals"][1]
+        assert any(m.value == REPORT for m in page.markdown)
+        assert any("the model declined" in w.value for w in page.warning)
+
+    def test_an_ordinary_turn_carries_no_note(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _finished_turn(monkeypatch, HumanMessage("q"), AIMessage(REPORT))
+
+        assert page.session_state["notice"] is None
+        assert page.session_state["refusals"] == {}
+        assert any(m.value == REPORT for m in page.markdown)
+
+    def test_a_genuinely_silent_turn_still_says_so(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The fallback is still the right message when there really was nothing to show;
+        # the stop branch must not swallow it.
+        page = _finished_turn(monkeypatch, HumanMessage("q"))
+
+        assert "without saying anything" in (page.session_state["notice"] or "")
 
 
 class TestTheThreadField:

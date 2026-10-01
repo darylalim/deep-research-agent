@@ -1,4 +1,4 @@
-"""Unit tests for the pure message-parsing helpers in `cli.py`.
+"""Unit tests for the pure message-parsing helpers in `turns.py`.
 
 These are the functions most exposed to a silent break when LangChain/LangGraph
 change the shape of message content — so they're tested against *real* message
@@ -9,21 +9,20 @@ defensive branches that real messages don't normally exercise.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from types import SimpleNamespace
 
-import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from deep_research.cli import (
+from deep_research.turns import (
     _SILENT_STOPS,
-    _export,
     _short,
     _stop_note,
     _text_of,
     _turn_stop,
+    export_markdown,
     render_thread,
     render_turn,
+    thread_sections,
 )
 
 
@@ -51,9 +50,9 @@ class TestStopNote:
 
     Both `refusal` and `model_context_window_exceeded` are a 200 with empty content: they
     cost tokens, raise nothing, and reach `render_turn` as a message with no prose. The
-    REPL printed `(the agent said nothing)`, which is true and useless — it reads as a bug
-    in the CLI rather than as something the API reported, and gives the user nothing to
-    act on.
+    app used to say `(the agent said nothing)`, which is true and useless — it reads as a
+    bug in the app rather than as something the API reported, and gives the user nothing
+    to act on.
     """
 
     def test_a_refusal_is_named_as_one(self) -> None:
@@ -74,10 +73,10 @@ class TestStopNote:
     def test_the_remedy_is_per_stop_reason_and_not_hardcoded_at_the_print_site(
         self,
     ) -> None:
-        # WHY `StopNote` carries two fields. The remedy used to be a literal appended by
-        # `main` and by `streamlit_app`, and it said "rephrasing or narrowing it usually
-        # helps" — advice that is actively wrong for an overrun, where the question was
-        # fine and the thread is what grew. Break either remedy and this goes red.
+        # WHY `StopNote` carries two fields. The remedy used to be a literal appended at
+        # the print site, and it said "rephrasing or narrowing it usually helps" — advice
+        # that is actively wrong for an overrun, where the question was fine and the
+        # thread is what grew. Break either remedy and this goes red.
         refusal, overrun = _stop_note(_refusal()), _stop_note(_overrun())
         assert refusal and overrun
         assert "rephras" in refusal.remedy
@@ -170,7 +169,7 @@ class TestStopNote:
 class TestStopReasonsAreAccountedFor:
     """Pin `_SILENT_STOPS` and the `category` key against the installed SDK.
 
-    `cli.py` tells the reader to re-read `anthropic/types/` on an SDK bump. That is
+    `turns.py` tells the reader to re-read `anthropic/types/` on an SDK bump. That is
     exactly the check this repo's own rule says cannot be trusted to prose — and it has
     already failed once: the anthropic 0.116 -> 0.120 upgrade was reviewed by hand,
     `general_harms` was spotted in `refusal_stop_details.py`, and
@@ -314,25 +313,24 @@ class TestRenderTurn:
 
     def test_strips_surrounding_whitespace(self) -> None:
         # Model output routinely carries leading/trailing newlines that must not
-        # reach the printed line.
+        # reach the rendered answer.
         assert render_turn({"messages": [AIMessage(content="  answer\n")]}) == "answer"
 
     def test_a_turn_with_no_assistant_prose_renders_nothing(self) -> None:
         # This used to fall back to `messages[-1]` and return "only human" — the user's
-        # own question, echoed back under an `agent >` header. Harmless while
-        # `render_turn` was only called on completed turns; not harmless now that
-        # `_print_unfinished_turn` calls it on turns abandoned at an approval prompt,
-        # where a bare human message is exactly what the checkpoint holds. It would
-        # also have handed `evals/harness.py` the question itself as the agent's
+        # own question, echoed back as the agent's answer. Harmless while `render_turn`
+        # was only called on completed turns; not harmless on a turn abandoned at an
+        # approval, where a bare human message is exactly what the checkpoint holds. It
+        # would also hand `evals/harness.py` the question itself as the agent's
         # `response`, for the judges to grade as an answer.
         assert render_turn({"messages": [HumanMessage(content="only human")]}) == ""
 
     def test_a_raw_tool_payload_is_never_shown_as_the_agents_words(self) -> None:
-        # The other half of removing the fallback, and the more dangerous half. Ctrl-C
-        # during the multi-minute search phase leaves a `tavily_search` ToolMessage as
-        # the last thing in the checkpoint — several KB of serialized result dicts. The
-        # old `messages[-1]` fallback would print that verbatim under an `agent >`
-        # header, and would hand it to the eval judges as the agent's `response`.
+        # The other half of removing the fallback, and the more dangerous half. A turn
+        # that dies during the multi-minute search phase leaves a `tavily_search`
+        # ToolMessage as the last thing in the checkpoint — several KB of serialized
+        # result dicts. The old `messages[-1]` fallback would show that verbatim as the
+        # agent's answer, and would hand it to the eval judges as its `response`.
         #
         # An earlier version of this very test pinned the opposite behavior using an
         # 11-character tool output, which made the dump look perfectly benign.
@@ -431,66 +429,43 @@ class TestRenderThread:
         assert render_thread({}) == ""
 
 
-class TestExport:
-    def _agent(self, messages: Sequence[object]) -> SimpleNamespace:
-        """An agent stub exposing ONLY `get_state`.
+class TestExportMarkdown:
+    """The document behind the page's "Export transcript" button."""
 
-        Deliberately nothing else. `/export` must never reach for `invoke`/`stream` or
-        the agent's own `write_file` tool — that route cannot work without a model turn
-        (the HITL middleware interrupts on the *model's* tool calls), so it would cost an
-        Opus call and ask the human to approve the thing the human just typed. Any such
-        reach raises AttributeError here rather than passing quietly.
-        """
-        return SimpleNamespace(
-            get_state=lambda config: SimpleNamespace(values={"messages": messages})
-        )
+    def test_it_is_the_whole_thread_under_a_header(self) -> None:
+        document = export_markdown({"messages": THREAD}, "main", "20260101T000000Z")
 
-    def test_it_writes_the_whole_thread_as_markdown(
-        self, tmp_path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        target = tmp_path / "out.md"
-        _export(self._agent(THREAD), {}, "main", str(target))
+        assert document.startswith("# Deep research — thread `main`")
+        assert "Exported 20260101T000000Z" in document
+        assert "## you\n\nwhat does Opus 4.8 cost?" in document
+        assert "$15/Mtok" in document and "$1/Mtok" in document
 
-        written = target.read_text(encoding="utf-8")
-        assert "# Deep research — thread `main`" in written
-        assert "## you\n\nwhat does Opus 4.8 cost?" in written
-        assert "$15/Mtok" in written and "$1/Mtok" in written
-        assert str(target.resolve()) in capsys.readouterr().out
+    def test_an_empty_thread_exports_nothing(self) -> None:
+        # `""` rather than a header over nothing — the page disables the button on it,
+        # so a reader is never handed an empty file.
+        assert export_markdown({"messages": []}, "main", "stamp") == ""
 
-    def test_it_refuses_to_write_an_empty_file(
-        self, tmp_path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        target = tmp_path / "empty.md"
-        _export(self._agent([]), {}, "main", str(target))
+    def test_an_unfinished_turn_still_exports_the_prose_it_has(self) -> None:
+        # A thread whose last turn was abandoned at an approval: the report is in the
+        # checkpoint even though the turn never completed. Export it.
+        assert "$15/Mtok" in export_markdown({"messages": THREAD[:2]}, "main", "stamp")
 
-        assert not target.exists()
-        assert "nothing to export" in capsys.readouterr().out
 
-    def test_an_unwritable_path_reports_instead_of_killing_the_session(
-        self, tmp_path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # main()'s broad `except` is at TURN scope, not command scope — an OSError here
-        # would escape it and end the REPL. Caught in `_export` itself.
-        _export(self._agent(THREAD), {}, "main", str(tmp_path / "nope" / "out.md"))
-        assert "export failed" in capsys.readouterr().out
+def test_render_turn_is_the_answer_the_page_draws() -> None:
+    """The evals grade `render_turn`; the page draws `thread_sections`. Same bytes.
 
-    def test_a_home_relative_path_is_expanded(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # `/export ~/report.md` is the obvious thing to type, and no shell expanded it —
-        # the path arrives as the literal string `~/report.md`. Without expanduser it dies
-        # with a bare ENOENT (or, if a stray `~` directory exists in cwd, silently writes
-        # into `./~/report.md`), losing a report that cost minutes and dozens of searches.
-        monkeypatch.setenv("HOME", str(tmp_path))
-        _export(self._agent(THREAD), {}, "main", "~/report.md")
+    `evals/harness.py` builds its graded `response` with `render_turn`, and the citation
+    metrics are only honest if that is what the user was shown. The page draws the last
+    `ai` section of `thread_sections` instead — so pin that the two agree on a finished
+    turn, including the report-then-sign-off pair that is two messages saying one thing.
+    Diverge them and the evals start grading text nobody saw.
+    """
+    state = {"messages": THREAD[:4]}  # turn one: report + write_file + sign-off
+    kind, drawn = thread_sections(state)[-1]
 
-        assert (tmp_path / "report.md").read_text(encoding="utf-8").count(
-            "$15/Mtok"
-        ) == 1
-
-    def test_an_unfinished_turn_still_exports_the_prose_it_has(self, tmp_path) -> None:
-        # A thread whose last turn was abandoned at an approval prompt: the report is in
-        # the checkpoint even though the turn never completed. Export it.
-        target = tmp_path / "out.md"
-        _export(self._agent(THREAD[:2]), {}, "main", str(target))
-        assert "$15/Mtok" in target.read_text(encoding="utf-8")
+    assert kind == "ai"
+    assert render_turn(state) == drawn
+    assert (
+        render_turn({"messages": THREAD})
+        == thread_sections({"messages": THREAD})[-1][1]
+    )

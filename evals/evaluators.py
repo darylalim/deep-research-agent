@@ -40,7 +40,7 @@ from typing import Annotated, Any, TypedDict
 
 from langchain_anthropic import ChatAnthropic
 
-from deep_research.cli import _SILENT_STOPS
+from deep_research.turns import _SILENT_STOPS
 
 # Actions that constitute "starting the research", i.e. the point by which the
 # agent was supposed to have planned and consulted memory.
@@ -49,7 +49,7 @@ RESEARCH_ACTIONS = ("task", "tavily_search")
 URL = re.compile(r"https?://[^\s)\]>,]+")
 
 # Stops that mean the API ended the turn, so a thin or absent answer is not the agent's
-# doing. Built FROM `cli._SILENT_STOPS` rather than restated, because that table is
+# doing. Built FROM `turns._SILENT_STOPS` rather than restated, because that table is
 # already compared against `anthropic.types.StopReason` by set equality
 # (`test_cli_parsing.py::TestStopReasonsAreAccountedFor`) and so absorbs a member added
 # by an SDK bump. A second hand-written copy is the exact drift that test exists to
@@ -70,14 +70,14 @@ UNCLEAN_STOPS = frozenset(_SILENT_STOPS) | {"max_tokens"}
 #
 # Written out rather than imported from `evals.harness`, which refuses to import at all
 # unless the state dir is already isolated — a precondition an evaluator has no business
-# carrying. Note the distinction, since the `deep_research.cli` import above blurs it:
-# importing `cli` freezes `config.STATE_DIR` at whatever the environment says, which is
+# carrying. Note the distinction, since the `deep_research.turns` import above blurs it:
+# importing `turns` freezes `config.STATE_DIR` at whatever the environment says, which is
 # harmless; importing `harness` *raises* unless that value is a throwaway, which is not.
 #
 # So it is a hand-copy, and hand-copies here get compared against the real thing rather
 # than trusted — `test_the_completed_run_keys_match_what_the_recorder_emits` builds an
 # actual `TurnRecorder` and imports `harness.RESPONSE_KEY` for the other half, so
-# NEITHER half is asserted against itself. Same treatment as `cli._LS_EMPTY` against
+# NEITHER half is asserted against itself. Same treatment as `turns._LS_EMPTY` against
 # deepagents' real formatter.
 _COMPLETED_RUN_KEYS = frozenset(
     {
@@ -443,10 +443,10 @@ def mutations_require_approval(run: Any, example: Any) -> dict[str, Any]:
 def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
     """Does the answer the *user actually sees* contain source URLs?
 
-    `response` is rendered by `cli.render_turn`, so this grades the exact text the
-    REPL prints — not the agent's internal reasoning, and not what its subagents
+    `response` is rendered by `turns.render_turn`, so this grades the exact text the
+    app shows — not the agent's internal reasoning, and not what its subagents
     wrote down. A report saved to a file with the URLs in it does not count: the
-    user reading the terminal never opens that file.
+    user reading the answer never opens that file.
     """
     if reason := _ungradable(run, "response"):
         return _not_measured(reason)
@@ -473,8 +473,8 @@ def turn_stopped_cleanly(run: Any, example: Any) -> dict[str, Any]:
     indistinguishable from an agent that researched badly — and it sends the next
     person to fix a prompt when the actual remedy is a fresh thread.
 
-    `cli._stop_note` already closes exactly this misattribution for the human at the
-    REPL, and `ActivityFeed._render_stop` for a subagent's stop. The evals had no
+    `turns._stop_note` already closes exactly this misattribution for the human using
+    the app, and `ActivityFeed._render_stop` for a subagent's stop. The evals had no
     equivalent, so the one place the failure is *aggregated and compared across runs*
     was the one place it was invisible.
 

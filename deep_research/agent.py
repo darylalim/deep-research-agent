@@ -96,7 +96,7 @@ Lead with the answer, then the supporting detail and sources."""
 # The store namespace `/memories/` files live under. This is *durable data*, not a
 # preference: it is exactly what deepagents' legacy auto-detection resolves to for
 # this app today (`("filesystem",)` — its `assistant_id` branch is a LangGraph
-# Platform concept a local CLI never sets). Passing it explicitly is required —
+# Platform concept a local app never sets). Passing it explicitly is required —
 # `StoreBackend` without a `namespace` is deprecated for removal in 0.7.0 — but the
 # *value* must not change, or every note already in `memories.sqlite` is orphaned.
 MEMORY_NAMESPACE = ("filesystem",)
@@ -140,8 +140,8 @@ def build_backend() -> CompositeBackend:
 # `interrupt_on` REQUIRES a checkpointer — that dependency is satisfied below.
 # `True` expands to all four decisions (approve / edit / reject / respond); a
 # per-tool `InterruptOnConfig` (e.g. `{"allowed_decisions": ["approve", "reject"]}`)
-# narrows them. Narrowing is honored by the CLI — `cli.py::_prompt_decision` builds
-# its menu from the interrupt's `ReviewConfig` — so it needs no change here. Sending
+# narrows them. Narrowing is honored by the browser — `webui.decision_controls` builds
+# its options from the interrupt's `ReviewConfig` — so it needs no change here. Sending
 # a decision a tool forbids raises `ValueError` inside the middleware.
 #
 # Gating a name the backend never exposes is a NO-OP, not a safety net: the tool has
@@ -179,20 +179,19 @@ GATED_TOOLS: dict[str, bool | InterruptOnConfig] = {
 }
 
 
-def build_agent(*, checkpointer: Any = None, store: Any = None) -> Any:
+def build_agent(*, checkpointer: Any, store: Any) -> Any:
     """Assemble the deep research agent — the single source of truth for its wiring.
 
-    Both front doors call this. `open_agent()` (the CLI) passes its own disk-backed
-    `checkpointer` and `store`; `graph.py` (the `langgraph dev` / Studio / web-UI
-    server) passes NEITHER, because the API server injects its own at runtime — and
-    omitting the checkpointer is also what keeps `interrupt_on` legal there (the
-    requirement is enforced at invoke time, which the server satisfies).
-
     Everything that defines *what the agent is* — model, tools, subagent, system
-    prompt, HITL gate, `/memories/` routing, name — lives here exactly once, so the
-    two front doors cannot drift: add a tool or subagent and both entry points gain
-    it in one edit. Persistence is the ONLY thing that legitimately differs between
-    them, which is why it is the only parameter.
+    prompt, HITL gate, `/memories/` routing, name — lives here exactly once.
+    `open_agent()` is the only caller and supplies the disk-backed persistence.
+
+    Both persistence arguments are REQUIRED, with no `None` default. `interrupt_on`
+    needs a checkpointer to hold a pending approval, but `create_deep_agent` only
+    enforces that at invoke time — so an agent built without one compiles cleanly and
+    fails on the first gated tool call, mid-turn, after the searches are paid for.
+    (The default used to be `None` for a `langgraph dev` server that injected its own
+    persistence; that front door was removed.)
     """
     return create_deep_agent(
         model=build_model(),
@@ -236,7 +235,7 @@ def open_agent() -> Iterator[Any]:
 
     Usage:
         with open_agent() as agent:
-            agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": "main"}})
+            agent.stream({"messages": [...]}, config={"configurable": {"thread_id": "main"}})
     """
     ensure_state_dir()
     # Both `from_conn_string` helpers are context managers that open the sqlite
@@ -245,6 +244,4 @@ def open_agent() -> Iterator[Any]:
         SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer,
         SqliteStore.from_conn_string(str(MEMORY_DB)) as store,
     ):
-        # Disk-backed persistence is the ONLY thing the CLI adds over the served
-        # graph; everything else lives in the shared `build_agent`.
         yield build_agent(checkpointer=checkpointer, store=store)

@@ -21,8 +21,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Interrupt
 
 from deep_research.agent import GATED_TOOLS
-from deep_research.cli import _SILENT_STOPS, render_turn
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
+from deep_research.turns import _SILENT_STOPS, render_turn
 from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
     _COMPLETED_RUN_KEYS,
@@ -356,8 +356,8 @@ def test_a_subagents_citations_do_not_earn_the_orchestrator_a_pass():
     The stream carries assistant messages from *inside* the researchers, and the
     user never sees one of them. If the harness built its transcript from the
     stream, a researcher's neatly-cited summary would score the orchestrator's
-    uncited sign-off as a pass. So `response` is rendered by `cli.render_turn` from
-    the orchestrator's final state — exactly the bytes the REPL prints.
+    uncited sign-off as a pass. So `response` is rendered by `turns.render_turn` from
+    the orchestrator's final state — exactly the text the page draws.
     """
     recorder = TurnRecorder()
     recorder.absorb(
@@ -754,7 +754,7 @@ def test_the_completed_run_keys_match_what_the_recorder_emits():
     refuses to import at all unless the state dir is already isolated, and an evaluator
     has no business requiring that. So the key list is written out by hand, and a
     hand-copy of a shape defined elsewhere is precisely what this repo keeps getting
-    wrong (`cli._LS_EMPTY`, `_SILENT_STOPS`). Same remedy: build the real object and
+    wrong (`turns._LS_EMPTY`, `_SILENT_STOPS`). Same remedy: build the real object and
     compare, rather than trusting the copy.
     """
     emitted = set(TurnRecorder().actions()) | {RESPONSE_KEY}
@@ -898,7 +898,7 @@ def test_searches_that_all_failed_are_not_evidence_that_it_researched():
 
 
 def test_an_api_stop_is_reported_as_a_stop_and_not_as_a_bad_answer():
-    """The misattribution `cli._stop_note` prevents at the REPL, prevented in the evals.
+    """The misattribution `turns._stop_note` prevents in the app, prevented in the evals.
 
     A refusal or a context-window overrun ends the turn with HTTP 200 and no prose, so
     `render_turn` yields `''`, so both judges score 0.0 and `response_cites_sources`
@@ -942,7 +942,7 @@ def test_an_api_stop_is_reported_as_a_stop_and_not_as_a_bad_answer():
 
 
 def test_every_stop_the_cli_calls_silent_is_also_graded_as_unclean():
-    """`UNCLEAN_STOPS` is DERIVED from `cli._SILENT_STOPS`, not copied beside it.
+    """`UNCLEAN_STOPS` is DERIVED from `turns._SILENT_STOPS`, not copied beside it.
 
     That table is already compared against `anthropic.types.StopReason` by set equality
     in `test_cli_parsing.py`, so deriving from it means an SDK bump that adds a silent

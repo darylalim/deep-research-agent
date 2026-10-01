@@ -59,7 +59,7 @@ class TestBuildModel:
         # minutes (`3600 * max_tokens / 128_000 > 600`) — but only when the client still
         # carries the SDK's default timeout, and langchain hands it `timeout=None`, so
         # that guard never fires here. A too-large non-streaming request would therefore
-        # not error; it would hang the REPL forever against a client with no timeout at
+        # not error; it would hang the turn forever against a client with no timeout at
         # all. `streaming=True` is what keeps us out of that regime, and it must not be
         # quietly dropped (or, worse, passed as `False`, which HARD-disables streaming
         # via `_streaming_disabled()` even under a streaming `stream_mode`).
@@ -89,7 +89,7 @@ class TestBuildModel:
         #    That is not a multi-turn-only bug: every tool result replays the assistant
         #    message that requested the call, so one research turn trips it as soon as
         #    `tavily_search` returns. "summarized" costs nothing extra (display controls
-        #    visibility, not billing) and never reaches the user (`cli._text_of` takes
+        #    visibility, not billing) and never reaches the user (`turns._text_of` takes
         #    bare strings and `{"type": "text"}` blocks; a thinking block is neither).
         #
         # 2. It MUST NOT be "disabled". On Opus 5 that makes the model occasionally emit

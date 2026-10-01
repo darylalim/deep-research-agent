@@ -1,13 +1,14 @@
-"""Unit tests for the Streamlit front door (`deep_research/webui.py`).
+"""Unit tests for the Streamlit rendering layer (`deep_research/webui.py`).
 
 Two kinds of test here, and they exist for different reasons.
 
-**Parity tests.** `webui` earns its keep by *not* reimplementing `cli.ActivityFeed` —
+**Parity tests.** `webui` earns its keep by *not* reimplementing `turns.ActivityFeed` —
 it subclasses it and overrides `_emit` alone. So the tests worth writing are the ones
 that go red if that reuse is ever quietly undone: a researcher's prose reaching the
 feed, a replayed tool call counted twice, a subagent's `ls` shown as the orchestrator's.
-Each of these is a bug this repo has already paid for once, in `cli.py` or in
-`evals/harness.TurnRecorder`.
+Each of these is a bug this repo has already paid for once, in the feed or in
+`evals/harness.TurnRecorder`. (`test_activity_feed.py` pins the same rules on the base
+class; these pin that the subclass did not override them away.)
 
 **Widget tests**, driven by `streamlit.testing.v1.AppTest`, which runs a script headless
 and exposes the elements it produced. That is the only way to assert on the thing that
@@ -25,15 +26,10 @@ import pytest
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Interrupt
-
-# Skips cleanly when the optional `ui` dependency group is not installed. CI syncs
-# `--group ui` precisely so this never actually skips there.
-pytest.importorskip("streamlit")
-
 from streamlit.testing.v1 import AppTest
 
 from deep_research import webui
-from deep_research.cli import FEED_KINDS, FeedEvent
+from deep_research.turns import FEED_KINDS
 
 SUBAGENT_NS: tuple[str, ...] = ("tools:9d0c2f4e",)
 
@@ -140,8 +136,8 @@ class TestStreamlitFeedInheritsEveryRule:
         # re-emits the cached writes of siblings that already succeeded, as FRESH
         # ToolMessage objects — `id=None` on the first pass, a new uuid on the resume —
         # so a message-id seen-set matches neither and lets every duplicate through.
-        # In the browser this matters more than in the terminal: `replay()` redraws the
-        # whole list on every rerun, so one duplicate becomes one duplicate per approval.
+        # `replay()` redraws the whole list on every rerun, so one duplicate here becomes
+        # one duplicate per approval.
         feed.absorb((), _delegation())
         for _ in range(2):
             feed.absorb(
@@ -216,6 +212,8 @@ class TestStreamlitFeedInheritsEveryRule:
         )
         live = webui.StreamlitFeed()
         live.absorb((), _delegation())
+        # Drawn as it is recorded — the live feed, inside the page's `st.status` box…
+        assert drawn == ["delegate"]
         drawn.clear()
 
         live.replay()
@@ -224,67 +222,52 @@ class TestStreamlitFeedInheritsEveryRule:
 
 
 @pytest.mark.parametrize("kind", FEED_KINDS)
-def test_every_feed_kind_is_rendered_by_both_front_ends(
-    kind: str, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Both renderers must handle every `FEED_KINDS` entry.
+def test_every_feed_kind_is_rendered(kind: str) -> None:
+    """The renderer must handle every `FEED_KINDS` entry.
 
-    Each is an if/elif chain that draws NOTHING for a kind it does not know, so an event
-    kind wired into only one front end is invisible rather than broken — no exception,
-    no failing test, just a line that silently stops appearing in the other.
+    `render_event` is an if/elif chain that draws NOTHING for a kind it does not know, so
+    an event kind the renderer was never taught is invisible rather than broken — no
+    exception, no failing test, just a line that silently never appears.
 
     **Parametrized per kind on purpose.** This started life as one test asserting
     `len(markdown) >= len(FEED_KINDS)` over every kind at once, and deleting a branch
     from `render_event` still passed it: `plan` draws two elements, so the totals had
     exactly one element of slack and it absorbed exactly one deletion. An aggregate
     assertion over things that are not one-to-one cannot detect a single omission. One
-    kind per run, asserting that kind drew *something*, does — verified by deleting a
-    branch from each renderer in turn.
+    kind per run, asserting that kind drew *something*, does.
     """
-    from deep_research.cli import ActivityFeed
-
-    ActivityFeed()._emit(FeedEvent(kind, text="t", detail="d", items=("i",)))
-    assert capsys.readouterr().out.strip(), f"the terminal drew nothing for {kind!r}"
-
     script = AppTest.from_string(
         "from deep_research import webui\n"
-        "from deep_research.cli import FeedEvent\n"
+        "from deep_research.turns import FeedEvent\n"
         f"webui.render_event(FeedEvent({kind!r}, text='t', detail='d', items=('i',)))\n"
     )
     script.run()
 
     assert not script.exception, script.exception
-    assert script.markdown, f"the browser drew nothing for {kind!r}"
+    assert script.markdown, f"nothing was drawn for {kind!r}"
 
 
-def test_feed_kinds_lists_every_kind_the_renderers_actually_handle() -> None:
+def test_feed_kinds_lists_every_kind_the_renderer_actually_handles() -> None:
     """The other direction, and the test above is worth little without it.
 
-    `test_every_feed_kind_is_rendered_by_both_front_ends` parametrizes over
-    `FEED_KINDS`, so a kind wired into both renderers but forgotten in the tuple is
-    simply never exercised — and the next person to add a kind and wire only one
-    renderer then gets exactly the silent blank line the tuple exists to catch. Closing
-    the loop means asserting the tuple is neither missing entries nor carrying dead ones.
+    `test_every_feed_kind_is_rendered` parametrizes over `FEED_KINDS`, so a kind wired
+    into the renderer but forgotten in the tuple is simply never exercised — and the next
+    person to add a kind and forget the renderer then gets exactly the silent blank line
+    the tuple exists to catch. Closing the loop means asserting the tuple is neither
+    missing entries nor carrying dead ones.
 
     Reading the branches out of the source is deliberate. Driving `absorb` instead would
     only reach the kinds a fixture happens to trigger, which is the same partial-coverage
-    problem one level down; the if/elif chains ARE the contract, so they are what gets
+    problem one level down; the if/elif chain IS the contract, so it is what gets
     compared.
     """
     import inspect
     import re
 
-    from deep_research.cli import ActivityFeed
+    drawn = set(re.findall(r'kind == "(\w+)"', inspect.getsource(webui.render_event)))
 
-    terminal = set(
-        re.findall(r'event\.kind == "(\w+)"', inspect.getsource(ActivityFeed._emit))
-    )
-    browser = set(re.findall(r'kind == "(\w+)"', inspect.getsource(webui.render_event)))
-
-    assert terminal, "found no branches — the regex has drifted from the source"
-    assert browser, "found no branches — the regex has drifted from the source"
-    assert terminal == set(FEED_KINDS)
-    assert browser == set(FEED_KINDS)
+    assert drawn, "found no branches — the regex has drifted from the source"
+    assert drawn == set(FEED_KINDS)
 
 
 class TestMemoryFiles:
@@ -482,9 +465,10 @@ def test_only_the_decisions_the_tool_permits_are_offered() -> None:
 
 
 def test_no_decision_is_preselected() -> None:
-    # Deliberately unlike the REPL, which defaults to approve because bare Enter has to
-    # mean something. A UI has no such affordance, so an explicit click costs the reviewer
-    # nothing and removes the one path by which a gate degrades into a rubber stamp.
+    # An explicit click costs the reviewer nothing and removes the one path by which a
+    # gate degrades into a rubber stamp. (The terminal REPL this project once had
+    # defaulted to approve, because bare Enter had to mean something; a UI has no such
+    # affordance to excuse it.)
     script = _form(Interrupt(id="i1", value={"action_requests": [_WRITE]}))
 
     assert script.session_state["decisions"] is None
@@ -495,7 +479,7 @@ def test_no_decision_is_preselected() -> None:
 def test_unparsable_edit_arguments_never_fall_back_to_approving_the_original() -> None:
     """A typo is not consent — this is the only security boundary the app has.
 
-    The REPL learned this the hard way: it used to return `approve` with the ORIGINAL,
+    The old terminal REPL learned this the hard way: it returned `approve` with the ORIGINAL,
     unedited arguments whenever a mistyped edit failed to parse, so a reviewer who chose
     `edit` precisely because the write looked wrong, and then fat-fingered the JSON,
     silently approved the very write they were trying to narrow.
@@ -517,9 +501,8 @@ def test_unparsable_edit_arguments_never_fall_back_to_approving_the_original() -
 
 
 def test_the_edit_box_is_prefilled_with_the_real_arguments() -> None:
-    # So narrowing a path is an edit rather than a retype. The CLI starts blank because a
-    # terminal cannot prefill a line; a browser can, and a reviewer who has to retype the
-    # whole args dict will approve as-is instead.
+    # So narrowing a path is an edit rather than a retype — a reviewer who has to retype
+    # the whole args dict will approve as-is instead.
     script = _form(Interrupt(id="i1", value={"action_requests": [_WRITE]}))
     script.button_group[0].set_value("edit").run()
 
@@ -529,8 +512,7 @@ def test_the_edit_box_is_prefilled_with_the_real_arguments() -> None:
 def test_the_full_file_body_is_shown_rather_than_elided() -> None:
     """The gate exists so a human READS the content; the browser has no reason to clip it.
 
-    The terminal caps its preview at `PREVIEW_LINES` because a scrollback buffer is a poor
-    place to dump a report. `st.code` scrolls, so the whole body goes in — an elided
+    `st.code` scrolls, so the whole body goes in — an elided
     review is a review that gets rubber-stamped, and `/memories/` is gitignored, so
     nothing undoes a bad write.
     """

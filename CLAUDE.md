@@ -6,27 +6,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **deep research agent** — a thin, opinionated assembly layer over the
 [`deepagents`](https://docs.langchain.com/oss/python/deepagents/overview) library
-(currently v0.7.x) on LangChain 1.0 + LangGraph. Two files carry the weight:
-`agent.py` (~250 lines) — *how* `create_deep_agent()` is wired — and `cli.py`
-(~1220 lines, the largest module here) — the human-in-the-loop
-interrupt/resume protocol that wiring implies, plus every rule about what a user may
-be shown. `webui.py` (~635) and `streamlit_app.py` (~455) are the browser front end:
-no longer small — `webui.py` is over half of `cli.py` — but still mostly *reuse* of
-`cli.py`'s rules, plus the rerun state machine that reuse has to sit inside.
-`config.py`, `tools.py`, and `subagents.py` are genuinely small support modules.
+(currently v0.7.x) on LangChain 1.0 + LangGraph, served as a **Streamlit app**. Four
+files carry the weight: `agent.py` (~250 lines) — *how* `create_deep_agent()` is wired;
+`turns.py` (~800, the largest module) — what a turn did and what a user may be shown of
+it: the activity feed, interrupt parsing, stop notes, and the answer read back from the
+checkpoint, all as presentation-free data; `webui.py` (~640) — Streamlit rendering and
+the approval widgets, which *reuse* `turns.py`'s rules rather than restating them; and
+`streamlit_app.py` (~490) — the page, i.e. the rerun state machine a paused turn has to
+live inside. `config.py`, `tools.py`, and `subagents.py` are genuinely small support
+modules.
 
-**Three front doors, one builder.** `python -m deep_research` (terminal),
-`streamlit run streamlit_app.py` (browser), and `langgraph dev` (HTTP server) all
-assemble the agent through `agent.build_agent()`, so a tool or subagent added there
-appears in all three in one edit. They differ only in persistence and presentation.
+**One front door.** `streamlit run streamlit_app.py` is the only way in. A terminal REPL
+(`python -m deep_research`, the old `cli.py`) and a `langgraph dev` HTTP server
+(`graph.py`) were removed; `turns.py` is what survived of `cli.py` once the REPL-only
+code (input prompts, terminal rendering, `/commands`) was cut. History in this file that
+says "the REPL" or "the CLI" describes measurements taken on that front end — the
+findings still hold, because the rules they produced live on in `turns.py`.
 
 ## Commands
 
 ```bash
 uv sync                          # install deps + the project itself (editable) into ./.venv
-uv run python -m deep_research   # run the interactive REPL (the CLI front door)
-uv run --group serve langgraph dev  # serve the SAME agent over HTTP for Studio / deep-agents-ui
-uv run --group ui streamlit run streamlit_app.py   # the SAME agent in a browser (port 8501)
+uv run streamlit run streamlit_app.py   # run the app (http://localhost:8501)
 uv run pytest                    # offline test suite (no keys/network needed)
 uv run pytest -m live            # opt-in tests that hit real Anthropic/Tavily APIs
 uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
@@ -47,9 +48,9 @@ uv run ty check                  # type check (Astral's ty)
   wire any new hook the same way. It formats and autofixes with ruff, reports
   whatever ruff *can't* autofix, type-checks with `ty` (0.24s, project-wide — CI's
   `lint` job runs it too, so leaving it out of the hook only moved the failure to a
-  red GitHub Actions run; it is also the one step that covers `streamlit_app.py` and
-  `evals/`, which the pytest step below skips), and — for edits under
-  `deep_research/` or `tests/` — runs the offline suite (**~5s**, no keys, no
+  red GitHub Actions run; it is also the one step that covers `evals/`, which the
+  pytest step below skips), and — for edits under `deep_research/`, `tests/`, or to
+  `streamlit_app.py` itself — runs the offline suite (**~5s**, no keys, no
   network; measured, and the number this file carried for a long time — "~1s" — was
   5x optimistic). A non-zero exit blocks with the failure in stderr. **Two consequences for how you edit here:** `ruff check --fix`
   deletes an import whose first *use* lands in a *later* edit, so add an import and its
@@ -73,26 +74,27 @@ uv run ty check                  # type check (Astral's ty)
   `uv run pytest` or the CI `lint` job is where it surfaces, detached from the edit that
   caused it. If you edit Python outside `Edit`/`Write`, run the three steps yourself:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
-- **Tests** live in `tests/` (pytest) — 8 files, ~4,700 lines, and the offline suite runs
-  in **~4s**. Where things are: `test_cli_hitl.py` (1,329 lines, the largest — the HITL
-  decision protocol, `ActivityFeed`, duplicate interrupts, command dispatch),
-  `test_cli_parsing.py` (`render_turn` / `_text_of` / the stop-reason table),
-  `test_agent_wiring.py` (the gate, the backend contract, the served graph),
-  `test_webui.py` + `test_streamlit_page.py` (the browser renderer and its rerun state
-  machine), `test_evals.py` (evaluators, harness, and — see *When the INSTRUMENT is
-  broken* — whether the evaluators themselves can be trusted), `test_config.py` (the model
-  payload), `test_live.py` (marked `live`, deselected by default).
+- **Tests** live in `tests/` (pytest) — 8 files, ~4,500 lines, and the offline suite runs
+  in **~4s**. Where things are: `test_activity_feed.py` (`ActivityFeed` as recorded
+  `FeedEvent`s, plus the interrupt-parsing helpers — `pending_reviews`,
+  `allowed_decisions_by_tool`, `_declined_tools`), `test_turn_parsing.py` (`render_turn` /
+  `_text_of` / the stop-reason table / `export_markdown`, and the parity pin between what
+  the evals grade and what the page draws), `test_agent_wiring.py` (the gate, the backend
+  contract), `test_webui.py` + `test_streamlit_page.py` (the renderer and the page's
+  rerun state machine, including the stop-reason notes), `test_evals.py` (the largest —
+  evaluators, harness, and — see *When the INSTRUMENT is broken* — whether the evaluators
+  themselves can be trusted), `test_config.py` (the model payload), `test_live.py`
+  (marked `live`, deselected by default).
   The offline suite is deliberately narrow —
-  it targets the branching logic in `cli.py` and the load-bearing wiring
+  it targets the branching logic in `turns.py` and the page, and the load-bearing wiring
   invariants (the `open_agent()` assembly smoke test, the `GATED_TOOLS` safety
   gate — including the one derived from the BUILT AGENT's tool list, which is what
   now catches a tool arriving ungated from a dependency — the Opus 5 no-sampling /
   thinking-not-disabled invariants, the `/memories/`
   route and its store
-  namespace, the deepagents 0.7 backend contract, the `langgraph dev`
-  served-graph assembly — it must build with **no** local checkpointer/store yet
-  keep the same gate — and, in `test_webui.py`, that the browser front end still
-  *reuses* `cli.py`'s rules rather than having drifted into its own copy of them),
+  namespace, the deepagents 0.7 backend contract, that the gate is wired together with
+  its checkpointer — and, in `test_webui.py`, that the renderer still *reuses*
+  `turns.py`'s rules rather than having drifted into its own copy of them),
   not the agent's LLM output —
   that half lives in `evals/` (see *Evaluating it*, below). Tests
   use *real* langchain/langgraph types so fakes match runtime shapes. The `live`
@@ -150,12 +152,16 @@ uv run ty check                  # type check (Astral's ty)
     release body; that style ends here. Pushing an annotated tag by hand before the
     bump merges does not preserve it — the job reuses the tag but writes generated
     notes over your prose.
-- **No console-script entry point** — the app is invoked only as a module
-  (`python -m deep_research` → `__main__.py` → `cli.main`).
+- **No console-script entry point, and no `python -m deep_research`** — the app is
+  `streamlit run streamlit_app.py`, and `streamlit` is a core dependency (not an
+  optional group) because of it. The page lives at the repo root, outside the package;
+  `streamlit run` puts its directory on `sys.path`, and the editable install supplies
+  `deep_research`.
 - **`ruff` selects more than the defaults** (`[tool.ruff.lint]` in `pyproject.toml`):
   `E,F,I,UP,B,SIM,RUF,BLE`, with `E501` ignored because the formatter owns line
-  length. `BLE` is load-bearing — it is what makes the `# noqa: BLE001` on the
-  broad `except` in `cli.py::main` an *enforced* suppression; under ruff's
+  length. `BLE` is load-bearing — it is what makes the `# noqa: BLE001`s on the
+  broad `except`s in `streamlit_app.py` and `webui.memory_browser` *enforced*
+  suppressions; under ruff's
   defaults that rule is off, so the directive would be dead (`RUF100` catches
   exactly this). `target-version` is inferred from `requires-python`, so the
   3.11 floor governs `UP` fixes without a separate setting.
@@ -176,10 +182,11 @@ uv run ty check                  # type check (Astral's ty)
   write down which ty version still needs it — an upgrade is what makes it dead, and the
   failure surfaces in CI's lint job rather than anywhere near the code.
 - Requires `.env` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` (copy from
-  `.env.example`). `config.missing_keys()` hard-exits the CLI if either is unset.
+  `.env.example`). `config.missing_keys()` stops the page with an error if either is
+  unset.
   **`python -m evals` needs a third — `LANGSMITH_API_KEY`** — and hard-exits on any of
   the three (`evals/__main__.py`), because the dataset and the experiment both live in
-  LangSmith. It is not needed for `pytest`, the REPL, or either browser/server front door.
+  LangSmith. It is not needed for `pytest` or the app.
 
 ## Architecture: the three things that span multiple files
 
@@ -208,7 +215,7 @@ approval — so changing the route or the prompt must stay in sync.
 `MEMORY_NAMESPACE = ("filesystem",)` is the Store namespace those files are filed
 under, and its **value must never change**. It is exactly what deepagents' legacy
 auto-detection resolves to for this app (its `assistant_id` branch is a LangGraph
-Platform concept a local CLI never sets), so it is the key every note already in
+Platform concept a local app never sets), so it is the key every note already in
 `memories.sqlite` lives under — change it and the user's durable memory is orphaned,
 silently. Passing it *explicitly* is separately required: a `StoreBackend` with no
 `namespace` was deprecated and is removed in 0.7.
@@ -272,7 +279,13 @@ tool call at *invoke* time.
 `GATED_TOOLS` (`write_file`, `edit_file`, `delete`, `execute`) is passed as `interrupt_on`,
 which pauses the graph for human approval. **This REQUIRES a checkpointer** — the
 pending interrupt is persisted there. The two are wired together in the same
-`create_deep_agent()` call; don't add interrupts without a checkpointer, and note
+`create_deep_agent()` call, and `build_agent`'s `checkpointer`/`store` are **required**
+keyword arguments for exactly this reason: `create_deep_agent` only enforces the
+dependency at *invoke* time, so an agent built without one compiles cleanly and fails on
+its first gated call, mid-turn. (They defaulted to `None` while a `langgraph dev` server
+injected its own persistence; that front door is gone.)
+`test_open_agent_wires_the_gate_together_with_its_persistence` pins the pair. Don't add
+interrupts without a checkpointer, and note
 that gating a *new* tool is adding its name to `GATED_TOOLS` (a `True` expands
 to all four decisions — `approve`, `edit`, `reject`, `respond`; an
 `InterruptOnConfig` narrows them).
@@ -300,24 +313,25 @@ proposed against every tool that actually interrupted. `test_agent_wiring.py` on
 the dict *says* `True`; measured, flipping `GATED_TOOLS["write_file"]` to `False` left
 all six other code metrics and both judges green.
 
-### 3. The HITL resume loop is split across `agent.py` and `cli.py`
+### 3. The HITL resume loop is split across `agent.py`, `turns.py` and the page
 
-`agent.py` declares *which* tools interrupt. `cli.py` implements the protocol that
-drives them:
+`agent.py` declares *which* tools interrupt. `turns.py` parses what an interrupt carries
+and drains the stream; `webui.approval_form` collects the decisions; `streamlit_app.py`
+sequences the loop across reruns:
 
-- **The CLI streams** (`stream_mode="updates"`, `subgraphs=True`) — same call the eval
+- **The app streams** (`stream_mode="updates"`, `subgraphs=True`) — same call the eval
   harness has always made — so an interrupt arrives as an `{"__interrupt__": (...)}`
   *chunk*, not as a key on a result. (`invoke()`'s `result["__interrupt__"]` was itself
   only a post-drain aggregate LangGraph assembled internally.)
 - **Drain the stream, THEN prompt, then restream.** Not a style choice. An interrupt chunk
   does not end the stream: LangGraph does not treat a `GraphInterrupt` as a failure, so
   sibling tasks in the same superstep run on and a *second* researcher's interrupt arrives
-  after the first. And the graph executes *inside* the generator — blocking on `input()`
+  after the first. And the graph executes *inside* the generator — pausing for a human
   mid-iteration freezes the Pregel loop, and starting the resume stream tears the old
   generator down, cancelling a still-running researcher whose interrupt was never emitted
-  and throwing away searches you already paid for. `_stream_turn` drains; `main` decides on
-  the whole set; the loop restreams with `Command(resume=...)`.
-- **The same interrupt is emitted TWICE, and `_collect_decisions` must dedupe by id.**
+  and throwing away searches you already paid for. `_stream_turn` drains; the page shows
+  an approval form for the whole set; the next rerun restreams with `Command(resume=...)`.
+- **The same interrupt is emitted TWICE, and `pending_reviews` must dedupe by id.**
   With `subgraphs=True`, an interrupt raised inside a subagent is emitted at the subagent's
   namespace *and* again, bubbled, at the root — same `Interrupt.id`. Prompting per
   occurrence asks the human to approve one researcher's `write_file` twice and (since the
@@ -333,7 +347,7 @@ drives them:
   **score 1**. The safety metric, defeated by the thing it was written to catch. Both sides of
   the comparison have to count real events, not emissions.
 
-- **Dedupe on TOOL-CALL ids, never on `BaseMessage.id`.** Both `cli.ActivityFeed` and
+- **Dedupe on TOOL-CALL ids, never on `BaseMessage.id`.** Both `turns.ActivityFeed` and
   `harness.TurnRecorder` learned this the hard way. A resumed superstep re-emits the *cached
   writes* of siblings that already succeeded (`_reapply_writes_to_succeeded_nodes`), and those
   arrive as **fresh** `ToolMessage` objects — measured: `id=None` on the first pass, a
@@ -347,8 +361,8 @@ drives them:
 - **A rejection reaches the stream as `status="error"`.** `HumanInTheLoopMiddleware` answers a
   rejected call with a synthetic `ToolMessage` whose status is `"error"` and whose content is
   *the human's own reason*, if they gave one. So nothing downstream can tell a rejection from
-  a crash — the feed printed `! write_file failed: too risky` at the person who had just typed
-  `r`. `main` zips the decisions it collected back against the `action_requests`
+  a crash — the feed reported `write_file failed: too risky` to the person who had just
+  rejected it. The page zips the decisions it collected back against the `action_requests`
   (`_declined_tools`) and hands `ActivityFeed.note_declined` the resulting set of tool
   *names* — name-level, because an `ActionRequest` carries no tool-call id; a feed that
   guesses from the message content cannot be right.
@@ -362,9 +376,10 @@ drives them:
   interrupt whose value carries **two parallel lists**: `action_requests` (what the
   agent wants to do — name/args/description, and *not* what may be decided about it)
   and `review_configs` (per-tool `allowed_decisions`, keyed by `action_name`).
-  `_collect_decisions` returns `dict[interrupt_id, list[decision]]` — one decision
-  per `action_request`, in order, *within each interrupt* — and looks the permitted
-  decisions up **by name**, not by position.
+  `webui.approval_form` returns `dict[interrupt_id, list[decision]]` — one decision
+  per `action_request`, in order, *within each interrupt* — and
+  `allowed_decisions_by_tool` looks the permitted decisions up **by name**, not by
+  position.
 - **A turn can hold more than one interrupt.** The orchestrator dispatches each
   `task` call as its own concurrent graph task, and every subagent inherits
   `interrupt_on` — so two `researcher`s fanned out in one turn (which `SYSTEM_PROMPT`
@@ -375,23 +390,26 @@ drives them:
   there are multiple pending interrupts, you must specify the interrupt id when
   resuming`. The mapping is also correct for the ordinary single-interrupt case, so
   there is one code path — keep it that way.
-- Resuming can hit the *next* gated tool, so `cli.py` **loops**
-  `while pending := _stream_turn(...)` until the turn finishes.
+- Resuming can hit the *next* gated tool, so the page **loops** — stream, approve,
+  restream — until a stream drains with nothing pending, unrolled across reruns (see
+  *A turn is a state machine spread across reruns*, below).
 
-**The feed shows actions; the answer comes from state.** `ActivityFeed` renders the tool
+**The feed shows actions; the answer comes from state.** `ActivityFeed` records the tool
 activity on the stream — the plan, each delegated sub-question, every search query — and
-prints **no prose**, because the stream carries the *researchers'* assistant messages and
-the user must never see one. The printed answer is `render_turn(agent.get_state(config).values)`,
-which is the same call `evals/harness.py` makes to build the `response` it grades. Build the
-printed answer from stream chunks instead and the citation metrics become fiction — and a
-subagent's internal prose gets shown as the agent's answer. Same rule for `/export`
-(`render_thread`), which reads the checkpoint for exactly this reason even though the
+records **no prose**, because the stream carries the *researchers'* assistant messages and
+the user must never see one. The answer the page draws is the last `ai` section of
+`thread_sections(agent.get_state(config).values)`, and `evals/harness.py` grades
+`render_turn` of the same state — which is the same text for a finished turn, pinned by
+`test_render_turn_is_the_answer_the_page_draws`. Build the answer from stream chunks
+instead and the citation metrics become fiction — and a subagent's internal prose gets
+shown as the agent's answer. Same rule for the export button (`export_markdown` →
+`render_thread`), which reads the checkpoint for exactly this reason even though the
 streaming loop has the chunks in hand.
 
 **The feed's plan and `ls` lines are orchestrator-only, and that is the same rule the evals
 enforce.** Every declarative subagent still gets its own `FilesystemMiddleware`, so a
 `researcher` really does call `ls`, `write_file` and `delete` — and those chunks stream out
-under its namespace. Render them namespace-blind and you print `⌕ /memories/` on a turn where
+under its namespace. Record them namespace-blind and you show `/memories/` as checked on a turn where
 the orchestrator never looked, hiding the very direct-path defect this file tells you to keep
 watching. It is the `orchestrator_trajectory` vs `trajectory` distinction, in the display
 layer. The **plan** half of the guard is defence in depth rather than load-bearing now:
@@ -404,10 +422,10 @@ needed no edit when the list changed underneath it.
 Also note the `ls` body is **not** newline-separated: deepagents renders a non-empty listing
 as `str(paths)`, a Python list repr (`"['/memories/a.md']"`), and an *empty* one as the bare
 string `"No files found"` (`_format_file_paths`, `deepagents/middleware/filesystem.py`).
-Counting lines is wrong either way — it reports "1 file(s)" for an empty store — so `cli.py`
-matches the `_LS_EMPTY` sentinel, else parses the repr with `ast.literal_eval`, and prints
-`?` only when it is neither. **Both empty shapes are handled deliberately**, because for a
-while only the 0.6 repr was: an empty `/memories/` rendered `⌕ /memories/ · ?`, which reads
+Counting lines is wrong either way — it reports "1 file(s)" for an empty store — so
+`turns.py` matches the `_LS_EMPTY` sentinel, else parses the repr with `ast.literal_eval`,
+and reports `?` only when it is neither. **Both empty shapes are handled deliberately**, because for a
+while only the 0.6 repr was: an empty `/memories/` rendered `/memories/ · ?`, which reads
 as "the feed could not tell" when the truth was "the orchestrator looked and found nothing"
 — and this line is the direct-path signal the evals watch. `_LS_EMPTY` is a hand-copied
 literal, so `test_the_empty_ls_sentinel_still_matches_what_deepagents_returns` calls the
@@ -424,116 +442,57 @@ as fresh `ToolMessage` objects, and `BaseMessage.id` is optional, so message-id 
 the duplicate through (observed: a researcher's completion line printed twice, once per
 approval round).
 
-**The menu is not hardcoded, and must not be.** The middleware raises `ValueError`
-if a decision's type is outside that tool's `allowed_decisions`, and `main`'s broad
-`except` would swallow it into a one-line `! error:` — losing the whole turn. So
-`_prompt_decision` builds its options from the `ReviewConfig` it is handed. This is
-invisible today only because every `GATED_TOOLS` value is `True` (all four
-decisions); the moment one becomes an `InterruptOnConfig` that drops `edit`, a
-hardcoded `[e]dit` option would break the turn.
+**The decision controls are not hardcoded, and must not be.** The middleware raises
+`ValueError` if a decision's type is outside that tool's `allowed_decisions`, which
+surfaces as a dead turn. So `webui.decision_controls` builds its options from the
+`ReviewConfig` it is handed, ordered by `turns.DEFAULT_ALLOWED_DECISIONS`. This is
+invisible today only because every `GATED_TOOLS` value is `True` (all four decisions);
+the moment one becomes an `InterruptOnConfig` that drops `edit`, a hardcoded *Edit*
+option would break the turn.
 
-If you change what's gated, or how decisions are shaped, both `_collect_decisions`
-/ `_prompt_decision` in `cli.py` and `GATED_TOOLS` in `agent.py` are in scope.
+If you change what's gated, or how decisions are shaped, `pending_reviews` /
+`allowed_decisions_by_tool` in `turns.py`, `decision_controls` / `approval_form` in
+`webui.py`, and `GATED_TOOLS` in `agent.py` are all in scope.
 
 ### Lifecycle: `open_agent()` is a context manager for a reason
 
 The compiled agent holds open sqlite connections (checkpointer + store), so it's
 only valid inside the `with open_agent() as agent:` block. Run the entire session
-inside it (as `cli.main` does); don't return the agent out of the block.
+inside it; don't return the agent out of the block. The app keeps the block open for the
+process lifetime by caching the `ExitStack` that entered it (see `st.cache_resource`,
+below).
 
-### The second front door: serving over HTTP (`graph.py` + `langgraph.json`)
+### The app: `streamlit_app.py` + `webui.py` (+ `turns.py`)
 
-`open_agent()` is the CLI's way in; `graph.py` is the other one — the module
-`langgraph dev` (and `langgraph up` / LangGraph Platform, and the `deep-agents-ui`
-web app) loads. Both delegate to one shared builder, `agent.build_agent(*,
-checkpointer=None, store=None)`, which owns the entire assembly — model, tools,
-subagent, system prompt, HITL gate, `/memories/` routing, name — so the two front
-doors genuinely **cannot** drift: add a tool or subagent in `agent.py` and both gain
-it in one edit. The single deliberate difference is persistence: `graph.py` calls
-`build_agent()` with **no `checkpointer=` and no `store=`**. On the server the topology inverts — the
-*server* owns persistence and injects both at runtime — so a compiled-in
-checkpointer is redundant at best and overridden at worst. Omitting it is also what
-keeps `interrupt_on` legal here: `create_deep_agent(interrupt_on=...)` compiles with
-no checkpointer (the requirement is enforced at *invoke* time, which the server
-satisfies), so the HITL gate fires server-side exactly as for the CLI —
-`deep-agents-ui`'s tool-approval UI renders the same `action_requests` /
-`review_configs` payload `cli.py::_collect_decisions` parses. Verified live: the
-served graph's node list contains `HumanInTheLoopMiddleware.after_model`.
-
-`build_backend()` is reused **unchanged**, and that is the load-bearing part.
-`StoreBackend` resolves the store from the runtime via `get_store()` (deepagents
-`backends/store.py`), not from a constructor arg — so `/memories/` transparently
-reads the *server's* store instead of the CLI's `SqliteStore`: same route, same
-`MEMORY_NAMESPACE`, different concrete backend. **Consequence:** notes the CLI wrote
-to `.deep_research/memories.sqlite` are *not* visible to a served instance; it is a
-different physical store under the same namespace key.
-
-**`langgraph.json` must reference the graph as a MODULE path, never a file path:**
-`"deep_research.graph:graph"`, not `"./deep_research/graph.py:graph"`. The loader
-(`langgraph_api/graph.py`) branches on one character — a value containing `/` is
-imported by file path (`spec_from_file_location` → a standalone module with no
-package parent → `from .agent import …` dies with "attempted relative import with no
-known parent package"); no `/` means a dotted-module import
-(`importlib.import_module` → proper package → relative imports work). The project is
-installed editable, so the dotted form resolves and lets `graph.py` keep the same
-relative imports as every other module. Measured, not guessed: the file-path form
-was tried and crashed the server on startup.
-(The offline suite only pins *assembly*, never serving — so verify a `graph.py` /
-`langgraph.json` change live: `uv run --group serve langgraph dev`, then curl
-`/assistants/search`, expecting graph_id `research`.)
-
-And it points at the module-level *compiled* `graph`, not the `build_graph`
-**factory** (`deep_research.graph:build_graph`): `langgraph_api` re-invokes a graph
-factory on **every run** (`invoke_factory`), which would rebuild the model, tools,
-and subagent per request; a compiled graph is built once at import and reused. The
-cost is that importing `graph.py` constructs the agent — which is why the tests
-import it *inside* the test body, so a build break fails those tests rather than
-erroring the whole file at collection.
-
-`langgraph dev` needs the `inmem` extra (`langgraph-cli[inmem]`), kept in its own
-**`serve` dependency-group** — out of the default set, so the lint/test CI jobs'
-bare `uv sync` stays lean — and run with `uv run --group serve langgraph dev`. It
-writes throwaway pickled state to `.langgraph_api/` (gitignored). Three tests in
-`test_agent_wiring.py` pin the wiring: `test_served_graph_assembles_offline` (it
-compiles), `test_served_graph_delegates_to_the_shared_builder` (it routes through
-`build_agent`, not a re-inlined `create_deep_agent`), and
-`test_shared_builder_gates_and_routes_without_persistence` (no checkpointer/store,
-yet the SAME `GATED_TOOLS` / `SYSTEM_PROMPT` / `backend` **objects** *and* a
-non-empty tool/subagent set — identity checks, so a divergent second assembly goes
-red).
-
-### The third front door: the browser (`streamlit_app.py` + `webui.py`)
-
-`uv run --group ui streamlit run streamlit_app.py`. Same agent, same
-`.deep_research/` databases, same threads as the REPL — a thread started in one
-continues in the other, because both go through `open_agent()`. It adds no behaviour;
-it is a second *renderer*, and the discipline that keeps it that way is worth stating
-plainly: **every rule about what a user may be shown is imported from `cli.py`, never
-restated.**
+`uv run streamlit run streamlit_app.py`. It goes through `open_agent()`, so the
+`.deep_research/` databases and threads survive a restart. The rendering layer adds no
+behaviour, and the discipline that keeps it that way is worth stating plainly: **every
+rule about what a user may be shown lives in `turns.py`, and `webui.py` imports it rather
+than restating it.**
 
 **The `FeedEvent` / `_emit` seam is the load-bearing part, and it exists because of a
 measured history.** `ActivityFeed.absorb`'s logic — dedupe on tool-call ids, skip
 updates carrying a `RemoveMessage`, orchestrator-only plan and `ls`, never a word of a
 researcher's prose — already existed **twice** in this repo (here and in
 `evals/harness.TurnRecorder`), and the *same* call-id dedupe bug was found and fixed in
-both, separately. A third hand-written copy for the web was not an option. So
-`ActivityFeed` now decides *what happened* and emits a `FeedEvent`; `_emit` decides how
-it looks. The terminal strings are unchanged (`TestActivityFeed` asserts them verbatim),
-and `webui.StreamlitFeed` overrides `_emit` **alone**.
+both, separately. A third hand-written copy in the renderer was not an option. So
+`ActivityFeed` decides *what happened* and records a `FeedEvent` (the base `_emit`
+appends to `self.events`); `webui.StreamlitFeed` extends `_emit` **alone**, to draw each
+event as it is recorded. That split is also what lets `test_activity_feed.py` assert on
+the feed's decisions as plain data, with no renderer in the way.
 
 Consequence for editing: a new feed line is a new `FeedEvent` kind plus a branch in
-**both** renderers. Both are if/elif chains that draw *nothing* for an unknown kind — no
-exception, no failing test, just a line that silently stops appearing in one front end.
-`cli.FEED_KINDS` is the canonical list and
-`test_webui.py::test_every_feed_kind_is_rendered_by_both_front_ends` checks both against
-it, parametrized per kind.
+`webui.render_event`, an if/elif chain that draws *nothing* for an unknown kind — no
+exception, no failing test, just a line that silently never appears.
+`turns.FEED_KINDS` is the canonical list and `test_webui.py::test_every_feed_kind_is_rendered`
+checks the renderer against it, parametrized per kind.
 
 **A turn is a state machine spread across reruns.** Streamlit re-executes the script
 top to bottom on every interaction, but a research turn pauses mid-flight for approval,
 so the turn cannot live in one pass. Four `st.session_state` keys carry it — `payload`
 (the next thing to send: a question or a `Command(resume=…)`), `question`, `feed`, and
-`pending` — and together they unroll `cli.main`'s `while pending := _stream_turn(...)`
-loop across reruns instead of iterations. Five more keys ride alongside without being part
+`pending` — and together they unroll a `while pending := _stream_turn(...)` loop across
+reruns instead of iterations. Five more keys ride alongside without being part
 of that loop: `thread_id`; `abandoned`, which feeds `recover_pending(skip=…)`; and
 `work_logs` / `refusals` / `notice`, which are keyed by *turn index* so a past turn's feed
 and stop-notes survive into later reruns. `_stream_turn` itself is **imported, not
@@ -554,9 +513,9 @@ Two things follow that are easy to get wrong:
   only worth having if the person at it can see what led there.
 - **The answer still comes from the checkpoint.** The transcript is
   `thread_sections(agent.get_state(config).values)` — the shared half of `render_thread`,
-  which `/export` and `evals/harness.py` also use. Building bubbles from stream chunks
-  would leak subagent prose into the UI and make the citation metrics fiction. Same rule
-  as the REPL, and the stream being right there in hand is exactly why it needs saying.
+  which the export button and `evals/harness.py` also use. Building bubbles from stream
+  chunks would leak subagent prose into the UI and make the citation metrics fiction, and
+  the stream being right there in hand is exactly why it needs saying.
 
 **Two `@st.fragment`s, and the reason is UI stability, NOT speed.** Every widget
 interaction reruns the whole script, so a decision click re-read the checkpoint, rebuilt
@@ -669,14 +628,15 @@ queued value even to a widget disabled by the time it arrives. That is the bug
 than shuffle it again. (`st.chat_input` is bottom-pinned by Streamlit, so its script
 position never affected where it appears.)
 
-**Deliberate divergences from the CLI, all in the safer direction.** `decision_controls`
-has **no default selection** — the REPL defaults to approve because bare Enter has to
-mean something, and a UI has no such affordance, so an explicit click costs nothing and
-removes the one path by which a gate degrades into a rubber stamp. Approval previews are
-**not elided** at `PREVIEW_LINES`: `st.code` scrolls, and an elided review is one that
-gets rubber-stamped. Choosing *edit* prefills the real arguments, because a reviewer who
-must retype the whole args dict will approve as-is instead. The CLI's "typo is not
-consent" rule is preserved — unparsable JSON yields no decision and disables submit.
+**Approval design choices, all in the safer direction** (each was a deliberate
+divergence from the old REPL's behaviour). `decision_controls` has **no default
+selection** — the REPL defaulted to approve because bare Enter had to mean something; a
+UI has no such affordance, so an explicit click costs nothing and removes the one path
+by which a gate degrades into a rubber stamp. Approval previews are **not elided**:
+`st.code` scrolls, and an elided review is one that gets rubber-stamped. Choosing *edit*
+prefills the real arguments, because a reviewer who must retype the whole args dict will
+approve as-is instead. "A typo is not consent" — unparsable JSON yields no decision and
+disables submit.
 
 **`MEMORY_ROUTE` exists because `CompositeBackend` strips the route prefix before
 delegating.** A note the agent wrote to `/memories/pricing.md` is stored under the Store
@@ -706,8 +666,9 @@ away. Module-level mutable state is normally a Streamlit bug — the per-user st
 `st.session_state` — but here the thing being guarded is process-wide too.
 
 Still on the operator: `SqliteStore.from_conn_string` sets no `journal_mode=WAL` (unlike
-`SqliteSaver`, which does), so the REPL and the browser writing `memories.sqlite`
-simultaneously can raise `database is locked`. `claim_thread` guards one process.
+`SqliteSaver`, which does), so two `streamlit run` processes on one state dir writing
+`memories.sqlite` simultaneously can raise `database is locked`. `claim_thread` guards one
+process.
 
 **`RerunException` derives from `BaseException`, and that has teeth here.** Streamlit
 aborts a running script at its next `st.*` call — and the feed calls `st.markdown` on
@@ -748,8 +709,8 @@ input to a thread with a pending interrupt (the prefill 400 documented above).
 `webui.recover_pending` reads `StateSnapshot.interrupts` — already the flattened
 `[i for task in tasks_with_writes for i in task.interrupts]`, so there is no need to walk
 `.tasks`. It runs only when the session is idle; during a turn the live stream is the
-authority, because the checkpoint lags it. This is also what makes "a thread you start in
-one front door continues in the other" true for a thread the REPL left paused.
+authority, because the checkpoint lags it. It is also what makes a restart of the app
+resume a thread left paused at an approval.
 
 **It also takes `skip=`, fed from `st.session_state.abandoned`, and that argument is what
 makes "Abandon this turn" actually abandon it.** The interrupt is still in the checkpoint
@@ -761,9 +722,8 @@ notice — a loop with no exit but closing the tab.
 until every action has a valid decision — so a tool gated with decisions this UI cannot
 render would disable it forever, while `busy` has already disabled the chat input and the
 thread field and `st.stop()` ends the page. There would be no control left that could
-move the session forward. `cli._prompt_decision` raises `ValueError` for the same input
-and `cli.main`'s broad `except` abandons the turn; the "Abandon this turn" button is the
-browser's equivalent, and it works for any stuck approval rather than just that one. It is
+move the session forward. The "Abandon this turn" button is the way out, and it works
+for any stuck approval rather than just that one. It is
 drawn by `approval_form` itself, in the same row as submit, via the `secondary_action`
 callback described above — so the way out sits beside the thing it is an alternative to,
 and stays enabled while submit is not.
@@ -775,13 +735,12 @@ authentication and its visitor can spend the API keys, read every note under
 `/memories/`, and click Approve on a gated `write_file`. Serving it to anyone else means
 putting real auth in front of it, not deleting that line.
 
-**CI installs the `ui` group; it does not install `serve`.** Not an inconsistency — the
-difference is first-party code. Nothing in this repo imports `langgraph-cli`, so there is
-nothing in `serve` for lint/ty/pytest to check. `webui.py` and `streamlit_app.py` are
-ours, and `uv sync` is an *exact* sync, so a bare one uninstalls streamlit and `ty` then
-fails both files with `unresolved-import`. `tests/test_webui.py` also guards its import
-with `pytest.importorskip("streamlit")` — that keeps a partial local install working, but
-a suite that silently skips in CI protects nothing, hence the group.
+**`streamlit` is a core dependency, and the tests import it unconditionally.** It used to
+sit in an optional `ui` group (with a `serve` group for `langgraph-cli` beside it), which
+forced CI to remember `--group ui` and the page tests to `pytest.importorskip("streamlit")`.
+Now that the app *is* Streamlit, a missing streamlit is a broken install, and a test that
+skipped over it would hide exactly that — so the guards are gone and a plain
+`uv sync --locked` covers CI.
 
 **Widget behaviour is tested with `streamlit.testing.v1.AppTest`**, which runs a script
 headless and exposes the elements it produced (`AppTest.from_string`, then
@@ -902,14 +861,14 @@ instant `tavily_search` returns, so the very first delegation 400s. A/B measured
 thinking turn with 3 tool calls: `summarized` → replay OK; `omitted` → the 400 above.
 
 `display` controls visibility only — thinking is billed identically either way, so this
-costs nothing — and it never reaches the user, because `cli._text_of` collects bare
+costs nothing — and it never reaches the user, because `turns._text_of` collects bare
 strings and `{"type": "text"}` blocks, and a thinking block is neither.
 
 **A related shape change worth knowing about `_text_of`.** Once thinking is on, an
 assistant message's `content` is a *mixed* list: `["", {…thinking…}, "the answer"]` —
 the answer arrives as a **bare string element**, not a `{"type": "text"}` dict.
 `_text_of` already handles this (it has an `isinstance(block, str)` branch), which is
-the only reason `render_turn` / `/export` / the eval `response` survived this upgrade
+the only reason `render_turn` / the export / the eval `response` survived this upgrade
 untouched. Do not "tidy" that branch away.
 
 **Never "save tokens" with `thinking={"type": "disabled"}`.** On Opus 5 that has a
@@ -931,7 +890,7 @@ to drop the argument. Right trade — a broken default model beats a constrained
 *because* of the above: on Opus 5 the ceiling covers **thinking plus the answer**, and
 this agent's answer is a long cited report. Too tight a ceiling truncates it
 mid-sentence with `stop_reason="max_tokens"` and no exception. What makes a ceiling
-this high safe is **`streaming=True` on the model**, not anything about the CLI. The
+this high safe is **`streaming=True` on the model**, not the app's live feed. The
 two are orthogonal and it is easy to conflate them:
 
 - `streaming=True` flips the *model's own HTTP request* to SSE (`_should_stream()` →
@@ -939,7 +898,7 @@ two are orthogonal and it is easy to conflate them:
   `AIMessage`. Nothing downstream — LangGraph, deepagents, the HITL middleware, the eval
   harness — can tell the difference.
 - The **graph's** `stream_mode` does *not* affect the wire format. The agent's model node
-  calls `model_.invoke()` unconditionally, so `cli.py` streaming with
+  calls `model_.invoke()` unconditionally, so the app streaming with
   `stream_mode="updates"` buys a live activity feed and **zero** `max_tokens` headroom.
 
 This corrects a premise that was wrong here for a long time. The old note claimed 16k kept
@@ -949,7 +908,7 @@ timeout**: langchain passes `default_request_timeout=None` straight into
 — measured. That also *disarms* the SDK's own guard, which only fires when the client still
 carries the SDK default timeout. So a non-streaming request over the guard's threshold
 (`3600 * max_tokens / 128_000 > 600`, i.e. **max_tokens > 21_333**) would not raise — it
-would hang the REPL indefinitely, which is strictly worse than the failure the 16k pin was
+would hang the turn indefinitely, which is strictly worse than the failure the 16k pin was
 imagined to prevent.
 
 **Raise `max_tokens` and set `streaming=True` together, or neither.** Verified that
@@ -973,21 +932,22 @@ by spelling out the default.
 `test_live.py::test_prompt_caching_actually_serves_the_prefix_from_cache` (which asserts
 `cache_read > 0` after two real turns) **passes with `streaming=True`**. Run it after any
 change to `build_model()`: a silently-cold cache roughly doubles the input cost of every
-turn with no visible symptom. That test calls `agent.invoke()`, not the streaming CLI, which
+turn with no visible symptom. That test calls `agent.invoke()`, not the streaming app, which
 is also the cleanest demonstration that the model's wire format is independent of the graph's
 `stream_mode` — and that tool calls reassemble correctly from partial JSON deltas.
 
 **Silent stops reach the user as `(the agent said nothing)` unless something names them,
 and there is more than one.** A generation can end with **HTTP 200, empty content, no
 exception** — it bills, raises nothing, and lands in the checkpoint as an assistant
-message with no prose, which `render_turn` renders as `''` and the REPL reported as
-silence. True, useless, and misattributed: it reads as a bug in `cli.py` rather than as
-something the API told us. `cli._stop_note` / `_turn_stop` name it, and
+message with no prose, which `render_turn` renders as `''` and the app used to report as
+silence. True, useless, and misattributed: it reads as a bug in the app rather than as
+something the API told us. `turns._stop_note` / `_turn_stop` name it (the page turns that
+into a notice or a warning beside the answer — `TestASilentStopIsExplained`), and
 `ActivityFeed._render_stop` covers the subagent case (a researcher's stop is otherwise
 *completely* invisible — its `task` result just comes back thin and the orchestrator
 synthesizes around the hole).
 
-`cli._SILENT_STOPS` is the table, and **it is a snapshot of a Literal that grows**:
+`turns._SILENT_STOPS` is the table, and **it is a snapshot of a Literal that grows**:
 
 - `refusal` — Anthropic's classifiers stopped the generation. Remedy: rephrase or narrow.
 - `model_context_window_exceeded` — **added in `anthropic` 0.120, absent at 0.116.**
@@ -1002,7 +962,7 @@ exists to close. Nothing here or in deepagents' middleware summarizes or trims a
 threads are resumed indefinitely, so this app *will* reach it. It survived a careful
 by-hand review of that same upgrade, in which `general_harms` was spotted in
 `refusal_stop_details.py` and this was missed one file over in `stop_reason.py`.
-`test_cli_parsing.py::TestStopReasonsAreAccountedFor` now compares the table against
+`test_turn_parsing.py::TestStopReasonsAreAccountedFor` now compares the table against
 `anthropic.types.StopReason` by set equality, so the next member goes red on `uv sync` and
 has to be classified as silent or not. **Prose telling a future reader to re-check a file
 is not a check** — that is the whole lesson, and it cost two rounds to learn. The
@@ -1052,11 +1012,11 @@ imprecision as `note_declined` being name-level.
 
 `_render_stop` emits under the **`"refusal"` feed kind, which is now broader than it
 reads** — a context-window overrun rides the same line. Deliberate, and worth knowing
-before "fixing": the kind is an internal selector for the two renderers and never reaches
+before "fixing": the kind is an internal selector for the renderer and never reaches
 the user (who sees `note.reason`), while renaming or adding one is **atomic across
-`FEED_KINDS`, `ActivityFeed._emit` and `webui.render_event`** — `test_webui.py` asserts
-`terminal == set(FEED_KINDS) == browser` in both directions, so every intermediate state is
-red and it cannot be sequenced past the PostToolUse hook. Rename it in one commit with the
+`FEED_KINDS` and `webui.render_event`** — `test_webui.py` asserts the two agree in both
+directions, so every intermediate state is red and it cannot be sequenced past the
+PostToolUse hook. Rename it in one commit with the
 hook disabled, or leave it.
 
 Not implemented, deliberately: Anthropic's server-side `fallbacks` beta
@@ -1103,9 +1063,10 @@ thread**: a brand-new `thread_id` reads a prefix an earlier thread (or an earlie
 *process*) warmed. That is why the test runs two one-turn threads rather than two
 turns on one thread — an opening turn can't hit the sharp edge where invoking fresh
 input on a thread with a *pending HITL interrupt* resumes the model node on a message
-list ending in an assistant message, which Opus 5 still rejects as prefill (400). `cli.py`
-never trips this because it loops on `__interrupt__` and resumes with `Command(resume=...)`
-instead of sending a new turn.
+list ending in an assistant message, which Opus 5 still rejects as prefill (400). The app
+never trips this because it resumes a paused turn with `Command(resume=...)` instead of
+sending a new one, and recovers a pause from the checkpoint before accepting new input
+(`webui.recover_pending`).
 
 ## Evaluating it (`evals/`) — the half pytest deliberately skips
 
@@ -1128,7 +1089,7 @@ assumes otherwise:
   the agent's entire research activity.
 - **Every full run interrupts**, because `write_file` is gated and step 5 of the prompt
   says to persist findings. An unattended `invoke()` returns `__interrupt__` and no
-  answer, scoring 0 for the wrong reason. `harness._approve_all` mirrors `cli.py`'s
+  answer, scoring 0 for the wrong reason. `harness._approve_all` mirrors the app's
   id-keyed resume.
 - **Grade the orchestrator against `orchestrator_trajectory`, never `trajectory`.**
   deepagents gives *every* declarative subagent its own `FilesystemMiddleware`, so the
@@ -1223,13 +1184,13 @@ on `sys.path` for `python -m evals` and `tests/test_evals.py`.
 
 ### What the evals found, and what came of it
 
-**The user was being shown uncited claims — fixed.** `cli.py` printed only the *last*
+**The user was being shown uncited claims — fixed.** The old REPL printed only the *last*
 assistant message, but the agent composes its cited report in the message that also
 proposes `write_file` and then signs off after the tool returns. Measured: 33 source URLs
 in the turn, **zero** in what the user saw, and a closing line pointing at a "summary
-above" that had never been printed. `cli.render_turn()` now renders the whole turn.
-`evals/harness.py` imports that exact function — the eval must grade the bytes the REPL
-prints, or the citation metric is fiction. Two consequences: `/report.md` is gone from
+above" that had never been printed. `turns.render_turn()` now renders the whole turn.
+`evals/harness.py` imports that exact function — the eval must grade the text the user is
+shown, or the citation metric is fiction. Two consequences: `/report.md` is gone from
 `SYSTEM_PROMPT` (it existed to hold a report the user couldn't see, and cost a second
 approval), and the prompt now tells the agent not to narrate, since its words all arrive
 at once.
@@ -1488,10 +1449,10 @@ not being enforced for the evaluators themselves.
   refusal, a context-window overrun or a `max_tokens` truncation all reach the
   evaluators as nothing but a thin `response` — both judges score 0.0,
   `response_cites_sources` scores 0, and off a sweep that is indistinguishable from an
-  agent that researched badly. `cli._stop_note` closes exactly this misattribution for
-  the human at the REPL; the evals had no equivalent, so the one place it is
+  agent that researched badly. `turns._stop_note` closes exactly this misattribution for
+  the human using the app; the evals had no equivalent, so the one place it is
   *aggregated across runs* was the one place it was invisible. `turn_stopped_cleanly`
-  is the new metric, and `UNCLEAN_STOPS` is **derived from** `cli._SILENT_STOPS` rather
+  is the new metric, and `UNCLEAN_STOPS` is **derived from** `turns._SILENT_STOPS` rather
   than copied beside it — that table is already compared against
   `anthropic.types.StopReason` by set equality, so an SDK bump reaches the eval too.
   Its test names `_SILENT_STOPS.keys()` rather than asserting a subset, because a subset
@@ -1531,7 +1492,7 @@ its `count_key` literal, a typo in which would silently make the metric a perman
 non-verdict across a paid sweep — had no test at all. Two claims also had to be walked
 back rather than fixed: `score=None` being excluded from the aggregate was asserted
 from a type signature and is still unmeasured, and the import-cost objection to
-`from deep_research.cli import _SILENT_STOPS` did not survive checking — `evals.harness`
+`from deep_research.turns import _SILENT_STOPS` (then `.cli`) did not survive checking — `evals.harness`
 refuses at the repo root with or without it, so that edge causes nothing; it costs
 ~0.4 s of import time inside a sweep measured in minutes. Nine further guards, all
 verified red by breaking the source.
@@ -1560,17 +1521,11 @@ verified red by breaking the source.
   passing tests noticed nothing.
 - **Production persistence** → swap `SqliteStore`/`SqliteSaver` for the Postgres
   equivalents in `open_agent()`; the `CompositeBackend` routing is unchanged.
-- **Serve it over HTTP / drive it from a web UI** → `uv run --group serve langgraph
-  dev` loads `deep_research.graph:graph` (see *The second front door*, above). Point
-  `deep-agents-ui` or LangGraph Studio at `http://127.0.0.1:2024`, assistant id
-  `research`. `graph.py` delegates to `agent.build_agent()` with no checkpointer/store
-  — the server provides them, so don't add them back; keep `langgraph.json`'s graph
-  value a module path (not a file path) pointing at the compiled `graph` (not the
-  `build_graph` factory).
-- **Change what the browser shows** → `deep_research/webui.py` for rendering and the
+- **Change what the app shows** → `deep_research/webui.py` for rendering and the
   approval widgets, `streamlit_app.py` for the page's sequence and the rerun state
-  machine. A new feed line needs a `FeedEvent` kind in `cli.FEED_KINDS` **and** a branch
-  in both `ActivityFeed._emit` and `webui.render_event` (see *The third front door*).
+  machine, `deep_research/turns.py` for what a turn is judged to have done. A new feed
+  line needs a `FeedEvent` kind in `turns.FEED_KINDS` **and** a branch in
+  `webui.render_event` (see *The app*, above).
   Theme lives in `.streamlit/config.toml`, which defines **both** `[theme.light]` and
   `[theme.dark]` on purpose: a bare `[theme]` locks the app to one mode and removes the
   toggle, and this app's output is long-form prose whose reading mode is the reader's

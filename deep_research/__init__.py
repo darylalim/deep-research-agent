@@ -5,7 +5,7 @@ A persistent, subagent-orchestrating research agent built on Deep Agents
 web-search sub-questions to a `researcher` subagent, keeps durable findings in
 cross-session memory, and gates file writes behind human approval.
 
-Entry point: `python -m deep_research`  (see cli.main).
+Run it: `streamlit run streamlit_app.py` (the page lives at the repo root).
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

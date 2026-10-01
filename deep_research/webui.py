@@ -1,19 +1,14 @@
-"""Streamlit front door: display and the approval protocol, nothing else.
+"""Streamlit rendering: display and the approval protocol, nothing else.
 
-The third way into the same agent, after `cli.py` (the terminal REPL) and `graph.py`
-(the `langgraph dev` / Studio / deep-agents-ui server). Like both of those, this adds
-nothing to what the agent *is* — `agent.build_agent()` stays the single source of that,
-so a tool or subagent added there shows up here for free.
+This adds nothing to what the agent *is* — `agent.build_agent()` stays the single source
+of that. It is the *renderer*, and every rule about what a user may be shown is imported
+from `turns.py` rather than restated here:
 
-What this module adds is a second *renderer*, and every rule about what a user may be
-shown is imported from `cli.py` rather than restated:
-
-- `ActivityFeed` decides what happened; `StreamlitFeed` only re-skins it via `_emit`.
+- `ActivityFeed` decides what happened; `StreamlitFeed` only draws it, via `_emit`.
 - `thread_sections` slices the thread into turns; the page turns slices into bubbles.
 - `pending_reviews` / `allowed_decisions_by_tool` parse an interrupt; the widgets here
   present it.
-- `export_markdown` builds the transcript the download button hands over, byte for byte
-  the same document `/export` writes.
+- `export_markdown` builds the transcript the download button hands over.
 
 The one rule worth repeating, because it is the easiest one to lose when a stream is
 right there in your hand: **the answer comes from the checkpoint, never from the
@@ -22,7 +17,7 @@ never see, and `evals/harness.py` grades exactly what `render_turn` / `thread_se
 produce. Building chat bubbles out of stream chunks would leak subagent-internal prose
 into the UI and make the citation metrics fiction.
 
-Some names imported below are underscore-private to `cli.py`. That is deliberate: they
+Some names imported below are underscore-private to `turns.py`. That is deliberate: they
 are private to the *package*, not to the module, and the alternative — a second
 implementation of "how a proposed action is described to a reviewer" — is the exact
 duplication this file exists to avoid.
@@ -39,8 +34,7 @@ from typing import Any
 import streamlit as st
 
 from .agent import MEMORY_NAMESPACE, MEMORY_ROUTE, open_agent
-from .cli import (
-    DECISION_KEYS,
+from .turns import (
     DEFAULT_ALLOWED_DECISIONS,
     ActivityFeed,
     FeedEvent,
@@ -84,8 +78,8 @@ def claim_thread(thread_id: str) -> Iterator[bool]:
     second session arriving during that window sees the same pending interrupt anyway,
     via `recover_pending`, which is the sane outcome rather than a race.
 
-    Note this guards a *process*. Running the REPL and the browser against the same
-    thread at the same time is still on the operator — as is the fact that
+    Note this guards a *process*. Running two `streamlit run` processes against the
+    same state directory is still on the operator — as is the fact that
     `SqliteStore.from_conn_string` (unlike `SqliteSaver`) sets no `journal_mode=WAL`, so
     simultaneous writers on `memories.sqlite` can raise `database is locked`.
     """
@@ -161,10 +155,7 @@ def recover_pending(
     new tab, or a session expiry strands it: the graph still considers the turn paused,
     but the page shows no form and re-enables the chat input. The next question then
     sends fresh input to a thread with a pending interrupt — the prefill 400 CLAUDE.md
-    documents, which `cli.py` never trips only because it never leaves the process.
-
-    It is also what makes the README's "a thread you start in one continues in the other"
-    true for a thread the REPL left paused at an approval.
+    documents.
 
     **`skip` is what stops that recovery from being a trap, and it is not optional.**
     Clearing `st.session_state.pending` does NOT resume the graph — the interrupt is
@@ -176,12 +167,11 @@ def recover_pending(
     reruns in 6 seconds, each paying for `agent.get_state`. The session had no way out,
     in the one control whose entire job is being the way out.
 
-    Passing the ids the session has deliberately given up on is therefore how the page
-    matches the REPL. `cli.main` abandons a turn by letting its broad `except` drop it
-    and reading the next question, leaving the graph paused; the dangling tool calls are
-    answered on the following turn by `PatchToolCallsMiddleware.before_agent`, which is
-    also what keeps that next question clear of the prefill 400. Skipping the interrupt
-    rather than resuming it reproduces exactly that, and it is the only option that works
+    Passing the ids the session has deliberately given up on is therefore how a turn is
+    abandoned: the graph is left paused, and the dangling tool calls are answered on the
+    following turn by `PatchToolCallsMiddleware.before_agent`, which is also what keeps
+    that next question clear of the prefill 400. Skipping the interrupt rather than
+    resuming it is the only option that works
     for the case the escape hatch exists for: a tool whose `allowed_decisions` this UI
     cannot render may not permit `reject` either, so "resume with a rejection" would
     raise `ValueError` inside the middleware on precisely the stuck turn it was meant
@@ -216,14 +206,13 @@ def render_event(event: FeedEvent) -> None:
         # Truncated, though the browser could wrap it. A `task` description is the whole
         # self-contained prompt the orchestrator wrote — measured at ~13 rendered lines
         # each on a real two-researcher turn, which buried the searches around it and
-        # made the live feed unscannable. More generous than the terminal's 90 because
-        # there is room for two lines here, but not unbounded.
+        # made the live feed unscannable. Room for about two lines, but not unbounded.
         st.markdown(
             f":material/person_search: **researcher** · {_one_line(event.text, 220)}"
         )
     elif kind == "search":
         # A subagent's searches are dimmed rather than indented: markdown collapses
-        # leading whitespace, so the terminal feed's indent has no equivalent here.
+        # leading whitespace, so an indent would not survive.
         query = _one_line(event.text, 140)
         st.markdown(
             f':material/search: "{query}"'
@@ -252,7 +241,7 @@ def render_event(event: FeedEvent) -> None:
 
 
 class StreamlitFeed(ActivityFeed):
-    """`ActivityFeed` with the terminal swapped for the current Streamlit container.
+    """`ActivityFeed` that also draws each event into the current Streamlit container.
 
     Only `_emit` changes, so every rule in `absorb` is inherited rather than
     reimplemented: dedupe on tool-call ids (not message ids — a replayed superstep
@@ -260,7 +249,7 @@ class StreamlitFeed(ActivityFeed):
     carrying a `RemoveMessage`, orchestrator-only plan and `ls` lines, and never a word
     of a researcher's prose. See `FeedEvent` for why that reuse is not optional.
 
-    It also **keeps the events**, which the terminal never had to. A Streamlit rerun
+    The events the base class keeps are what make it redrawable. A Streamlit rerun
     re-executes the script from scratch and discards everything previously drawn, but a
     turn that pauses for approval spans several reruns — so the feed has to be able to
     redraw itself. This instance lives in `st.session_state` for the whole turn, which is
@@ -268,12 +257,8 @@ class StreamlitFeed(ActivityFeed):
     replaying lines the user already watched appear.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.events: list[FeedEvent] = []
-
     def _emit(self, event: FeedEvent) -> None:
-        self.events.append(event)
+        super()._emit(event)
         render_event(event)
 
     def replay(self) -> None:
@@ -289,14 +274,13 @@ def render_action(request: dict[str, Any]) -> None:
     see the content before it lands in durable, gitignored `/memories/` that git cannot
     restore, and a reviewer who cannot read the diff approves it unread.
 
-    Three deliberate differences from `cli._render_action`:
+    Three deliberate choices:
 
-    - **Nothing is elided.** The terminal caps the preview at `PREVIEW_LINES` because a
-      scrollback buffer is a poor place to dump a report; a browser has no such excuse,
-      and `st.code` scrolls. An elided review is a review that gets rubber-stamped.
+    - **Nothing is elided.** `st.code` scrolls, so there is no reason to cut a long file
+      body short — and an elided review is a review that gets rubber-stamped.
     - **`language=None`**, i.e. plain monospace. Guessing a highlighter from the tool or
-      the file extension would reintroduce exactly the per-tool special-casing the CLI
-      avoids, and would need updating every time `GATED_TOOLS` grows.
+      the file extension would be per-tool special-casing, and would need updating every
+      time `GATED_TOOLS` grows.
     - **Every value goes through `st.code`, including short scalars.** Not a style
       choice — arguments are written by the MODEL, and the earlier version rendered
       scalars with `st.markdown`, so a `file_path` of `[safe](http://elsewhere)` drew a
@@ -304,11 +288,8 @@ def render_action(request: dict[str, Any]) -> None:
       markdown is precisely wrong on the one screen whose entire job is showing a
       reviewer, verbatim, what is about to happen.
 
-      Sending everything down one path also deletes this function's copy of the CLI's
-      long-vs-scalar classification (the `\\n`-or-over-120-chars test and its
-      `splitlines() or [""]`). That duplication was the same drift `pending_reviews` and
-      `allowed_decisions_by_tool` were extracted to prevent, and it sat in the app's only
-      security-relevant screen. There is nothing left here to drift.
+      Sending everything down one path also means there is no long-vs-scalar
+      classification to get wrong on the app's only security-relevant screen.
     """
     name = request.get("name", "<tool>")
     args = request.get("args", {})
@@ -349,16 +330,14 @@ def decision_controls(
     outside a tool's `allowed_decisions`, and that exception would surface as a dead turn.
     Every value in `GATED_TOOLS` is `True` today (all four decisions), but narrowing them
     with an `InterruptOnConfig` is supported and documented, so the menu is built from
-    what the interrupt actually carries. `DECISION_KEYS` supplies the ordering so the CLI
-    and the UI offer the same choices in the same sequence.
+    what the interrupt actually carries. `DEFAULT_ALLOWED_DECISIONS` supplies the ordering,
+    so a narrowed tool's options appear in the same sequence as everyone else's.
 
-    **There is no default selection**, which is where this deliberately diverges from the
-    REPL. The CLI defaults to approve because bare Enter has to mean something; a UI has
-    no such affordance, so requiring an explicit click costs the reviewer nothing and
-    removes the one path by which a gate degrades into a rubber stamp.
+    **There is no default selection.** Requiring an explicit click costs the reviewer
+    nothing and removes the one path by which a gate degrades into a rubber stamp.
     """
     permitted = set(DEFAULT_ALLOWED_DECISIONS if allowed is None else allowed)
-    options = [decision for decision in DECISION_KEYS if decision in permitted]
+    options = [d for d in DEFAULT_ALLOWED_DECISIONS if d in permitted]
     if not options:
         # Gated with a decision set this UI cannot produce. Guessing would just raise
         # inside the graph, so say so instead.
@@ -454,8 +433,7 @@ def approval_form(
     `researcher`s fanned out in one turn each raise their own. LangGraph rejects a flat
     resume in that case with `RuntimeError: When there are multiple pending interrupts,
     you must specify the interrupt id when resuming`. The mapping form is also correct
-    for the ordinary single-interrupt case, so there is one code path — the same rule
-    `cli._collect_decisions` follows.
+    for the ordinary single-interrupt case, so there is one code path.
 
     Widget keys are `f"{interrupt_id}:{index}"`, which stays stable across the reruns
     that picking a decision costs. Anything derived from position in `pending` would not

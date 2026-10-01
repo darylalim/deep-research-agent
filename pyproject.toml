@@ -60,6 +60,12 @@ dependencies = [
     "langsmith>=0.3,<1.0",
     # Load .env into the environment
     "python-dotenv>=1.0,<2.0",
+    # The app itself (`streamlit run streamlit_app.py` → `deep_research/webui.py`).
+    # Capped at the major: streamlit is 1.x and stable there. The >=1.57 floor is what
+    # ships the bundled agent-skill docs under `streamlit/.agents/`, and
+    # `st.code(height=...)` / `st.chat_input(submit_mode=...)`, both of which `webui.py`
+    # uses.
+    "streamlit>=1.57,<2.0",
 ]
 
 [build-system]
@@ -86,41 +92,13 @@ dev = [
     # not hygiene.
     #
     # **No upper cap, and that is a decision rather than an oversight** — it has been
-    # raised once in review already. The 0.x caps elsewhere in this file (`deepagents`,
-    # `langgraph-cli`) bound things that ship INTO the app, where a surprise resolution
+    # raised once in review already. The 0.x cap elsewhere in this file (`deepagents`)
+    # bounds something that ships INTO the app, where a surprise resolution
     # changes runtime behavior. These two are developer tools: `uv.lock` pins them
     # exactly, so CI and every `uv sync` are already deterministic, and the only exposure
     # is an install that bypasses the lock. Capping a `0.0.x` tool at its real breaking
     # boundary would mean `<0.0.64` and an edit per release, which buys churn, not safety.
     "ty>=0.0.63",
-]
-# The `langgraph dev` server (the Studio / deep-agents-ui front door — see
-# `deep_research/graph.py`). Its OWN group, deliberately NOT in the default set, so
-# the lint/test CI jobs' bare `uv sync` stays lean and never pulls the server stack
-# (langgraph-api, uvicorn, opentelemetry, …) it does not use. Run it with
-# `uv run --group serve langgraph dev`, which installs the group on demand.
-# Capped at the minor: langgraph-cli is 0.x, so a minor bump is its breaking
-# boundary, and an unbounded `>=` could pull a langgraph-api requiring langgraph>=2,
-# which cannot resolve against this project's `langgraph>=1.0,<2.0` runtime cap.
-serve = [
-    "langgraph-cli[inmem]>=0.4.31,<0.5",
-]
-# The browser front door (`streamlit run streamlit_app.py` → `deep_research/webui.py`).
-# Its own group like `serve`, and out of the default set for the same reason: a bare
-# `uv sync` should not drag pandas, pyarrow and numpy into an install that only wants the
-# agent. Run it with `uv run --group ui streamlit run streamlit_app.py`.
-#
-# **Unlike `serve`, CI installs this one** (`.github/workflows/ci.yml` syncs
-# `--group ui` in its `lint` and `test` jobs). The difference is first-party code: nothing in this repo
-# imports langgraph-cli, so there is nothing for lint/ty/pytest to check in `serve` —
-# whereas `webui.py` and `streamlit_app.py` are ours, and without the group `ty` fails
-# them with `unresolved-import` and `tests/test_webui.py` skips itself.
-#
-# Capped at the major: streamlit is 1.x and stable there. The >=1.57 floor is what ships
-# the bundled agent-skill docs under `streamlit/.agents/`, and `st.code(height=...)` /
-# `st.chat_input(submit_mode=...)`, both of which `webui.py` uses.
-ui = [
-    "streamlit>=1.57,<2.0",
 ]
 
 # The single source of the project's version: hatchling greps this file for a
@@ -143,8 +121,8 @@ packages = ["deep_research", "evals"]
 # Ruff's defaults are only E4/E7/E9 + F. Widen to catch import order (I),
 # outdated idioms (UP), likely bugs (B), needless complexity (SIM), dead `noqa`
 # directives (RUF100), and blind excepts (BLE) — the last of these is what makes
-# the deliberate suppression in `cli.py` an enforced decision rather than a
-# decorative comment. `target-version` is inferred from `requires-python`.
+# the deliberate suppressions in `streamlit_app.py` and `webui.py` enforced decisions
+# rather than decorative comments. `target-version` is inferred from `requires-python`.
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 # The formatter owns line length; E501 would only ever fire on prose it won't rewrap.
 ignore = ["E501"]

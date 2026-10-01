@@ -1,6 +1,6 @@
 """LangSmith evaluation harness for the deep research agent.
 
-`pytest` covers the wiring and the CLI's branching logic; it deliberately does
+`pytest` covers the wiring and the app's branching logic; it deliberately does
 not grade the agent's *output*. This package is the other half: it runs the real
 agent against a dataset of research questions and scores both what it did (the
 tool trajectory) and what it said (citations, responsiveness).

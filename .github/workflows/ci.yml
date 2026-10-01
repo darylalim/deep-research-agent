@@ -31,12 +31,9 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1  # exact patch, deliberately — see the note above
         with:
           enable-cache: true
-      # `--group ui`, unlike `serve`, because that group has FIRST-PARTY code behind
-      # it (`deep_research/webui.py`, `streamlit_app.py`) and `uv sync` is an exact
-      # sync — without it `ty` fails both with `unresolved-import: streamlit`.
       # `--locked` so a `uv.lock` that has drifted from `pyproject.toml` fails the
       # build instead of being silently re-resolved into a lock nobody committed.
-      - run: uv sync --locked --group ui
+      - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run ty check
@@ -58,10 +55,7 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      # `--group ui` so `tests/test_webui.py` actually RUNS here rather than
-      # skipping itself on `pytest.importorskip("streamlit")` — a suite that
-      # silently skips in CI is a suite that is not protecting anything.
-      - run: uv sync --locked --group ui
+      - run: uv sync --locked
       # Offline suite only; `live` tests are deselected by `addopts`, so no
       # ANTHROPIC_API_KEY / TAVILY_API_KEY secrets are needed here.
       - run: uv run pytest

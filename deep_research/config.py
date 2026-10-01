@@ -31,7 +31,7 @@ def build_model() -> ChatAnthropic:
     """Construct the Claude chat model used by the orchestrator and subagents.
 
     **`streaming=True` is what holds the `max_tokens` ceiling open, and it is not
-    about the CLI.** It flips the *model's own HTTP request* to SSE
+    about the live feed.** It flips the *model's own HTTP request* to SSE
     (`_should_stream()` → `_stream()` → `generate_from_stream()`), while still handing
     the graph one complete `AIMessage` — nothing downstream, in LangGraph, deepagents,
     the HITL middleware, or the eval harness, can tell the difference. It is
@@ -47,7 +47,7 @@ def build_model() -> ChatAnthropic:
     that only fires when the client still has the SDK default timeout. So a
     non-streaming request over the guard's threshold
     (`3600 * max_tokens / 128_000 > 600`, i.e. **max_tokens > 21_333**) would not raise
-    — it would hang the REPL indefinitely, which is strictly worse than the failure the
+    — it would hang the turn indefinitely, which is strictly worse than the failure the
     16k pin was imagined to prevent. Raise `max_tokens` and set `streaming=True`
     together, or neither.
 
@@ -75,7 +75,7 @@ def build_model() -> ChatAnthropic:
     trip, and the replay succeeds — verified end to end.
 
     `display` controls visibility only: thinking happens and is billed identically either
-    way, so this costs nothing. It also never reaches the user — `cli._text_of` collects
+    way, so this costs nothing. It also never reaches the user — `turns._text_of` collects
     bare strings and `{"type": "text"}` blocks, and a thinking block is neither.
 
     Two more consequences, neither optional:

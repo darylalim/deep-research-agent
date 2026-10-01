@@ -1,8 +1,8 @@
-"""Browser front door for the deep research agent — `streamlit run streamlit_app.py`.
+"""The deep research agent's app — `streamlit run streamlit_app.py`.
 
 A page script, deliberately: it is the sequence of things that appear on screen, and
 every reusable decision it makes lives in `deep_research/webui.py` (which in turn
-imports the display rules from `deep_research/cli.py`, rather than restating them).
+imports the display rules from `deep_research/turns.py`, rather than restating them).
 
 **The turn is a state machine spread across reruns, and that is the whole design.**
 Streamlit re-executes this file top to bottom on every interaction, but a research turn
@@ -14,9 +14,9 @@ keys in `st.session_state` carry it:
     feed      the `StreamlitFeed` for the turn in flight — events AND the seen-set
     pending   interrupts drained from the stream, waiting on a human
 
-The loop those four implement is exactly `cli.main`'s `while pending := _stream_turn(…)`,
-unrolled across reruns instead of iterations. That matters, because two of the rules it
-encodes are not obvious and were paid for once already:
+Together they implement `while pending := _stream_turn(…): decide; resume`, unrolled
+across reruns instead of iterations. Two of the rules it encodes are not obvious and
+were paid for once already:
 
 - **Drain the stream, THEN ask.** An interrupt chunk does not end the stream; sibling
   tasks in the same superstep keep running and a second researcher's interrupt arrives
@@ -25,8 +25,8 @@ encodes are not obvious and were paid for once already:
   researcher whose searches you already paid for. `_stream_turn` exhausts the stream;
   only then does this page render an approval form.
 - **The answer comes from the checkpoint, never from the stream.** The transcript below
-  is built by `thread_sections(agent.get_state(...).values)` — the same slicing
-  `/export` and `evals/harness.py` use. The stream carries the *researchers'* prose,
+  is built by `thread_sections(agent.get_state(...).values)` — the same slicing the
+  export button and `evals/harness.py` use. The stream carries the *researchers'* prose,
   which the user must never see.
 
 Script order — the page's chrome is written above the `agent.get_state` read — is
@@ -42,14 +42,14 @@ import streamlit as st
 from langgraph.types import Command
 
 from deep_research import webui
-from deep_research.cli import (
+from deep_research.config import MEMORY_DB, MODEL_NAME, missing_keys
+from deep_research.turns import (
     _declined_tools,
     _stream_turn,
     _turn_stop,
     export_markdown,
     thread_sections,
 )
-from deep_research.config import MEMORY_DB, MODEL_NAME, missing_keys
 
 st.set_page_config(
     page_title="Deep research agent",
@@ -58,7 +58,7 @@ st.set_page_config(
 )
 
 # --- credentials -------------------------------------------------------------------
-# Same gate as `cli.main`, which hard-exits rather than failing later inside a turn.
+# Checked up front rather than failing later, inside a turn, with an opaque 401.
 if missing := missing_keys():
     st.title("Deep research agent")
     st.error("Missing required environment variables.")
@@ -103,7 +103,7 @@ prompt = st.chat_input("Ask a research question", disabled=busy, submit_mode="di
 if prompt and busy:
     # `disabled` is not a guarantee, and painting this widget above the checkpoint read
     # is what made that matter. On the pass that DISCOVERS a pause — a fresh tab on a
-    # thread the REPL left at an approval — `busy` is still False, so the input paints
+    # thread another session left at an approval — `busy` is still False, so the input paints
     # enabled while `agent.get_state` deserializes the whole message list. A question
     # typed into that window is queued, and Streamlit delivers a queued value even to a
     # widget that is disabled by the time it arrives.
@@ -336,10 +336,8 @@ def approval_panel() -> None:
             `InterruptOnConfig` this UI cannot render a control for leaves that button
             permanently disabled, while `busy` has already disabled the chat input and
             the thread field and `st.stop()` below ends the page. The session would
-            have no control left that could move it forward. `cli._prompt_decision`
-            raises for the same input and `cli.main`'s broad `except` abandons the
-            turn; this is the browser's equivalent, and it works for any stuck
-            approval rather than just that one.
+            have no control left that could move it forward. This works for any stuck
+            approval, not just that one.
             """
             if not st.button("Abandon this turn", icon=":material/close:"):
                 return
@@ -390,7 +388,7 @@ def approval_panel() -> None:
 if st.session_state.pending:
     if not webui.reviewable_actions(st.session_state.pending):
         # Paused on something with no action requests. Resuming would just re-interrupt,
-        # so say so and drop the turn. Same call `cli.main` makes.
+        # so say so and drop the turn.
         #
         # Recording the ids is what makes "drop" true. Clearing `pending` leaves the
         # interrupt in the checkpoint, so the recovery above used to re-seed it on the
@@ -420,7 +418,7 @@ if st.session_state.payload is not None:
     # out. Leaving it set meant the next rerun re-entered here with the SAME user
     # message: the question appended to the thread twice, `thread_sections` merging the
     # pair into one doubled bubble, and every search paid for again. Taking it now makes
-    # an interrupted turn simply end — the same outcome as Ctrl-C in the REPL.
+    # an interrupted turn simply end.
     payload = st.session_state.payload
     st.session_state.payload = None
     with (
@@ -470,7 +468,7 @@ if st.session_state.payload is not None:
     # reads as a bug in this app rather than as something the API reported.
     #
     # Formatted into its final sentence HERE, remedy included, so the render site is a
-    # bare `st.warning(note)`. The remedy is per stop reason (`cli.StopNote`) and used to
+    # bare `st.warning(note)`. The remedy is per stop reason (`turns.StopNote`) and used to
     # be hardcoded at the render site as "rephrasing or narrowing it usually helps" —
     # which is the wrong advice for a context-window overrun, where the question was fine
     # and the thread is what grew. Storing the finished string also keeps what lands in

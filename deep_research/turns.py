@@ -1,30 +1,34 @@
-"""Interactive command-line chat for the deep research agent.
+"""What a research turn did, and what the user may be shown of it.
 
-Runs a REPL against a single persistent thread. When the agent proposes a gated
-action (writing a file, running a command) the turn pauses and this CLI collects
-one decision per pending action, then resumes the run.
+Everything here is presentation-free: it reads the stream and the checkpoint and returns
+data. `webui.py` draws it and `streamlit_app.py` sequences it; `evals/harness.py` grades
+exactly what `render_turn` produces. Keeping these rules in one place is the point —
+they are subtle, each was paid for once already, and a second copy is a second place
+for them to drift:
 
-Which decisions are on offer is not fixed: each interrupt carries a `ReviewConfig`
-per tool saying what that tool permits, and the middleware raises `ValueError` on
-anything outside it. `_prompt_decision` therefore builds its menu from that config
-rather than hardcoding approve/edit/reject.
+- `ActivityFeed` turns stream chunks into `FeedEvent`s: dedupe on tool-call ids, skip
+  thread rewrites, orchestrator-only plan and `ls`, never a word of a researcher's prose.
+- `_stream_turn` drains a stream to exhaustion and returns what it paused on.
+- `pending_reviews` / `allowed_decisions_by_tool` / `_declined_tools` parse an approval
+  interrupt; `webui.approval_form` presents it.
+- `render_turn` / `thread_sections` / `export_markdown` read the answer back from the
+  CHECKPOINT, never from the stream.
+- `_stop_note` / `_turn_stop` name a turn the API ended with no prose.
+
+Which decisions are on offer for an approval is not fixed: each interrupt carries a
+`ReviewConfig` per tool saying what that tool permits, and the middleware raises
+`ValueError` on anything outside it. So the decision controls are built from that
+config rather than hardcoding approve/edit/reject.
 """
 
 from __future__ import annotations
 
 import ast
 import json
-import sys
-from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
-from langgraph.types import Command
-
-from .agent import open_agent
-from .config import MEMORY_DB, MODEL_NAME, missing_keys
+from .config import MODEL_NAME
 
 
 @dataclass(frozen=True)
@@ -33,15 +37,15 @@ class FeedEvent:
 
     `ActivityFeed` decides *what happened* — the subtle half, and the one this
     module's docstrings spend pages on: dedupe on tool-call ids, skip thread
-    rewrites, orchestrator-only plan and `ls`. `ActivityFeed._emit` decides how it
-    *looks*. Splitting the two is what lets a second front end reuse the decisions
-    instead of reimplementing them — `deep_research/webui.py` subclasses the feed
-    and overrides `_emit` alone.
+    rewrites, orchestrator-only plan and `ls`. `webui.render_event` decides how it
+    *looks*. Keeping the two apart is what lets the decisions be tested as data,
+    with no renderer in the way, and lets `webui.StreamlitFeed` add drawing by
+    overriding `_emit` alone.
 
-    That reuse is not a nicety. This absorb-and-dedupe logic already exists twice
-    (here and in `evals/harness.TurnRecorder`), and the SAME call-id dedupe bug was
-    found and fixed in both, separately. A third hand-written copy in the web UI
-    would be a third place for it to come back — so there isn't one.
+    That separation is not a nicety. This absorb-and-dedupe logic already exists
+    twice (here and in `evals/harness.TurnRecorder`), and the SAME call-id dedupe bug
+    was found and fixed in both, separately. A third hand-written copy in the
+    renderer would be a third place for it to come back — so there isn't one.
 
     `items` is a tuple, not a list, so the whole event stays hashable and frozen:
     the web UI keeps a per-turn list of these in `st.session_state` and re-renders
@@ -63,12 +67,12 @@ class FeedEvent:
 # matches_what_deepagents_returns` calls the real function and goes red if it ever changes.
 _LS_EMPTY = "No files found"
 
-# Every `kind` the feed can emit — the contract between `ActivityFeed` and its renderers.
-# Both `ActivityFeed._emit` (terminal) and `webui.render_event` (browser) are if/elif
-# chains that silently draw NOTHING for a kind they do not recognize, so adding a kind and
-# wiring only one of them would blank that line in the other with no error anywhere.
-# `test_webui.py::test_every_feed_kind_is_rendered_by_both_front_ends` asserts both cover
-# this tuple, which is what turns that silence into a red test.
+# Every `kind` the feed can emit — the contract between `ActivityFeed` and its renderer.
+# `webui.render_event` is an if/elif chain that silently draws NOTHING for a kind it does
+# not recognize, so adding a kind here without a branch there would blank that line with
+# no error anywhere. `test_webui.py::test_every_feed_kind_is_rendered` asserts every kind
+# draws something, and `test_feed_kinds_lists_every_kind_the_renderer_actually_handles`
+# asserts the reverse, which is what turns that silence into a red test.
 FEED_KINDS: tuple[str, ...] = (
     "plan",
     "delegate",
@@ -80,36 +84,6 @@ FEED_KINDS: tuple[str, ...] = (
     "failed",
     "refusal",
 )
-
-
-BANNER = f"""\
-╭──────────────────────────────────────────────────────────────╮
-│  Deep Research Agent                                          │
-│  model: {MODEL_NAME:<52}│
-│  Ask a research question. The agent plans, delegates web      │
-│  searches to a subagent, synthesizes a cited answer, and      │
-│  remembers durable findings across sessions.                  │
-│                                                               │
-│  Commands:  /help  /thread <id>  /export [path]  /exit        │
-╰──────────────────────────────────────────────────────────────╯"""
-
-HELP = f"""\
-Commands:
-  /help            show this help
-  /thread <id>     switch to a different conversation thread (default: "main")
-  /export [path]   write this thread — every question and its cited answer — to
-                   a markdown file (default: ./research-<thread>-<utc>.md)
-  /exit, /quit     leave
-
-Notes:
-  • The agent's work is shown live as it happens: its plan, each sub-question it
-    delegates, and every search it runs.
-  • Conversation, todos, and pending approvals persist across restarts
-    (checkpointed to .deep_research/checkpoints.sqlite).
-  • Durable findings the agent saves under /memories/ persist across every
-    thread and session ({MEMORY_DB.name}).
-  • Writing a file pauses for your approval — you see the full contents first,
-    and can approve, edit, reject, or answer the agent on the tool's behalf."""
 
 
 def _text_of(message: Any) -> str:
@@ -149,7 +123,8 @@ class StopNote:
     """Why a turn produced no prose, and what the user can actually do about it.
 
     Two fields rather than one sentence because the **remedy differs per stop reason**
-    and used to be hardcoded at both print sites (`main` below, and `streamlit_app`).
+    and used to be hardcoded at the print sites (`streamlit_app`, and a terminal REPL
+    this project once had).
     That was survivable while `refusal` was the only silent stop and stopped being so
     the moment a second one existed: telling someone to rephrase a question that was
     never the problem is worse than saying nothing, because it sends them to fix the
@@ -162,7 +137,7 @@ class StopNote:
 
 # Every stop reason that ends a generation with **HTTP 200, no exception, and no prose**.
 # Each bills, raises nothing, and lands in the checkpoint as an assistant message that
-# `render_turn` renders as `''` — which the REPL reported as `(the agent said nothing)`,
+# `render_turn` renders as `''` — which used to be reported as `(the agent said nothing)`,
 # describing the symptom while hiding the cause and reading as a bug in this code rather
 # than as something the API told us.
 #
@@ -252,9 +227,9 @@ def _turn_stop(result: dict[str, Any]) -> StopNote | None:
 
     The first one, not all of them: a turn that refuses twice refused for one reason,
     and two identical lines above the answer is noise. Read from the checkpoint rather
-    than the stream, for the same reason `render_turn` is — `main` has the final state
-    in hand there, and a mid-stream refusal that the orchestrator then recovered from
-    would still be recorded in it.
+    than the stream, for the same reason `render_turn` is — the page has the final
+    state in hand there, and a mid-stream refusal that the orchestrator then recovered
+    from would still be recorded in it.
     """
     for message in _this_turn(result.get("messages", [])):
         if getattr(message, "type", None) == "ai" and (note := _stop_note(message)):
@@ -275,8 +250,10 @@ def render_turn(result: dict[str, Any]) -> str:
     reprint its history.
 
     `evals/harness.py` imports this, deliberately — the eval that grades whether the
-    user was shown any sources must grade exactly what the CLI prints, or the two drift
-    and the metric becomes fiction.
+    user was shown any sources must grade exactly what the user is shown, or the two
+    drift and the metric becomes fiction. For a finished turn this equals the last `ai`
+    section of `thread_sections`, which is what the page draws;
+    `test_render_turn_is_the_answer_the_page_draws` pins that.
     """
     texts = [
         text
@@ -286,12 +263,11 @@ def render_turn(result: dict[str, Any]) -> str:
     ]
     # Assistant prose, or nothing. There is deliberately no fallback to "whatever ended
     # the turn" — that used to be `_text_of(messages[-1])`, and it was harmless only
-    # while this function was called exclusively on *completed* turns. It isn't:
-    # `_print_unfinished_turn` calls it on turns abandoned at an approval prompt or by
-    # an API error, and there the last message is routinely something that must never be
-    # printed as the agent's words:
-    #   - the user's OWN question, echoed back under an `agent >` header, when the turn
-    #     was abandoned before the agent said anything;
+    # while this function was called exclusively on *completed* turns. It isn't: a turn
+    # abandoned at an approval prompt or by an API error is still rendered, and there the
+    # last message is routinely something that must never be shown as the agent's words:
+    #   - the user's OWN question, echoed back as the agent's answer, when the turn was
+    #     abandoned before the agent said anything;
     #   - a raw `tavily_search` ToolMessage — multiple KB of serialized result dicts —
     #     when the turn was abandoned mid-search.
     # Both would also reach `evals/harness.py`, which renders `response` with this exact
@@ -303,7 +279,7 @@ def render_turn(result: dict[str, Any]) -> str:
 def thread_sections(state: dict[str, Any]) -> list[tuple[str, str]]:
     """The thread as ordered `(speaker, text)` sections, speaker being `human` or `ai`.
 
-    The grouping half of `render_thread`, split out because the web UI needs the same
+    The grouping half of `render_thread`, split out because the page needs the same
     sections as *chat bubbles* rather than as markdown headings. One definition of
     "how a thread divides into turns", two renderers — the same split as `FeedEvent`,
     and for the same reason: the rules below are load-bearing and were paid for once
@@ -369,10 +345,10 @@ def render_thread(state: dict[str, Any]) -> str:
 def export_markdown(state: dict[str, Any], thread_id: str, stamp: str) -> str:
     """The thread as a self-contained markdown document, or `""` if there is none yet.
 
-    Shared by `/export` in the REPL and the download button in the web UI so the two
-    hand the user the same bytes. `stamp` is passed in rather than read here: the
-    caller also puts it in the filename, and a header and filename disagreeing about
-    when a report was taken is the kind of small lie that makes an archive useless.
+    Behind the page's "Export transcript" download button. `stamp` is passed in
+    rather than read here: the caller also puts it in the filename, and a header and
+    filename disagreeing about when a report was taken is the kind of small lie that
+    makes an archive useless.
 
     "Exported", not "answered" — the messages carry no timestamps, and the only
     per-turn clock lives in the checkpointer's snapshots. A date we did not measure is
@@ -397,28 +373,14 @@ def _short(value: Any, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
-# The decision types the middleware understands, in the order we offer them, each
-# mapped to the key that selects it and how it renders in the menu. `respond` has
-# no free letter left, hence `re[s]pond`.
-DECISION_KEYS: dict[str, tuple[str, str]] = {
-    "approve": ("a", "[a]pprove"),
-    "edit": ("e", "[e]dit"),
-    "reject": ("r", "[r]eject"),
-    "respond": ("s", "re[s]pond"),
-}
-
-# What the middleware itself assumes for a tool gated with a bare `True`. Used
-# only as a fallback for an interrupt that carries no matching `ReviewConfig`.
+# What the middleware itself assumes for a tool gated with a bare `True`, in the order
+# the decision controls offer them. The set is the fallback for an interrupt that
+# carries no matching `ReviewConfig`; the order is used for every interrupt, so a
+# narrowed tool's options still appear in the same sequence.
 DEFAULT_ALLOWED_DECISIONS = ("approve", "edit", "reject", "respond")
 
 # The middleware's own default `description_prefix`. See `_reviewer_note`.
 DEFAULT_DESCRIPTION_PREFIX = "Tool execution requires approval"
-
-# How much of a long string argument (a file body, a shell command) to show before
-# eliding. The gate exists so a human reads the content before it lands in durable,
-# gitignored `/memories/` that git cannot restore, so this has to be generous enough
-# for a real note — an elided review is a review that gets rubber-stamped.
-PREVIEW_LINES = 40
 
 
 def _reviewer_note(request: dict[str, Any]) -> str | None:
@@ -426,8 +388,8 @@ def _reviewer_note(request: dict[str, Any]) -> str | None:
 
     The middleware builds the default description as
     `f"{prefix}\\n\\nTool: {name}\\nArgs: {args}"` (langchain's
-    `human_in_the_loop.py`) — i.e. the tool name we already print as a header, and
-    the raw `args` **dict repr** we can render far better ourselves. Printing it
+    `human_in_the_loop.py`) — i.e. the tool name we already show as a header, and
+    the raw `args` **dict repr** we can render far better ourselves. Showing it
     verbatim is what put an escaped-newline Python dict in front of the reviewer.
 
     So strip that boilerplate and keep only what is left. Usually nothing — but a
@@ -444,150 +406,6 @@ def _reviewer_note(request: dict[str, Any]) -> str | None:
     return note.strip() or None
 
 
-def _render_action(request: dict[str, Any]) -> None:
-    """Print a proposed action so a human can *read* it.
-
-    This is the whole point of the gate. `write_file` interrupts because a human
-    should see the content before it is written — but a markdown report reaches us
-    inside `args["content"]` as one string, and both of the ways this used to be
-    displayed (the middleware's dict-repr `description`, then a 300-char JSON clip
-    of the same dict) render it as a single unreadable line of escaped `\\n`, twice.
-    A reviewer who cannot read the diff approves it unread, and the gate becomes
-    theater.
-
-    Rendered per-argument instead, and generically — `execute`'s `command` and any
-    future gated tool's long string argument get the same treatment as `content`,
-    with no per-tool special-casing to keep in sync with `GATED_TOOLS`.
-    """
-    name = request.get("name", "<tool>")
-    args = request.get("args", {})
-
-    print(f"\n  ⏸  Approval required — {name}")
-    if note := _reviewer_note(request):
-        print(f"     {note}")
-
-    if not isinstance(args, dict):  # not a shape the middleware produces, but cheap
-        print(f"     args: {_short(args)}")
-        return
-
-    for key, value in args.items():
-        # A long or multi-line string is the thing the human is here to read: give
-        # it real newlines and its own block. Everything else is a scalar — a path,
-        # a flag — and reads fine inline.
-        if isinstance(value, str) and ("\n" in value or len(value) > 120):
-            lines = value.splitlines() or [""]
-            count = f" ({len(lines)} lines)" if len(lines) > 1 else ""
-            print(f"     {key}:{count}")
-            for line in lines[:PREVIEW_LINES]:
-                print(f"     │ {line}")
-            if len(lines) > PREVIEW_LINES:
-                print(f"     │ … {len(lines) - PREVIEW_LINES} more lines")
-        else:
-            print(f"     {key}: {_short(value, 200)}")
-
-
-def _prompt_decision(
-    request: dict[str, Any], allowed_decisions: Sequence[str] | None = None
-) -> dict[str, Any]:
-    """Ask the human to decide on one proposed action.
-
-    Only the decisions `allowed_decisions` permits for *this* tool are offered.
-    That restriction is load-bearing, not cosmetic: the middleware raises
-    `ValueError` on a decision type outside the tool's `allowed_decisions`, and
-    `main`'s broad `except` would swallow it into a one-line error, losing the
-    turn. Every value in `GATED_TOOLS` is currently `True` (which permits all
-    four), but an `InterruptOnConfig` narrowing them is a supported, documented
-    thing to do — so the CLI has to honor whatever it is handed.
-
-    **Approval is only ever returned for an affirmative act** — `a`, the empty
-    default, or a deliberately blank edit. Never as a fallback from a failure to
-    parse what the human typed: a mistyped edit means they wanted to *change* the
-    args, so approving the original ones is the one outcome they certainly did not
-    ask for.
-    """
-    name = request.get("name", "<tool>")
-
-    # `None` means "no ReviewConfig came with this request" → assume the default.
-    # An *empty* list is different: it means nothing is permitted. Don't conflate.
-    permitted = set(
-        DEFAULT_ALLOWED_DECISIONS if allowed_decisions is None else allowed_decisions
-    )
-    allowed = [d for d in DECISION_KEYS if d in permitted]
-    if not allowed:
-        # The tool is gated with a decision set this CLI cannot produce. Guessing
-        # would just raise inside the graph, so fail loudly with the real reason.
-        raise ValueError(
-            f"no supported decision for '{name}' "
-            f"(tool allows: {sorted(permitted) or 'nothing'})"
-        )
-
-    by_key = {DECISION_KEYS[d][0]: d for d in allowed}
-    menu = " / ".join(DECISION_KEYS[d][1] for d in allowed)
-    # Approving is the default only when it is actually on offer.
-    default = "approve" if "approve" in permitted else None
-    prompt = f"     {menu}{' (default a)' if default else ''} > "
-
-    _render_action(request)
-
-    while True:
-        choice = input(prompt).strip().lower()
-        if not choice and default:
-            decision = default
-        elif choice in by_key:
-            decision = by_key[choice]
-        elif choice in permitted and choice in DECISION_KEYS:
-            decision = choice  # the full word, e.g. "approve"
-        else:
-            print(f"     ? choose {', '.join(DECISION_KEYS[d][0] for d in allowed)}.")
-            continue
-
-        if decision == "approve":
-            return {"type": "approve"}
-        if decision == "reject":
-            reason = input("     reason for the agent (optional) > ").strip()
-            return {"type": "reject", **({"message": reason} if reason else {})}
-        if decision == "respond":
-            # The human answers *on behalf of* the tool; the tool never runs, so
-            # an empty message would hand the model an empty tool result.
-            message = input("     reply to the agent on the tool's behalf > ").strip()
-            if not message:
-                print("     ? a response needs a message.")
-                continue
-            return {"type": "respond", "message": message}
-
-        # edit — a *deliberately* blank line means "never mind, take it as-is", and
-        # that shortcut is only legal when approve is permitted.
-        can_fall_back = "approve" in permitted
-        hint = "blank = approve as-is" if can_fall_back else "required"
-        print(f"     enter replacement args as JSON ({hint}):")
-        raw = input("     > ").strip()
-        if not raw:
-            if can_fall_back:
-                return {"type": "approve"}
-            print(
-                "     ? this tool does not allow approving unchanged — edit or reject."
-            )
-            continue
-        try:
-            new_args = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            # NEVER fall back to approve here. This used to return `approve` with the
-            # ORIGINAL, unedited args whenever the tool permitted approving — so a
-            # reviewer who chose `edit` precisely because the write looked wrong, and
-            # then fat-fingered the JSON, silently approved the very write they were
-            # trying to narrow. A typo is not consent, and this is the only security
-            # boundary the app has. Re-prompt; `a` is right there if they mean it.
-            print(f"     ! not valid JSON ({exc.msg}) — nothing approved. Try again.")
-            continue
-        if not isinstance(new_args, dict):
-            # `"/memories/y.md"` and `[1, 2]` are valid JSON but not valid *args*.
-            # The middleware doesn't validate, so this would sail through into a
-            # ToolCall with non-dict args and only blow up at tool execution.
-            print('     ! args must be a JSON object, e.g. {"file_path": "..."}.')
-            continue
-        return {"type": "edit", "edited_action": {"name": name, "args": new_args}}
-
-
 def pending_reviews(interrupts: list[Any]) -> list[tuple[str, dict[str, Any]]]:
     """Every DISTINCT pending interrupt, as ordered `(interrupt_id, HITLRequest)` pairs.
 
@@ -598,10 +416,10 @@ def pending_reviews(interrupts: list[Any]) -> list[tuple[str, dict[str, Any]]]:
     silently keep only the second answer. Approval fatigue is exactly how a gate stops
     being a gate.
 
-    Deduping lives here, in one place, because three callers now need it and each one
-    that rolls its own is a chance to get it wrong: `_collect_decisions` (the prompting
-    invariant is "one prompt per pending action"), `_declined_tools`, and
-    `webui.StreamlitFeed`'s approval form. `evals/harness._approve_all` is immune only by
+    Deduping lives here, in one place, because three callers need it and each one that
+    rolls its own is a chance to get it wrong: `webui.approval_form` (the invariant is
+    "one set of controls per pending action"), `webui.reviewable_actions`, and
+    `_declined_tools`. `evals/harness._approve_all` is immune only by
     accident — it writes into a dict keyed by id without asking anyone anything, so a
     duplicate is idempotent — and `harness.TurnRecorder` was NOT immune, which cost this
     project a silently defeated safety metric.
@@ -636,58 +454,24 @@ def allowed_decisions_by_tool(value: dict[str, Any]) -> dict[str, list[str]]:
     }
 
 
-def _collect_decisions(interrupts: list[Any]) -> dict[str, list[dict[str, Any]]]:
-    """Collect decisions for every pending action, grouped by interrupt id.
-
-    The human-in-the-loop middleware bundles all of *one agent's* pending tool
-    calls into a single interrupt whose value is a HITLRequest with two parallel
-    lists: `action_requests` (what the agent wants to do) and `review_configs`
-    (which decisions are legal for each, keyed by `action_name`). That interrupt's
-    resume value is `{"decisions": [...]}`, one decision per *request*, in order.
-
-    But a turn can carry **more than one** interrupt. The orchestrator dispatches
-    each `task` call as its own concurrent graph task, and every subagent inherits
-    `interrupt_on` — so two `researcher` subagents fanned out in one turn (which
-    `SYSTEM_PROMPT` explicitly encourages) can each raise their own interrupt. This
-    is why the result is keyed by `interrupt.id` and not flattened: LangGraph
-    raises `RuntimeError("When there are multiple pending interrupts, you must
-    specify the interrupt id when resuming")` unless the resume value is a mapping
-    of interrupt id → that interrupt's resume value. The mapping form is also
-    correct for the ordinary single-interrupt case, so there is one code path.
-
-    The duplicate-emission problem this used to handle inline now lives in
-    `pending_reviews`, and the `review_configs` name lookup in
-    `allowed_decisions_by_tool` — both because the web UI needs the identical rules.
-    """
-    by_interrupt: dict[str, list[dict[str, Any]]] = {}
-    for interrupt_id, value in pending_reviews(interrupts):
-        allowed_by_tool = allowed_decisions_by_tool(value)
-        decisions = [
-            _prompt_decision(request, allowed_by_tool.get(request.get("name")))
-            for request in value.get("action_requests", [])
-        ]
-        if decisions:
-            by_interrupt[interrupt_id] = decisions
-    return by_interrupt
-
-
 class ActivityFeed:
-    """Prints what the agent is doing, as it does it.
+    """Records what the agent is doing, as it does it, as a list of `FeedEvent`s.
 
-    The turn used to be a black box: one `… working …` line, then minutes of nothing,
-    then a wall of text. This renders the tool activity arriving on
-    `agent.stream(..., stream_mode="updates", subgraphs=True)`.
+    The turn used to be a black box: minutes of nothing, then a wall of text. This
+    reads the tool activity arriving on
+    `agent.stream(..., stream_mode="updates", subgraphs=True)`. It draws nothing
+    itself — `webui.StreamlitFeed` overrides `_emit` to draw each event as it lands.
 
     Three things it must get right, each of which is a bug waiting to happen:
 
-    **It prints actions, never prose.** The stream carries the *researchers'* assistant
-    messages too, and the user must never see one — they are a subagent's internal
-    working, and `evals/harness.py` refuses to build its graded `response` from the
-    stream for exactly this reason. The answer comes from `render_turn` on the final
-    checkpoint, so the terminal, the exported file, and the eval's `response` stay the
-    same bytes. Same rule as `harness.TurnRecorder`: actions only.
+    **It records actions, never prose.** The stream carries the *researchers'*
+    assistant messages too, and the user must never see one — they are a subagent's
+    internal working, and `evals/harness.py` refuses to build its graded `response`
+    from the stream for exactly this reason. The answer comes from the final
+    checkpoint, so the transcript, the exported file, and the eval's `response` stay
+    the same bytes. Same rule as `harness.TurnRecorder`: actions only.
 
-    **It prints each event once, keyed on the TOOL CALL id.** On resume,
+    **It records each event once, keyed on the TOOL CALL id.** On resume,
     `HumanInTheLoopMiddleware.after_model` re-emits the AIMessage that proposed the gated
     call, and the re-streamed superstep re-emits the *cached writes* of the siblings that
     already succeeded (`_reapply_writes_to_succeeded_nodes`) — so without deduping, an
@@ -710,7 +494,11 @@ class ActivityFeed:
     """
 
     def __init__(self) -> None:
-        self._printed: set[str] = set()  # event keys already on screen
+        # Every event this turn, in order. Kept rather than discarded because a turn
+        # that pauses for approval spans several Streamlit reruns, and each rerun has to
+        # redraw what the user already watched appear (`webui.StreamlitFeed.replay`).
+        self.events: list[FeedEvent] = []
+        self._printed: set[str] = set()  # event keys already recorded
         self._task_descriptions: dict[str, str] = {}  # task tool_call id -> description
         self._ls_paths: dict[str, str] = {}  # ls tool_call id -> the path it listed
         self._declined: set[str] = set()  # tool names the human rejected this turn
@@ -721,8 +509,8 @@ class ActivityFeed:
         Needed because a rejection is indistinguishable from a crash by the time it
         reaches the stream: `HumanInTheLoopMiddleware` answers a rejected call with a
         synthetic `ToolMessage` carrying **`status="error"`** — and if the human supplied
-        a reason, that reason *becomes* the content. So the feed would print
-        `! write_file failed: too risky` at the person who just typed `r`, reporting
+        a reason, that reason *becomes* the content. So the feed would show
+        `write_file failed: too risky` to the person who just clicked Reject, reporting
         their own honoured decision as a bug in the agent.
 
         Name-level, not call-level, because an `ActionRequest` carries no tool-call id.
@@ -736,7 +524,7 @@ class ActivityFeed:
         """Fold in one `(namespace, update)` chunk; return any interrupts it carried.
 
         Deliberately the same shape as `harness.TurnRecorder.absorb` — that one has been
-        run against the live agent, and divergence between the two is how the REPL and
+        run against the live agent, and divergence between the two is how the app and
         the eval start disagreeing about what happened.
         """
         if not isinstance(chunk, dict):
@@ -793,44 +581,13 @@ class ActivityFeed:
         return True
 
     def _emit(self, event: FeedEvent) -> None:
-        """Render one event to the terminal — the ONLY method a front end overrides.
+        """Record one event — the ONLY method a renderer overrides.
 
         Everything above this line decided *whether* an event happened and what it
-        says; this decides what it looks like. `webui.StreamlitFeed` replaces this
-        method and inherits every rule in `absorb`, which is the point (see
-        `FeedEvent`).
-
-        The strings are load-bearing in one narrow sense: `TestActivityFeed` asserts
-        on them verbatim, so a subclass that renders differently is fine but an edit
-        that reworders *these* is a test change too.
+        says. `webui.StreamlitFeed` extends this to draw the event too, and inherits
+        every rule in `absorb`, which is the point (see `FeedEvent`).
         """
-        if event.kind == "plan":
-            count = len(event.items)
-            print(f"\n  ✎ plan · {count} item{'s' if count != 1 else ''}")
-            for index, item in enumerate(event.items, 1):
-                print(f"      {index}. {item}")
-        elif event.kind == "refusal":
-            print(f"  ! researcher · {event.text}")
-        elif event.kind == "delegate":
-            print(f"  → researcher · {_one_line(event.text, 90)}")
-        elif event.kind == "search":
-            # Subagent searches are indented under the delegation they belong to.
-            indent = "  " if event.is_orchestrator else "      "
-            print(f'{indent}⌕ "{_one_line(event.text, 80)}"')
-        elif event.kind == "read":
-            print(f"  ▸ reading {event.text}")
-        elif event.kind == "rejected":
-            print(f"  ✗ {event.text} — rejected, as you asked")
-        elif event.kind == "failed":
-            print(f"  ! {event.text} failed: {_one_line(event.detail, 100)}")
-        elif event.kind == "listed":
-            print(f"  ⌕ {event.text} · {event.detail}")
-        elif event.kind == "done":
-            print(
-                f"  ✓ researcher · {_one_line(event.text, 90)}"
-                if event.text
-                else "  ✓ researcher"
-            )
+        self.events.append(event)
 
     def _render_plan(self, todos: list[Any]) -> None:
         # `write_todos` returns a Command that updates the `todos` channel, so the whole
@@ -863,8 +620,8 @@ class ActivityFeed:
         twice.
 
         SUBAGENT ONLY — the caller enforces that. An orchestrator stop is reported by
-        `main`, from the checkpoint, exactly where the missing answer would have been;
-        printing it here as well would say it twice.
+        the page, from the checkpoint (`_turn_stop`), exactly where the missing answer
+        would have been; recording it here as well would say it twice.
 
         A researcher's stop is otherwise completely INVISIBLE. It ends that subagent's
         turn with empty content, so the `task` result comes back thin and the
@@ -882,11 +639,11 @@ class ActivityFeed:
         an event.
 
         Emitted under the `"refusal"` feed kind, which is now broader than it reads. The
-        kind is an internal selector for the two renderers and never reaches the user —
-        who sees `note.reason` — and renaming it is atomic across `FEED_KINDS`,
-        `ActivityFeed._emit` and `webui.render_event` (test_webui asserts set equality in
-        BOTH directions), so it cannot be sequenced past the pytest hook. Only the
-        `reason` distinguishes the two stops here; only `main` needs the remedy.
+        kind is an internal selector for the renderer and never reaches the user — who
+        sees `note.reason` — and renaming it is atomic across `FEED_KINDS` and
+        `webui.render_event` (test_webui asserts set equality in BOTH directions), so it
+        cannot be sequenced past the pytest hook. Only the `reason` distinguishes the two
+        stops here; only the page's turn-level note needs the remedy.
         """
         note = _stop_note(message)
         if note and self._once(f"stop:{namespace}"):
@@ -987,8 +744,8 @@ class ActivityFeed:
 
 
 def _one_line(text: Any, limit: int) -> str:
-    """Collapse a value to a single, bounded line — feed lines must not wrap or wrap
-    the terminal in a researcher's whole prompt."""
+    """Collapse a value to a single, bounded line — a feed line must not swell into a
+    researcher's whole prompt."""
     flat = " ".join(str(text).split())
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
@@ -996,12 +753,12 @@ def _one_line(text: Any, limit: int) -> str:
 def _stream_turn(
     agent: Any, payload: Any, config: dict[str, Any], feed: ActivityFeed
 ) -> list[Any]:
-    """Run one stream to exhaustion, printing the feed; return the pending interrupts.
+    """Run one stream to exhaustion, feeding the feed; return the pending interrupts.
 
-    **Drain, THEN prompt.** Not a style choice — an interrupt chunk does not end the
+    **Drain, THEN ask.** Not a style choice — an interrupt chunk does not end the
     stream. LangGraph does not treat a `GraphInterrupt` as a failure, so sibling tasks in
     the same superstep keep running and a *second* researcher's interrupt arrives after
-    the first. Worse, the graph executes inside this generator: blocking on `input()`
+    the first. Worse, the graph executes inside this generator: pausing for a human
     mid-iteration freezes the Pregel loop, and starting the resume stream would tear the
     old generator down — cancelling a still-running researcher whose interrupt was never
     emitted, and throwing away searches you already paid for.
@@ -1023,9 +780,9 @@ def _declined_tools(
 ) -> set[str]:
     """The tool names the human just rejected.
 
-    `_collect_decisions` returns one decision per `action_request`, in order, within each
-    interrupt — so zipping the two back together recovers which *tool* each decision was
-    about. `pending_reviews` supplies the same deduplication it does, for the same
+    `webui.approval_form` returns one decision per `action_request`, in order, within
+    each interrupt — so zipping the two back together recovers which *tool* each decision
+    was about. `pending_reviews` supplies the same deduplication it does, for the same
     reason: a subagent's interrupt arrives twice.
     """
     declined: set[str] = set()
@@ -1036,204 +793,3 @@ def _declined_tools(
             if decision.get("type") == "reject":
                 declined.add(request.get("name", "?"))
     return declined
-
-
-def _print_unfinished_turn(agent: Any, config: dict[str, Any]) -> None:
-    """Print whatever the agent already said, when a turn ends early.
-
-    Both `except` arms below used to `continue` straight back to the input prompt,
-    skipping the `render_turn` at the bottom of the loop — and with it, the answer.
-    That is not a hypothetical loss. The agent composes its cited report in the *same*
-    assistant message that proposes the `write_file` (the reason `render_turn` exists
-    at all), so the turn a human is most likely to Ctrl-C — the one sitting at an
-    approval prompt — is reliably the one that has already done every search and
-    written the entire report. Minutes of work and dozens of sources, discarded on a
-    keystroke, while the prose sat in the checkpoint the whole time. Read it back.
-
-    Best-effort by construction: we are already on an error path, and a failure to
-    read the checkpoint must never replace the error the user actually needs to see.
-
-    The abandoned tool call left dangling by this is not a problem for the *next* turn:
-    deepagents puts `PatchToolCallsMiddleware` at the graph entry, which answers any
-    dangling tool call with a synthetic "cancelled" ToolMessage before the model runs.
-    """
-    try:
-        text = render_turn(agent.get_state(config).values)
-    except Exception:  # noqa: BLE001 — salvage must not mask the failure that got us here
-        return
-    if text:
-        print(f"\nagent (unfinished turn) > {text}")
-
-
-def _export(agent: Any, config: dict[str, Any], thread_id: str, target: str) -> None:
-    """Write the thread to a markdown file the user can actually keep.
-
-    Plain `Path.write_text`, deliberately — NOT the agent's own `write_file` tool. That
-    route is not merely heavier, it is incoherent: `HumanInTheLoopMiddleware` interrupts
-    on the tool calls of the *model's* last message, so there is no way to invoke a gated
-    tool without a model turn. Exporting through the agent would mean an Opus call, and
-    an approval prompt asking the human to approve the thing the human just typed — with
-    the model free to rename, reword, or decline it. And a `/memories/` path is not a
-    file at all: it is a row in `memories.sqlite`, which is precisely why `SYSTEM_PROMPT`
-    step 5 says "/memories/ or nothing" and stopped asking the agent to write reports.
-    `/export` gives the user the artifact that prompt deliberately stopped producing, at
-    zero tokens and zero approvals — so `SYSTEM_PROMPT` needs no changes and must not be
-    told about it.
-
-    Sourced from the checkpoint, never from the stream, even though the streaming loop
-    has the chunks in hand. The stream carries the researchers' own prose, which the user
-    never saw and whose citations the eval deliberately refuses to credit; taking the
-    convenient path would put subagent-internal text into the user's file and drift the
-    export away from both the terminal output and the eval's graded `response`.
-    """
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    document = export_markdown(agent.get_state(config).values, thread_id, stamp)
-    if not document:
-        print("! nothing to export — this thread has no answers yet.")
-        return
-
-    named = bool(target)
-    # `expanduser`, because `/export ~/report.md` is the obvious thing to type and no
-    # shell expanded it for us — the path arrived as the literal string `~/report.md`.
-    # Without this it fails with a bare ENOENT (or, if a stray `~` directory exists in
-    # cwd, silently succeeds into `./~/report.md`), losing a report that took minutes.
-    path = (
-        Path(target).expanduser() if named else Path(f"research-{thread_id}-{stamp}.md")
-    )
-    if path.exists() and not named:
-        print(f"! {path} already exists — pass an explicit path to overwrite.")
-        return
-
-    try:
-        # Explicit encoding, always: the default is locale-dependent, and a real report
-        # is full of em-dashes. Failing on the one machine the user cannot debug is not
-        # a hypothetical. Caught here, not by main's turn-scoped `except`.
-        path.write_text(document, encoding="utf-8")
-    except OSError as exc:
-        print(f"! export failed: {exc}")
-        return
-    print(f"(exported to {path.resolve()})")
-
-
-def main() -> None:
-    missing = missing_keys()
-    if missing:
-        print("Missing required environment variables:\n")
-        for key, why in missing.items():
-            print(f"  - {key}\n      {why}")
-        print("\nCopy .env.example to .env, fill these in, then re-run.")
-        sys.exit(1)
-
-    thread_id = "main"
-    print(BANNER)
-
-    with open_agent() as agent:
-        while True:
-            try:
-                user_input = input("\nyou > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nbye.")
-                return
-
-            if not user_input:
-                continue
-            # Match the command EXACTLY, never as a prefix. `startswith("/export")` also
-            # swallows `/exports` and `/exported`, silently writing a default-named file
-            # for what is plainly a typo — and a mistyped command should say so, not act.
-            command, _, argument = user_input.partition(" ")
-            argument = argument.strip()
-
-            if command in ("/exit", "/quit"):
-                print("bye.")
-                return
-            if command == "/help":
-                print(HELP)
-                continue
-            if command == "/thread":
-                if argument:
-                    thread_id = argument
-                    print(f"(switched to thread '{thread_id}')")
-                else:
-                    print(f"(current thread: '{thread_id}')")
-                continue
-            if command == "/export":
-                _export(
-                    agent,
-                    {"configurable": {"thread_id": thread_id}},
-                    thread_id,
-                    argument,
-                )
-                continue
-            if command.startswith("/"):
-                print(f"(unknown command '{command}' — try /help)")
-                continue
-
-            config = {"configurable": {"thread_id": thread_id}}
-            feed = ActivityFeed()
-            payload: Any = {"messages": [{"role": "user", "content": user_input}]}
-            try:
-                # Drain the stream, decide on everything it paused for, restream. There
-                # is no `__interrupt__` key to loop on any more: under `stream_mode=
-                # "updates"` interrupts only ever arrive as chunks, and `invoke()`'s
-                # `result["__interrupt__"]` was itself just a post-drain aggregate that
-                # LangGraph assembled internally. Same loop as `evals/harness.py`.
-                while pending := _stream_turn(agent, payload, config, feed):
-                    by_interrupt = _collect_decisions(pending)
-                    if not by_interrupt:
-                        # Nothing reviewable — resuming would just re-interrupt.
-                        print("\n! paused with no reviewable action; abandoning turn.")
-                        break
-                    # A rejected call comes back as a ToolMessage with `status="error"`,
-                    # so the feed cannot tell it from a crash. Tell it.
-                    feed.note_declined(_declined_tools(pending, by_interrupt))
-                    # Keyed by interrupt id: a turn can hold several interrupts at once
-                    # (concurrent researchers), and LangGraph rejects a resume that
-                    # doesn't say which interrupt each value belongs to.
-                    payload = Command(
-                        resume={
-                            interrupt_id: {"decisions": decisions}
-                            for interrupt_id, decisions in by_interrupt.items()
-                        }
-                    )
-            except KeyboardInterrupt:
-                # Ctrl-C is a BaseException (not Exception), so it must be caught
-                # separately — otherwise it escapes mid-turn as a raw traceback
-                # instead of returning to the prompt like Ctrl-C does at input().
-                print("\n(interrupted — back to prompt)")
-                _print_unfinished_turn(agent, config)
-                continue
-            except Exception as exc:  # noqa: BLE001 — surface any runtime error to the user
-                print(f"\n! error: {exc}")
-                _print_unfinished_turn(agent, config)
-                continue
-
-            # From the checkpoint, NOT from the stream — even though the stream just went
-            # past us and it would be easy. The stream carries the researchers' own
-            # assistant messages, and the user must never be shown one; `evals/harness.py`
-            # renders its graded `response` with this same call for exactly that reason,
-            # so building the printed answer any other way makes the citation metrics
-            # fiction. The feed shows *actions*; the answer comes from state.
-            values = agent.get_state(config).values
-            answer = render_turn(values)
-            # A silent stop — a classifier refusal, or a turn that ran past the context
-            # window — is a 200 with empty content and no exception, so it arrives here
-            # indistinguishable from a turn where the model had nothing to say, and the
-            # bare `(the agent said nothing)` below reported something the API told us as
-            # an apparent bug in this REPL. Printed BEFORE the answer, and not instead of
-            # it: a turn can lose one branch and still answer, in which case the note
-            # explains why the answer is thinner than the question.
-            #
-            # The remedy comes from the note, never from this line. It used to be the
-            # hardcoded "rephrasing or narrowing it usually helps", which is exactly
-            # wrong for a context-window overrun — that question was fine and the thread
-            # is what grew.
-            if stop := _turn_stop(values):
-                print(f"\n! {stop.reason} — {stop.remedy}.")
-            if answer:
-                print(f"\nagent > {answer}")
-            elif not stop:
-                print("\n(the agent said nothing)")
-
-
-if __name__ == "__main__":
-    main()
