@@ -11,6 +11,11 @@ Ask it a question and it will:
 4. Write a report with inline citations.
 5. Ask for your approval before saving anything to memory.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/answer-dark.png">
+  <img alt="A finished research turn: the question, a bottom-line summary, and a cited comparison of uv and Poetry" src="docs/images/answer-light.png">
+</picture>
+
 ## Setup
 
 Requires **Python 3.11+** and [uv](https://docs.astral.sh/uv/).
@@ -38,6 +43,7 @@ uv run streamlit run streamlit_app.py   # http://localhost:8501
   shows the full proposed change. Choose **Approve**, **Edit**, **Reject** (with an optional
   reason) or **Respond**. Nothing is preselected, and invalid edit JSON is never treated as
   approval. **Abandon this turn** is always available.
+  ![An approval pause: the work log on the left, the proposed write to /memories/ on the right with Approve, Edit, Reject and Respond](docs/images/approval.png)
 - **Sidebar.** Switch threads, export the thread as Markdown, and browse durable memory.
 
 Threads and pending approvals are saved to disk, so restarting the app resumes where you
