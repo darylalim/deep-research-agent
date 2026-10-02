@@ -58,17 +58,17 @@ left off.
 
 ```python
 create_deep_agent(
-    model        = ChatAnthropic("claude-opus-5-5"),      # no sampling params: Opus 5 rejects them
-    tools        = [tavily_search],                       # quick lookups by the orchestrator
-    subagents    = [researcher],                          # breadth, delegated via `task`
-    middleware   = [TodoListMiddleware()],                # provides `write_todos`
-    backend      = CompositeBackend(
-                       default = StateBackend(),          # per-thread scratch space
-                       routes  = {"/memories/": StoreBackend(...)},  # shared across threads
-                   ),
-    interrupt_on = GATED_TOOLS,                           # human approval; needs a checkpointer
-    checkpointer = SqliteSaver(...),                      # .deep_research/checkpoints.sqlite
-    store        = SqliteStore(...),                      # .deep_research/memories.sqlite
+    model=ChatAnthropic("claude-opus-5-5"),  # no sampling params: Opus 5 rejects them
+    tools=[tavily_search],  # quick lookups by the orchestrator
+    subagents=[researcher],  # breadth, delegated via `task`
+    middleware=[TodoListMiddleware()],  # provides `write_todos`
+    backend=CompositeBackend(
+        default=StateBackend(),  # per-thread scratch space
+        routes={"/memories/": StoreBackend(...)},  # shared across threads
+    ),
+    interrupt_on=GATED_TOOLS,  # human approval; needs a checkpointer
+    checkpointer=SqliteSaver(...),  # .deep_research/checkpoints.sqlite
+    store=SqliteStore(...),  # .deep_research/memories.sqlite
 )
 ```
 
