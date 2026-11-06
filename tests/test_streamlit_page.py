@@ -423,7 +423,7 @@ class TestTheWorkLogSitsBesideTheDecision:
         assert len(page.columns) == 2, "work log and form are not side by side"
         log, review = page.columns
         # Not in an expander: the replayed search is visible with nothing to open.
-        assert not page.expander, "the work log is collapsed behind a click again"
+        assert not page.main.expander, "the work log is collapsed behind a click again"
         assert any("opus 5 pricing" in m.value for m in log.markdown)
         # The decision controls are in the OTHER column, so the two really are beside
         # each other rather than both stacked into the first.

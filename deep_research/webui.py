@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
@@ -59,7 +59,7 @@ _ACTIVE_THREADS_LOCK = threading.Lock()
 
 
 @contextmanager
-def claim_thread(thread_id: str) -> Iterator[bool]:
+def claim_thread(thread_id: str) -> Generator[bool]:
     """Take exclusive process-wide use of `thread_id`; yields False if already taken.
 
     **Per-session state cannot do this job, and assuming it could was a real bug.** The
