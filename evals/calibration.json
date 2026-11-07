@@ -1,0 +1,213 @@
+{
+  "description": "Human labels for calibrating the citation and answer judges. Labelled by the project owner on 2026-11-07, without seeing any judge verdict, under the attribution rule the claims_are_cited prompt states. Each claim is a verbatim substring that occurs exactly once in its report.",
+  "reports": [
+    {
+      "experiment": "sweep-e92a5920",
+      "run_id": "019f58ec-b0bb-7eb1-94ea-d9cf71a3c04a",
+      "question": "What is the latest stable release of Python, and when was it released?",
+      "response": "I'll check for the latest stable Python release.\n\nThe latest stable release of Python is **Python 3.14.6**, released **June 10, 2026**.\n\nAdditional context:\n- The 3.14 series debuted with **Python 3.14.0 on October 7, 2025**, marking the current major release line (\"many new features and optimisations compared to Python 3.13\").\n- The prior maintenance line also gets updates — **Python 3.13.14** was released the same day, June 10, 2026.\n\nSource: [python.org/downloads/source](https://www.python.org/downloads/source) and [python.org/downloads/release/python-3140](https://www.python.org/downloads/release/python-3140).",
+      "claims": [
+        {
+          "id": "c01",
+          "claim": "The latest stable release of Python is **Python 3.14.6**, released **June 10, 2026**.",
+          "label": "cited"
+        },
+        {
+          "id": "c02",
+          "claim": "The prior maintenance line also gets updates — **Python 3.13.14** was released the same day, June 10, 2026.",
+          "label": "cited"
+        }
+      ],
+      "parts": []
+    },
+    {
+      "experiment": "cited-2b568efa",
+      "run_id": "019f59eb-b27b-7bb2-8a6c-25ec3284c5fe",
+      "question": "What is the latest stable release of Python, and when was it released?",
+      "response": "The latest stable release of Python is **Python 3.14**, released on **October 7, 2025**.\n\nSources:\n- [Liquid Web](https://www.liquidweb.com/blog/latest-python-version) — \"Python 3.14 was released on October 7, 2025\"\n- [endoflife.date/python](https://endoflife.date/python) — confirms 3.14 released 07 Oct 2025 (with maintenance releases such as 3.14.6 following in mid-2026)\n\nNote: Python 3.14 is the current stable *feature* release. Within that line, patch releases (e.g., 3.14.x) are issued periodically for bug and security fixes.",
+      "claims": [
+        {
+          "id": "c03",
+          "claim": "Python 3.14 is the current stable *feature* release.",
+          "label": "cited"
+        },
+        {
+          "id": "c04",
+          "claim": "patch releases (e.g., 3.14.x) are issued periodically for bug and security fixes",
+          "label": "cited"
+        }
+      ],
+      "parts": [
+        {
+          "id": "p01",
+          "part": "What is the latest stable release of Python?",
+          "label": "answered"
+        }
+      ]
+    },
+    {
+      "experiment": "workflow-feef8724",
+      "run_id": "01a0f98d-7ede-7db1-977e-d332c68add19",
+      "question": "Compare the free tiers of Tavily and LangSmith: what are the monthly usage limits of each?",
+      "response": "Tavily's free plan gives you **1,000 API credits a month**. LangSmith's free plan gives you **5,000 base traces a month**. Neither needs a credit card. If you don't add a payment method, both stop working when you hit the limit, until the monthly reset or an upgrade.\n\n## Side-by-side\n\n| | **Tavily: free \"Researcher\" plan** | **LangSmith: free \"Developer\" plan** |\n|---|---|---|\n| Monthly allowance | 1,000 API credits | 5,000 base traces |\n| Reset | 1st of each calendar month, whatever your billing date | Monthly |\n| At the limit | Requests stop until reset or upgrade | Hard cap with no payment method (tracing errors). With a card, extra traces are pay-as-you-go |\n| Seats | Not specified | 1 seat |\n| Rate limits | 100 requests/min (development key) | 50,000 trace events/hour and 500 MB ingested/hour without a card. 250,000 events/hour and 2.5 GB/hour with one |\n| Data retention | Not applicable | 14 days for base traces, 180 days for extended traces |\n| Credit card | Not required | Not required |\n\nSources for the Tavily column: [tavily.com/pricing](https://www.tavily.com/pricing), [docs: API credits](https://docs.tavily.com/documentation/api-credits), [docs: rate limits](https://docs.tavily.com/documentation/rate-limits).\nSources for the LangSmith column: [langchain.com/pricing](https://www.langchain.com/pricing), [docs: usage & billing](https://docs.langchain.com/langsmith/usage-and-billing), [support: trace limits](https://support.langchain.com/articles/1066772484-how-do-i-set-trace-limits-in-my-langsmith-workspace).\n\n## Tavily details\n- **What 1,000 credits buys** ([docs](https://docs.tavily.com/documentation/api-credits)):\n  - A basic, fast or ultra-fast search costs 1 credit, so up to about 1,000 searches a month. An advanced search costs 2, so about 500.\n  - Extract costs 1 credit per 5 successful URLs, or 2 in advanced mode.\n  - Map costs 1 credit per 10 pages. Crawl costs the map cost plus the extract cost.\n  - Research costs 4–110 credits per request with the mini model and 15–250 with pro.\n- **Watch for automatic advanced searches.** With `auto_parameters` turned on, Tavily may run a search as advanced (2 credits) unless you set `search_depth=basic` yourself ([changelog](https://docs.tavily.com/changelog)).\n- **Rate limits.** Production keys allow 1,000 requests/min but need a paid plan or pay-as-you-go turned on, so free users stay at 100/min ([docs](https://docs.tavily.com/documentation/rate-limits)).\n- **Rollover.** Credits reset \"with a clean slate\" ([pricing](https://www.tavily.com/pricing)). That suggests unused credits don't carry over, but no source says so directly.\n- **Upgrade path.** Pay-as-you-go costs $0.008 per credit. The Project plan is $30 a month for 4,000 credits ([docs](https://docs.tavily.com/documentation/api-credits)).\n\n## LangSmith details\n- **Some traces cost more.** Adding feedback, running evaluators or automation rules, or putting a trace in an annotation queue upgrades it to extended (longer-retained, pricier) storage ([docs](https://docs.langchain.com/langsmith/usage-and-billing)).\n- **Retention was recently cut.** Extended retention was 400 days. From September 14, 2026 the maximum is 180 days ([data-purging docs](https://docs.langchain.com/langsmith/data-purging-compliance.md)). Many third-party articles still say 400 days.\n- **Other monthly limits on the free plan** ([pricing](https://www.langchain.com/pricing), [pricing FAQ](https://docs.langchain.com/langsmith/pricing-faq)):\n  - Fleet (formerly Agent Builder) gets 5 LCU of usage a month. LCU is LangChain's usage unit, priced at $1.50.\n  - Sandboxes get 5 LCU plus 1 LSU (a $1 unit) a month, with no more than 10 sandboxes.\n  - Deployment (formerly LangGraph Platform) isn't included.\n- **API limits for all plans.** For example, 5,000 requests/min for POST /runs, and 2,000/min for most other endpoints ([docs](https://docs.langchain.com/langsmith/usage-and-billing)).\n- **The overage price is unclear.** In July 2026 LangChain switched to billing in LSU/LCU units. Third-party trackers put the new rate at about $5 per 1,000 base traces ([UsagePricing](https://www.usagepricing.com/blueprint/activity/langsmith-2026-07-21-lcu-lsu-reprice), [Pydantic](https://pydantic.dev/logfire/vs-langsmith)). Older sources say $0.50 or $2.50 per 1,000. The official page shows the rate only in a hover tooltip, so check it before you budget for overage.\n- **Upgrade path.** More seats require the Plus plan at $39 per seat per month ([pricing](https://www.langchain.com/pricing)).\n\n## Reliability\n- **Well supported:** the headline numbers (1,000 credits; 5,000 traces, 1 seat, 14-day retention). The vendors' own pricing pages and docs agree on them.\n- **Less certain:** LangSmith's overage price, and Tavily's student offer. Tavily's [FAQ](https://docs.tavily.com/faq/faq) says students get free access. A [Help Center article](https://help.tavily.com/articles/6606514713-student-account) last updated about a year ago says 4 months of the Project plan.\n\nI saved these findings to `/memories/tavily-langsmith-free-tiers.md` for future sessions.",
+      "claims": [
+        {
+          "id": "c05",
+          "claim": "Neither needs a credit card.",
+          "label": "cited"
+        },
+        {
+          "id": "c06",
+          "claim": "1st of each calendar month, whatever your billing date",
+          "label": "cited"
+        },
+        {
+          "id": "c07",
+          "claim": "A basic, fast or ultra-fast search costs 1 credit, so up to about 1,000 searches a month.",
+          "label": "cited"
+        },
+        {
+          "id": "c08",
+          "claim": "Deployment (formerly LangGraph Platform) isn't included.",
+          "label": "uncited"
+        },
+        {
+          "id": "c09",
+          "claim": "Many third-party articles still say 400 days.",
+          "label": "uncited"
+        },
+        {
+          "id": "c10",
+          "claim": "Older sources say $0.50 or $2.50 per 1,000.",
+          "label": "uncited"
+        }
+      ],
+      "parts": [
+        {
+          "id": "p02",
+          "part": "What are the monthly usage limits of LangSmith's free tier?",
+          "label": "answered"
+        }
+      ]
+    },
+    {
+      "experiment": "judgesplit-full-8708ffe9",
+      "run_id": "01a07794-3d10-7182-a556-a0f11e229c15",
+      "question": "What are Anthropic's published rate limits for the Claude API, and how do they differ between usage tiers?",
+      "response": "I'll start by checking memory and planning this out.\n\n# Anthropic Claude API Rate Limits\n\n**The headline correction first: the numbered Tier 1–4 system no longer exists.** Anthropic consolidated usage tiers into **Start, Build, and Scale** (plus a separate **Custom** tier), and the old deposit ladder — \"$5 / $40 / $200 / $400 in credits, plus a 7- or 14-day wait\" — has been abolished entirely. Per the platform release notes dated **June 26, 2026**: \"We've raised rate limits across the Claude API. Claude Sonnet and Claude Haiku rate limits now match Claude Opus at every usage tier, and usage tiers have been consolidated into three: Start, Build, and Scale. Most organizations move to a higher tier, no organization receives lower limits than before, and no action is required.\" ([docs.claude.com/en/release-notes/overview](https://docs.claude.com/en/release-notes/overview))\n\n## What is actually limited\n\nThree dimensions on the Messages API, measured **per model class**: requests per minute (RPM), input tokens per minute (ITPM), and output tokens per minute (OTPM). There is no tokens-per-day limit — the periodic cap is a *spend* cap, not a token cap. ([docs.claude.com/en/api/rate-limits](https://docs.claude.com/en/api/rate-limits); [support.anthropic.com — our approach to rate limits](https://support.anthropic.com/en/articles/8243635-our-approach-to-api-rate-limits))\n\nMechanics worth knowing, all from [the rate limits page](https://docs.claude.com/en/api/rate-limits):\n\n- **Token bucket algorithm** — capacity replenishes continuously rather than resetting at fixed intervals.\n- **Sub-minute enforcement** — \"a rate of 60 requests per minute (RPM) might be enforced as 1 request per second,\" so bursts can 429 you well under the nominal minute rate.\n- ITPM is estimated at request start and reconciled during the request; **OTPM is estimated from your `max_tokens`**, so an inflated `max_tokens` burns OTPM headroom you never use.\n- Separate **\"acceleration limits\"** can 429 you on a sharp usage increase even within your nominal limits.\n- Limits are **organization-level**; workspaces can be given optional sub-limits carved out of the org budget, but org-wide limits always bind.\n- \"All limits described here represent maximum allowed usage, not guaranteed minimums.\"\n\n## The per-model numbers\n\n| Model | Max RPM | Max ITPM | Max OTPM |\n|---|---|---|---|\n| Claude Fable 5.x ¹ | 1,000 | 500,000 | 100,000 |\n| Claude Opus 5 | 1,000 | 2,000,000 | 400,000 |\n| Claude Opus 4.x ² | 1,000 | 2,000,000 | 400,000 |\n| Claude Sonnet 5 | 1,000 | 2,000,000 | 400,000 |\n| Claude Sonnet 4.x ³ | 1,000 | 2,000,000 | 400,000 |\n| Claude Haiku 4.5 | 1,000 | 2,000,000 | 400,000 |\n| Claude Haiku 3.5 (retired exc. Bedrock/Google Cloud) | 1,000 | 100,000 † | 20,000 |\n\nSource: [docs.claude.com/en/api/rate-limits](https://docs.claude.com/en/api/rate-limits). ¹ Fable 5.1 and 5 share one combined bucket; Mythos 5.1/5 share a separate one. ² Opus 4.8/4.7/4.6/4.5 share one combined bucket — Opus 5 has its own. ³ Sonnet 4.6/4.5 share one — Sonnet 5 has its own. † Haiku 3.5 counts `cache_read_input_tokens` toward ITPM; other models don't.\n\n**One caveat I could not close, and it matters for your question.** The docs present these limits in per-tier *tabs*, and every retrieval — English, the German mirror, and the legacy `#tier-4-rate-limits` and `#rate-limits-by-tier` anchors — returns the same single unlabelled table. I could not confirm whether the numbers above are the Start, Build, or Scale figures, and I could not pull the other two tiers' tables at all. I'm not going to guess at them. To get the Start/Build/Scale Messages API breakdown you need to open [the page](https://docs.claude.com/en/api/rate-limits) in a browser and click the tabs, or read your own org's numbers from Console → Settings → Limits, or via the Rate Limits API.\n\nThe structural signal is still clear: since the June 2026 change made Sonnet and Haiku match Opus *at every tier*, the flagship models carry identical limits within any given tier — Fable and legacy Haiku 3.5 are the only exceptions. So model choice no longer costs you rate-limit headroom the way it used to.\n\nOne per-tier table I *could* retrieve cleanly, for the token counting endpoint: **Start 5,000 RPM · Build 10,000 RPM · Scale 20,000 RPM** ([token counting docs](https://docs.anthropic.com/en/docs/build-with-claude/token-counting)). It's a useful proxy for the shape of the ladder — roughly 2× per step — though not a substitute for the Messages API figures.\n\n## How the tiers actually differ\n\n**Monthly spend caps** are the cleanest published per-tier difference ([rate limits page](https://docs.claude.com/en/api/rate-limits)):\n\n| Tier | Monthly spend cap |\n|---|---|\n| Start | $500 |\n| Build | $1,000 |\n| Scale | $200,000 |\n| Custom | None — arranged with your account team |\n\nSource: [docs.claude.com/en/api/rate-limits](https://docs.claude.com/en/api/rate-limits). Note the odd shape: Start→Build is a 2× step, Build→Scale is 200×. That gap is published as-is but looks like a table that hasn't been fully reworked for the three-tier consolidation, so verify against Console before planning around it. Hitting the cap pauses API usage until 00:00 UTC on the 1st of the next month.\n\n**Advancement is automatic and unpriced.** \"Organizations are placed on a tier automatically based on usage history and account standing.\" Anthropic's help center is now blunt about the old scheme: \"Usage tiers are assigned automatically. There's no deposit or purchase that moves you up.\" ([support.anthropic.com](https://support.anthropic.com/en/articles/10366389-how-can-i-advance-my-api-usage-to-tier-2)) New organizations may start below the standard published limits in an **Evaluation** state as an anti-abuse measure, rising automatically as history accrues. You can request an increase in Console, but only **once you're using ≥50% of your current limits** ([support](https://support.anthropic.com/en/articles/8114527-i-m-encountering-429-errors-and-i-m-worried-my-rate-limit-is-too-low-what-should-i-do)). Beyond Scale means the Custom tier via sales. Orgs on Claude Platform on AWS are pinned to Start and do not move automatically.\n\n## The lever most people miss: cache-aware ITPM\n\nFor most Claude models, **only uncached input tokens count toward ITPM**. `input_tokens` and `cache_creation_input_tokens` (writes) count; `cache_read_input_tokens` does not. Anthropic's own worked example: \"With a 2,000,000 ITPM limit and an 80% cache hit rate, you could effectively process 10,000,000 total input tokens per minute.\" ([docs.claude.com/en/api/rate-limits](https://docs.claude.com/en/api/rate-limits)) Cached tokens are also billed at 10% of base input price. The exception is Haiku 3.5, which counts cache reads and has a far lower 100,000 ITPM.\n\n## Separate limit pools and 429 behavior\n\n- **Message Batches API** (shared across all models): 1,000 RPM, 200,000 batch requests in the processing queue, 100,000 requests per batch. ([rate limits](https://docs.claude.com/en/api/rate-limits)) I could not confirm whether these are uniform across tiers.\n- **Long context**: the dedicated 1M-token rate limits **have been removed** — \"Your standard account limits now apply across every context length\" ([API release notes](https://docs.claude.com/en/release-notes/api)). 1M is now the default on supported models, with no beta header and standard pricing ([context windows](https://docs.claude.com/en/docs/build-with-claude/context-windows)).\n- **Priority Tier is closed to new customers**: \"Priority Tier capacity commitments are no longer available for purchase.\" Existing commitments run to contract end, target 99.5% uptime, and overflow falls back to standard tier. Not supported on Opus 5, Sonnet 5, Fable 5.1, or Mythos. ([service tiers](https://docs.claude.com/en/api/service-tiers))\n- **Headers**: `retry-after`, plus `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}` (remaining tokens rounded to the nearest thousand; resets in RFC 3339). Priority and fast-mode status use `anthropic-priority-*` and `anthropic-fast-*`. The OpenAI-compatible endpoint emits `x-ratelimit-*` instead. ([rate limits](https://docs.claude.com/en/api/rate-limits); [OpenAI SDK compat](https://docs.claude.com/en/api/openai-sdk))\n- **Telling a spend-cap 429 from a rate-limit 429**: both carry `error.type = \"rate_limit_error\"`, but the spend-cap variant has **no `retry-after`** and returns `error.details.error_code = enforced_spend_limit_reached`. SDK auto-retry will spin fruitlessly against it.\n\n## A note on sourcing\n\nEvery third-party aggregator that surfaced in this research — sitepoint, aifreeapi, metacto, classmethod, mindstudio — still publishes the retired Tier 1–4 deposit ladder, and they contradict each other on the numbers (Tier 1 ITPM quoted variously as 20,000 and 30,000). Anthropic's own help center directly contradicts the deposit-based model they all describe. I've used only first-party pages above. Two things named \"tier\" are also easy to conflate: **usage tiers** (Evaluation/Start/Build/Scale/Custom) govern rate and spend limits, while **service tiers** (standard/priority/batch) govern request prioritization — unrelated axes.\n\nDurable findings saved to `/memories/anthropic-claude-api-rate-limits.md`.",
+      "claims": [
+        {
+          "id": "c11",
+          "claim": "**Token bucket algorithm** — capacity replenishes continuously rather than resetting at fixed intervals.",
+          "label": "cited"
+        },
+        {
+          "id": "c12",
+          "claim": "| Claude Opus 5 | 1,000 | 2,000,000 | 400,000 |",
+          "label": "cited"
+        },
+        {
+          "id": "c13",
+          "claim": "Hitting the cap pauses API usage until 00:00 UTC on the 1st of the next month.",
+          "label": "cited"
+        },
+        {
+          "id": "c14",
+          "claim": "Orgs on Claude Platform on AWS are pinned to Start and do not move automatically.",
+          "label": "cited"
+        },
+        {
+          "id": "c15",
+          "claim": "Cached tokens are also billed at 10% of base input price.",
+          "label": "cited"
+        },
+        {
+          "id": "c16",
+          "claim": "the spend-cap variant has **no `retry-after`** and returns `error.details.error_code = enforced_spend_limit_reached`",
+          "label": "cited"
+        },
+        {
+          "id": "c17",
+          "claim": "Tier 1 ITPM quoted variously as 20,000 and 30,000",
+          "label": "uncited"
+        }
+      ],
+      "parts": [
+        {
+          "id": "p03",
+          "part": "How do the rate limits (RPM, ITPM, OTPM) differ between usage tiers?",
+          "label": "answered"
+        },
+        {
+          "id": "p04",
+          "part": "What are Anthropic's published rate limits for the Claude API?",
+          "label": "answered"
+        }
+      ]
+    },
+    {
+      "experiment": "final-02131087",
+      "run_id": "019f59fe-3e41-7b41-8af2-4256c629b321",
+      "question": "Compare mypy, pyright, and ty as Python type checkers: which are actively maintained, and how do they differ on speed and coverage?",
+      "response": "I'll research this comparison. Let me start by checking memory and planning.\n\nMemory is empty. Let me plan and delegate research.\n\nAll three research tasks are complete. Let me update the todos and persist findings.\n\n## mypy vs. pyright vs. ty\n\n**Short answer:** All three are actively maintained as of late 2025. mypy and pyright are mature and production-safe; ty is a fast newcomer still in beta. On **speed**, ty (Rust) is dramatically fastest, pyright and mypy are roughly comparable (the old \"pyright is 3–5x faster than mypy\" claim is now stale), and ty leads by a wide margin. On **coverage/correctness**, pyright leads on formal spec conformance, mypy is the de-facto real-world standard, and ty trails but is improving quickly.\n\n### Maintenance status — all three are active\n\n| Tool | Maintainer | Latest / cadence | Status |\n|---|---|---|---|\n| **mypy** | Community, under `python/mypy` (origin: Jukka Lehtosalo, Dropbox) | 1.19.0, ~28 Nov 2025; every ~1.5–3 months | Mature, stable |\n| **pyright** | Microsoft (MIT) | `1.1.4xx` series, near-weekly releases | Mature, stable |\n| **ty** | Astral (Ruff/uv makers) | Beta ~16 Dec 2025 (~v0.0.9); stable targeted 2026 | Early, beta |\n\n- mypy: https://mypy-lang.org/news.html, https://github.com/python/mypy\n- pyright: https://github.com/microsoft/pyright — also powers Microsoft's closed-source **Pylance** VS Code extension (Pyright itself is open-source/MIT). https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-pylance\n- ty: developed under codename \"Red Knot,\" renamed \"ty\" ~May 2025; Astral now uses it internally and recommends it \"to motivated users for production,\" but calls a stable release a 2026 goal. https://astral.sh/blog/ty, https://www.infoworld.com/article/4108979/python-type-checker-ty-now-in-beta.html\n  - *Consensus caveat:* independent coverage says mypy/pyright remain the safe choice for critical workloads today. https://www.pkgpulse.com/guides/pyrefly-vs-ty-python-type-checkers-2026\n\n### Speed\n\nImplementation language largely drives this: **mypy** is Python (compiled to C extensions via mypyc, ~4x self-speedup), **pyright** is TypeScript/Node.js, **ty** is Rust (using the Salsa incremental framework, like rust-analyzer).\n\n- **ty is fastest by a large margin.** Astral claims it is \"consistently between 10x and 60x faster than mypy and Pyright.\" Example on the home-assistant project: ty 2.19s vs. pyright 19.62s vs. mypy 45.66s. https://astral.sh/blog/ty, https://byteiota.com/astral-ty-python-type-checker-60x-faster-than-mypy\n- ty's biggest edge is **incremental editor updates**: ~4.7ms to recompute after an edit vs. ~386ms for pyright (~80x). https://astral.sh/blog/ty\n- **mypy vs. pyright is now roughly even.** Pyright's docs long claimed \"3–5x faster than mypy,\" but that predates mypy's mypyc-compiled builds and 1.18+ optimizations; recent independent benchmarks find pyright now comparable to or slower than current mypy. https://docs.basedpyright.com/latest/usage/mypy-comparison, https://pydevtools.com/handbook/explanation/how-do-mypy-pyright-and-ty-compare\n- *Caveat:* most ty performance figures come from Astral itself, and all ratios vary by codebase and hardware.\n\n### Coverage / correctness\n\nMeasured against the community **typing-spec conformance suite** (approximate, moving targets):\n\n| Tool | Conformance (~2025) |\n|---|---|\n| pyright | ~97–98% (highest) |\n| mypy | ~57–59% |\n| ty | ~15–53% (early, rising) |\n\nSource: https://pyrefly.org/blog/typing-conformance-comparison, https://pydevtools.com/handbook/explanation/how-do-mypy-pyright-and-ty-compare\n\n- **Important caveat:** a low conformance score ≠ \"not useful.\" The suite probes many obscure corners of the spec; mypy remains the de-facto reference for everyday Python and is heavily relied upon. https://news.ycombinator.com/item?id=47398023\n- **pyright** has the strongest inference and type narrowing (isinstance/assert/TypeGuard/`match`), and historically ships new typing PEPs before mypy. https://docs.basedpyright.com/latest/usage/mypy-comparison\n- **ty** currently produces more false positives (one reviewer saw 1,599 diagnostics where pyright found 10 correct ones); it favors a conservative \"gradual guarantee\" design over aggressive inference. https://byteiota.com/astral-ty-python-type-checker-60x-faster-than-mypy, https://pydevtools.com/handbook/explanation/ty-complete-guide\n- **Plugin systems** matter for framework coverage: **mypy has plugins** (Django, SQLAlchemy, Pydantic); **pyright and ty do not** (ty lists first-class Pydantic/Django support as a pre-stable goal). https://news.ycombinator.com/item?id=42868576, https://astral.sh/blog/ty\n\n### Feature highlights\n\n- **mypy:** incremental cache, `dmypy` daemon for fast re-checks, plugin system, `--strict` meta-flag. https://mypy.readthedocs.io/en/stable/mypy_daemon.html\n- **pyright:** open LSP server (any editor), `--watch`, strict mode, aggressive inference on unannotated code. https://github.com/microsoft/pyright\n- **ty:** single-binary LSP (no Node/Python runtime needed), Salsa-based incrementality, VS Code extension, Rust-compiler-style multi-file diagnostics. https://astral.sh/blog/ty\n\n### Bottom line\n\n- **Want maximum correctness / editor intelligence today:** pyright.\n- **Want the real-world standard with framework plugin support:** mypy.\n- **Want the fastest tool and are an early adopter who can tolerate rough edges:** ty — but keep mypy/pyright for critical work until ty reaches stable (targeted 2026).\n\n*Note on uncertainty: exact \"latest version\" numbers, cross-tool speed multipliers, and conformance percentages shift frequently — treat the specific figures above as recent snapshots rather than fixed values.*",
+      "claims": [
+        {
+          "id": "c18",
+          "claim": "All three are actively maintained as of late 2025.",
+          "label": "cited"
+        },
+        {
+          "id": "c19",
+          "claim": "**mypy** is Python (compiled to C extensions via mypyc, ~4x self-speedup), **pyright** is TypeScript/Node.js, **ty** is Rust",
+          "label": "uncited"
+        },
+        {
+          "id": "c20",
+          "claim": "ty's biggest edge is **incremental editor updates**: ~4.7ms to recompute after an edit vs. ~386ms for pyright (~80x).",
+          "label": "cited"
+        },
+        {
+          "id": "c21",
+          "claim": "**pyright and ty do not** (ty lists first-class Pydantic/Django support as a pre-stable goal)",
+          "label": "cited"
+        }
+      ],
+      "parts": []
+    },
+    {
+      "experiment": "sweep-e92a5920",
+      "run_id": "019f58f1-5fb5-7931-b1b3-db85b1a1338f",
+      "question": "How do LangGraph's SqliteSaver and PostgresSaver checkpointers differ in durability, concurrency support, and setup cost?",
+      "response": "I'll research this. Let me start by checking memory and planning.\n\n# SqliteSaver vs. PostgresSaver in LangGraph\n\n**Bottom line:** Both persist checkpoints durably (unlike `MemorySaver`/`InMemorySaver`, which lose everything on restart). The difference is scale: `SqliteSaver` is a zero-infrastructure, single-writer file store for local dev and lightweight/single-server use; `PostgresSaver` is the officially recommended production checkpointer, built for concurrent, multi-instance workloads at the cost of running a Postgres server. LangGraph's own API reference tiers them explicitly — SQLite for \"lightweight demos and small projects,\" Postgres as the \"(Production)\" option ([reference.langchain.com](https://reference.langchain.com/python/langgraph/checkpoints)).\n\n## 1. Durability\n\n| | SqliteSaver | PostgresSaver |\n|---|---|---|\n| Backing store | Local SQLite file (or `\":memory:\"`) | Running PostgreSQL server |\n| Survives restart | Yes, if file-backed; **no** in `\":memory:\"` mode | Yes |\n| Durability tuning | WAL journaling enabled by default; no documented commit-mode control | `durability` modes: `\"exit\"`, `\"async\"`, `\"sync\"`; per-task \"pending writes\" recovery; encryption-at-rest option |\n\n- `SqliteSaver` stores to a disk file so thread history survives process restarts — but only when given a filename; the `\":memory:\"` connection string is as ephemeral as the RAM savers and is meant for quick demos ([github.com](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py), [reference.langchain.com](https://reference.langchain.com/python/langgraph.checkpoint.sqlite)).\n- `PostgresSaver` inherits Postgres's transactional integrity (JSONB + transactional writes) and adds finer control via a `durability` setting — `\"sync\"` commits before the next step (highest safety, slower), `\"async\"` commits in the background, `\"exit\"` only on graph exit (fastest, no mid-run crash recovery) ([docs.langchain.com](https://docs.langchain.com/oss/python/langgraph/checkpointers), [fast.io](https://fast.io/resources/langgraph-persistence)). It also supports encrypted serialization for data at rest ([docs.langchain.com](https://docs.langchain.com/oss/python/langgraph/checkpointers)).\n- One caveat: I found no official statement of formal fsync/durability guarantees for SqliteSaver beyond the WAL mode its `setup()` enables — its durability rests on SQLite's own behavior.\n\n## 2. Concurrency Support\n\n**SqliteSaver — limited.** SQLite permits only **one writer at a time**. Even in WAL mode (many concurrent readers + one writer), simultaneous writes queue and can raise `SQLITE_BUSY` / \"database is locked\" ([blog.skypilot.co](https://blog.skypilot.co/abusing-sqlite-to-handle-concurrency)). This is a real, LangGraph-specific problem, not just theory: open issue [#8136](https://github.com/langchain-ai/langgraph/issues/8136) reports `AsyncSqliteSaver.aput` intermittently failing with \"database is locked\" under concurrent async agents. Within a single process it is thread-safe (uses a lock, `check_same_thread=False`), and an async variant `AsyncSqliteSaver` (via `aiosqlite`) exists — but the reference marks even the async version **\"not recommended for production\"** and unsuitable for distributed systems ([github.com](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py), [reference.langchain.com](https://reference.langchain.com/python/langgraph/checkpoints)).\n\n**PostgresSaver — designed for it.** Postgres handles concurrent clients with transactional integrity, making it the recommended choice for serverless/multi-instance hosts where \"conversation state is not durable across cold starts or replicas\" ([fast.io](https://fast.io/resources/langgraph-persistence), [docs.langchain.com](https://docs.langchain.com/langsmith/deploy-nextjs)). It offers an async variant `AsyncPostgresSaver` and, importantly, **connection pooling** (`ConnectionPool`/`AsyncConnectionPool` from `psycopg_pool`), recommended for production to manage many concurrent connections ([ai.plainenglish.io](https://ai.plainenglish.io/never-lose-ai-memory-in-production-postgressaver-for-langgraph-2f165c3688a0), [support.langchain.com](https://support.langchain.com/articles/6253531756-understanding-checkpointers-databases-api-memory-and-ttl)). Caveat: as of v3.0.4, `AsyncPostgresSaver.from_conn_string()` doesn't accept pool-config kwargs, so for remote DBs with idle timeouts you should build the pool yourself and pass it in (open issue [#7304](https://github.com/langchain-ai/langgraph/issues/7304)).\n\n## 3. Setup Cost\n\n| | SqliteSaver | PostgresSaver |\n|---|---|---|\n| Package | `langgraph-checkpoint-sqlite` (pulls `aiosqlite` for async) | `langgraph-checkpoint-postgres` + `psycopg` (often `psycopg[binary,pool]`) |\n| Infrastructure | None — just a local file | A running PostgreSQL server |\n| Instantiate | `with SqliteSaver.from_conn_string(\"checkpoints.sqlite\") as cp:` | `with PostgresSaver.from_conn_string(DB_URI) as cp:` |\n| Conn string | `\":memory:\"` or a file path | `postgresql://user:pass@host:port/db` |\n| `.setup()` | **Not needed** — called automatically | **Required on first use** — creates tables/runs migrations |\n| Extra config | Optional msgpack hardening | Manual connections need `autocommit=True` + `row_factory=dict_row`; pool sizing |\n\n- SQLite's setup cost is minimal: no server or service, and you can swap `InMemorySaver()` → `SqliteSaver.from_conn_string(\"checkpoints.db\")` without changing graph code. Its `setup()` (creating tables, setting WAL) runs automatically and \"should not be called directly\" ([github.com](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py), [kalviumlabs.ai](https://www.kalviumlabs.ai/blog/langgraph-in-production-stateful-multi-step-agents)).\n- Postgres requires provisioning a server, installing 2–3 packages, and a one-time explicit `checkpointer.setup()` (or `await asetup()`) that the reference says **\"MUST be called directly by the user the first time\"** ([reference.langchain.com](https://reference.langchain.com/python/langgraph.checkpoint.postgres/PostgresSaver), [pypi.org](https://pypi.org/project/langgraph-checkpoint-postgres)). Manual (non-`from_conn_string`) connections must set `autocommit=True` (needed for `setup()` to commit tables) and `row_factory=dict_row` ([reference.langchain.com](https://reference.langchain.com/python/langgraph.checkpoint.postgres)).\n\n## Choosing between them\n- **Local dev, testing, single-process/single-server apps, prototypes:** `SqliteSaver` — durable-to-disk with essentially no setup.\n- **Production, multiple workers/replicas, serverless, concurrent writes:** `PostgresSaver` — the officially recommended tier, with async + pooling and tunable durability.\n\n*Note on source quality:* Durability/setup facts come largely from official LangGraph/LangChain docs and the API reference and are consistent. Some concurrency-tuning specifics (pool sizing, timeout mitigation) come from LangChain support articles and forum threads rather than core docs. One minor doc conflict: the reference calls `row_factory=dict_row` required, while a maintainer issue ([#4937](https://github.com/langchain-ai/langgraph/issues/4937)) notes it sometimes works without — treat `dict_row` as the safe, supported setting.\n\nI'll save the durable technical facts for future reference.\n\nSaved key facts to memory for future reference. The full comparison is above.",
+      "claims": [
+        {
+          "id": "c22",
+          "claim": "WAL journaling enabled by default; no documented commit-mode control",
+          "label": "uncited"
+        },
+        {
+          "id": "c23",
+          "claim": "Within a single process it is thread-safe (uses a lock, `check_same_thread=False`)",
+          "label": "cited"
+        },
+        {
+          "id": "c24",
+          "claim": "you can swap `InMemorySaver()` → `SqliteSaver.from_conn_string(\"checkpoints.db\")` without changing graph code",
+          "label": "cited"
+        },
+        {
+          "id": "c25",
+          "claim": "It also supports encrypted serialization for data at rest",
+          "label": "cited"
+        }
+      ],
+      "parts": [
+        {
+          "id": "p05",
+          "part": "How do they differ in setup cost?",
+          "label": "answered"
+        }
+      ]
+    }
+  ]
+}

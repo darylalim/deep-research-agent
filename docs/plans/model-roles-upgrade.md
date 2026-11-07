@@ -149,7 +149,14 @@ have to work it out again.
   - Follow-up, 2026-11-07: the account predates enforcement, so step 7 was re-checked
     with the opt-in check. Zero breaks across 34 captured requests; see `CLAUDE.md`. No
     harness change is needed.
-- [ ] PR 2: Judge calibrated
+- [ ] PR 2: Judge calibrated. Steps 1 to 3 done on 2026-11-07: `evals/calibration.json` holds
+  25 claims (19 cited, 6 uncited) and 5 question parts (all answered) from 6 stored reports
+  across all 5 questions, labelled by the user blind to the judge. Next is step 4,
+  `--calibrate`. Two things to settle there. The judge's `claim` field may be "closely
+  paraphrased", so exact matching will miss some flags; use containment or overlap, and print
+  what goes unmatched. With no unanswered part, the answer judge can show only false
+  accusations, not misses. LangSmith's trace quota resets 2026-12-01, and `--calibrate` must
+  not depend on it.
 - [ ] PR 2: Phase 2 researcher settings
 - [ ] PR 2: Phase 2b metrics added and calibrated
 - [ ] PR 3: `score=None` measured
