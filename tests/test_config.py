@@ -71,11 +71,14 @@ class TestBuildModel:
     def test_streaming_does_not_smuggle_in_a_sampling_param(self) -> None:
         # The two invariants meet here: streaming must buy headroom WITHOUT reopening
         # the Opus 5 400-on-temperature footgun. Assert on the actual request payload
-        # rather than trusting that `streaming=True` is inert.
+        # rather than trusting that `streaming=True` is inert. `extra_body` is merged in
+        # because on `anthropic` 2.x that is where `langchain_anthropic` puts these
+        # params, and the SDK still sends them, so top-level keys alone see nothing.
         payload = config.build_model()._get_request_payload(
             [{"role": "user", "content": "hi"}]
         )
-        assert not {"temperature", "top_p", "top_k"} & set(payload)
+        sent = {**payload, **payload.get("extra_body", {})}
+        assert not {"temperature", "top_p", "top_k"} & set(sent)
 
     def test_thinking_is_adaptive_and_summarized_never_disabled(self) -> None:
         # Two separate invariants, both measured against the real API, both silent when

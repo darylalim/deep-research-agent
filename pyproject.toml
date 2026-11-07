@@ -51,6 +51,11 @@ dependencies = [
     "langchain-core>=1.0,<2.0",
     # Anthropic provider (Claude models)
     "langchain-anthropic>=1.0,<2.0",
+    # Capped because it arrived only through `langchain-anthropic`, which sets a floor
+    # and no cap, so a major that changed the API version came in unannounced. The repo
+    # also depends on it directly: `TestStopReasonsAreAccountedFor` reads its types. The
+    # floor of 2 is deliberate: below it the SDK sends the old API version.
+    "anthropic>=2,<3",
     # Web search tool for research (dedicated partner package)
     "langchain-tavily>=0.2,<1.0",
     # Orchestration runtime + disk-backed checkpointer for HITL/persistence
@@ -61,11 +66,10 @@ dependencies = [
     # Load .env into the environment
     "python-dotenv>=1.0,<2.0",
     # The app itself (`streamlit run streamlit_app.py` → `deep_research/webui.py`).
-    # Capped at the major: streamlit is 1.x and stable there. The >=1.57 floor is what
-    # ships the bundled agent-skill docs under `streamlit/.agents/`, and
-    # `st.code(height=...)` / `st.chat_input(submit_mode=...)`, both of which `webui.py`
-    # uses.
-    "streamlit>=1.57,<2.0",
+    # Capped at the major: streamlit is 1.x and stable there. The >=1.67 floor is the
+    # first release checked to have `st.grid`, which the page layout uses: it is missing
+    # from 1.60.0, 1.62.0, 1.64.0 and 1.66.0.
+    "streamlit>=1.67,<2.0",
 ]
 
 [build-system]
@@ -109,7 +113,7 @@ dev = [
 # `__version__ = "..."` assignment at build time and uses it for `[project].version`,
 # which is declared `dynamic` above. Bump `deep_research/__init__.py` and the wheel,
 # `importlib.metadata.version("deep-research-agent")`, and `deep_research.__version__`
-# all move together — then tag `v<that value>`.
+# all move together. CI then creates the tag and the GitHub Release on its own.
 [tool.hatch.version]
 path = "deep_research/__init__.py"
 
@@ -136,7 +140,7 @@ ignore = ["E501"]
 # installed (editable) into the venv by `uv sync`.
 testpaths = ["tests"]
 # `live` tests hit real Anthropic/Tavily APIs — opt in with `pytest -m live`.
-addopts = "-m 'not live'"
+addopts = "-m 'not live' --strict-markers"
 markers = [
     "live: exercises real external APIs (needs keys + network); deselected by default",
 ]

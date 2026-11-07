@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: not started. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress, offline work done and uncommitted. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -69,8 +69,24 @@ starts. They scale the old 5-example sweeps ($1.83 to $4.49, older models) to 9 
 Tick items as they finish, and add what was measured beside them, so the next session does not
 have to work it out again.
 
-- [ ] PR 1: Phase 0 offline work
-- [ ] PR 1: Phase 1 judge and regrade
+- [ ] PR 1: Phase 0 offline work. All done except the rule check that needs a fresh session
+  (*Tighten `.claude/settings.json`* step 4). Measured on 2026-11-06:
+  - Lowest versions: 218 passed on `streamlit` 1.67.0, `anthropic` 2.0.0,
+    `langchain-anthropic` 1.7.7 and `deepagents` 0.7.8.
+  - The 13 warnings on Python 3.14 are all one line, `langsmith/_internal/_beta_decorator.py:92`
+    (`asyncio.iscoroutinefunction`, removed in 3.16). None come from this repo.
+  - API version review: nothing to change beyond `JUDGE`. The client sends
+    `anthropic-version: 2026-10-21` and `Authorization`. There is no `document` or `citations`
+    block, no Admin API, no `MessageParam` call, no `betas` on Models and no `X-Api-Key`, in the
+    repo or in `langchain_anthropic` and `deepagents`. The SDK is now Apache 2.0, not MIT.
+  - Docs confirm the `!` lines, and that `ask` prompts in auto mode and matches past a leading
+    env assignment, so the third `ask` pattern is redundant but harmless.
+- [ ] PR 1: Phase 1 judge and regrade. Steps 1 to 3 done; step 4 and the regrade are next.
+  `effort` and the structured-output `format` merge correctly in `output_config` (checked
+  offline). Correction to step 3: asserting on top-level keys misses a sampling parameter on
+  `anthropic` 2.x, because `langchain_anthropic` moves it into `extra_body` and it is still
+  sent. The new test merges `extra_body`, and so does the `test_config.py` guard, which had
+  been unable to fail. Both were seen to fail with a parameter put back.
 - [ ] PR 1: Phase 0 steps 6 and 7 passed
 - [ ] PR 1: Release 0.4.0 published and note added
 - [ ] PR 2: Judge calibrated

@@ -94,25 +94,29 @@ _COMPLETED_RUN_KEYS = frozenset(
 )
 
 
-# The judge is Haiku, not the agent's own Opus 5, for two independent reasons:
-# grading is a cheap, high-volume classification task that does not need Opus, and
-# Opus 5 rejects `temperature` with a 400 — a judge wants `temperature=0`, so the
-# app's own `build_model()` is the wrong constructor to reuse here. (Opus 5 would
-# also think on every grade, which is pure cost for a classification call.)
-# This line used to carry the same `ty: ignore` as `config.py::build_model`, for the
-# same Pydantic-alias false positive; ty 0.0.63 fixed it and the now-dead directive was
-# itself a `ty check` failure. See that docstring — and the `ty>=0.0.63` dev floor it
-# explains, which this line depends on too.
+# The judge is Haiku, not the agent's own Opus, because grading is a cheap, high-volume
+# classification task that does not need Opus. `build_model()` is the wrong constructor
+# to reuse for the same reason: its effort and token ceiling are sized for a long report.
 #
-# `max_tokens` is 8192, and the number is load-bearing rather than generous. At 1024 a
-# grade could not always FIT: `_UncitedClaim` requires a verbatim quote of the nearest
-# citation plus a justification (~88 tokens an entry, so ~11 entries), and a
-# claim-dense report cited badly needs more than that. The failure was silent and
-# one-directional — see `_graded` for the mechanism, and note that the bias runs
-# *towards* a good score in exactly the regime the metric exists to detect. Output is
-# billed on tokens produced, never on the ceiling, so a ceiling clear of the worst case
-# costs nothing; the same argument as `config.MAX_TOKENS`, one layer down.
-JUDGE = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=8192)
+# No `temperature`, `top_p` or `top_k`. API version `2026-10-21` rejects all three on
+# every model, even at their defaults, and Haiku 5.5 rejects non-default sampling on any
+# version. So a judge can no longer be pinned to `temperature=0`, and grades vary from
+# run to run. Effort is the control instead. Do not disable thinking to save tokens.
+#
+# Thinking is on by default here and leaves `display` at `omitted`, which `config.py`
+# forbids for the agent. That rule exists because tool calls replay thinking blocks, and
+# a grade is one request that replays nothing, so it does not apply.
+#
+# `max_tokens` is load-bearing in both directions. Too low and a grade cannot FIT:
+# `_UncitedClaim` requires a verbatim quote of the nearest citation plus a justification
+# (~88 tokens an entry), thinking counts toward the same ceiling, and the failure is
+# silent and one-directional. See `_graded` for the mechanism, and note that the bias
+# runs *towards* a good score in exactly the regime the metric exists to detect. Output
+# is billed on tokens produced, never on the ceiling, so headroom is free. Too high is
+# the other trap: `JUDGE` does not stream, and above 21,333 a non-streaming request can
+# hang rather than fail (see `config.build_model`), so stay under it or set
+# `streaming=True`.
+JUDGE = ChatAnthropic(model="claude-haiku-5-5", effort="medium", max_tokens=16000)
 
 
 def _outputs(record: Any) -> dict[str, Any]:

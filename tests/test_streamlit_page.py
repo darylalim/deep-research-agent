@@ -266,11 +266,11 @@ class TestAQuestionCannotSlipPastATurnInFlight:
     (`runtime/state/session_state.py`, "Enforce `disabled` server-side"), so `set_value`
     on the disabled input leaves `prompt` as None and the guard is never reached — this
     class's original single test went red on the upgrade for that reason, with the page
-    behaving correctly. The guard still has to stay: `pyproject.toml` supports
-    `streamlit>=1.57`, where the old delivery is live, and it is the only thing that
-    turns a swallowed question into a notice rather than a silent drop. So the two tests
-    split what each can honestly prove — the invariant through the real widget, the
-    branch through a stubbed one.
+    behaving correctly. The guard stays as cheap defence: the `streamlit>=1.67` floor
+    leaves no supported version where the old delivery is live, but it is the only thing
+    that would turn a swallowed question into a notice rather than a silent drop. So the
+    two tests split what each can honestly prove — the invariant through the real widget,
+    the branch through a stubbed one.
 
     **Streamlit 1.64 then closed it a second time, in the test harness.** `AppTest`'s
     `Widget.set_value` now calls `_assert_can_interact` and raises `AppTestError` on a
@@ -310,8 +310,8 @@ class TestAQuestionCannotSlipPastATurnInFlight:
     ) -> None:
         """The `if prompt and busy:` branch itself, on a value Streamlit still delivers.
 
-        The stub is the whole point: it reproduces what 1.57-1.61 do to a disabled input,
-        which the installed Streamlit no longer will. Without it this test would pass on
+        The stub is the whole point: it reproduces what Streamlit before 1.62 did to a
+        disabled input, which no supported version still does. Without it this test would pass on
         an empty branch — `prompt` is None, nothing runs, and every assertion about the
         turn being untouched is satisfied by Streamlit having dropped the value. That is
         this repo's recurring failure mode, an assertion met by an unrelated condition.

@@ -48,9 +48,8 @@ uv run ty check                  # type check (Astral's ty)
   wire any new hook the same way. It formats and autofixes with ruff, reports
   whatever ruff *can't* autofix, type-checks with `ty` (0.24s, project-wide — CI's
   `lint` job runs it too, so leaving it out of the hook only moved the failure to a
-  red GitHub Actions run; it is also the one step that covers `evals/`, which the
-  pytest step below skips), and — for edits under `deep_research/`, `tests/`, or to
-  `streamlit_app.py` itself — runs the offline suite (**~5s**, no keys, no
+  red GitHub Actions run), and — for edits under `deep_research/`, `evals/`, `tests/`,
+  or to `streamlit_app.py` itself — runs the offline suite (**~5s**, no keys, no
   network; measured, and the number this file carried for a long time — "~1s" — was
   5x optimistic). A non-zero exit blocks with the failure in stderr. **Two consequences for how you edit here:** `ruff check --fix`
   deletes an import whose first *use* lands in a *later* edit, so add an import and its
@@ -66,13 +65,26 @@ uv run ty check                  # type check (Astral's ty)
   of `.env` and `.deep_research/**` (live agent state: checkpoints, memories,
   *pending approvals*) — both gitignored, so git cannot undo damage to them — and
   `deny`s *edits* of `uv.lock`, which **is** committed: regenerate it with `uv lock`,
-  never hand-edit it. (It also carries an `allow` list — the read-only `uv` invocations —
-  which only suppresses permission prompts and gates nothing.)
-- **The hook's matcher is `Edit|Write`, so a `.py` file changed through Bash is never
-  checked.** `sed -i`, a heredoc, `git checkout`, a script that rewrites a module — none
-  of them run ruff, ty or pytest, and none of them fail. Nothing warns you; the next
-  `uv run pytest` or the CI `lint` job is where it surfaces, detached from the edit that
-  caused it. If you edit Python outside `Edit`/`Write`, run the three steps yourself:
+  never hand-edit it. `.env.*` is denied too, with `!.env.example` carved back out; the
+  `!` line must stay after the rule it narrows, or it carves nothing. **Deny rules are not
+  a hard boundary:** they stop the built-in tools and commands like `cat .env`, but not
+  `grep -r` or a Python script opening the file. Only the sandbox enforces this at OS
+  level, and that is more setup than a single-developer project needs. An `ask` list
+  covers `pytest -m live` and `python -m evals`, the commands that spend money, and the
+  docs say it prompts even in auto mode and past a leading env assignment. (The `allow`
+  list only suppresses permission prompts and gates nothing. It is not read-only: `uv
+  sync`, `uv lock` and `ruff format` change files, and `ruff check --fix` passes it too.)
+- **The hook's matcher is `Edit|Write`, so a `.py` file changed through Bash is checked
+  only at the end of the turn, and so is every `.md` file.** `sed -i`, a heredoc, `git
+  checkout`, a script that rewrites a module — none of them run ruff, ty or pytest at the
+  edit. A `Stop` hook, `.claude/hooks/stop-check.sh`, closes that gap: when `git status`
+  shows changed or untracked `.py` or `.md` files it runs `ruff format --check`, `ruff
+  check`, `ty check` and `pytest -q`, and blocks on failure. `.md` is covered because
+  `ruff format` also formats Python blocks in Markdown, which turned `main` red on
+  2026-10-02 through a README snippet. It only checks, and never rewrites files, and it
+  exits at once when `stop_hook_active` is set, or a failing check would loop the session.
+  The accepted cost is several seconds on every turn while such changes are uncommitted.
+  If you edit Python outside `Edit`/`Write`, you can run the steps yourself sooner:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
 - **Tests** live in `tests/` (pytest) — 8 files, ~4,500 lines, and the offline suite runs
   in **~4s**. Where things are: `test_activity_feed.py` (`ActivityFeed` as recorded
@@ -770,13 +782,13 @@ widget that rendered disabled, treating it as stale or forged
 (`runtime/state/session_state.py`, "Enforce `disabled` server-side"). So `set_value` on
 the disabled chat input no longer reaches the script, and the single test that drove the
 `if prompt and busy:` branch through the real widget went red *while the page was
-behaving correctly*. Two things follow. The guard stays, because `pyproject.toml`
-supports `streamlit>=1.57` where the old delivery is live, and it is the only thing that
-turns a swallowed question into a visible notice. And the test had to **split**:
+behaving correctly*. Two things follow. The guard stays as cheap defence: the
+`streamlit>=1.67` floor leaves no supported version where the old delivery is live, but it
+is the only thing that would turn a swallowed question into a visible notice. And the test had to **split**:
 `test_a_queued_question_never_disturbs_the_turn_in_flight` drives the real widget and
 proves the end-to-end invariant on either side of the change, while
 `test_a_delivered_question_is_refused_with_a_notice` monkeypatches `st.chat_input` to
-return a value — reproducing what 1.57-1.61 do — because without the stub it would pass
+return a value — reproducing what Streamlit before 1.62 did — because without the stub it would pass
 on an empty branch, every assertion satisfied by Streamlit having dropped the value
 rather than by the guard. That is this file's recurring failure mode, one version later.
 
@@ -853,6 +865,14 @@ is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
 accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
 has no `model` key — so the rule covers them too.
+
+**A sampling param is invisible at the top level of the payload on `anthropic` 2.x.** The
+SDK removed `temperature`, `top_p` and `top_k` from `messages.create`, so
+`langchain_anthropic` moves them into `extra_body`, and the SDK still sends them. Measured
+through a mock transport: `temperature=0` reached the wire under `2026-10-21` while
+`set(payload)` showed no such key. So any assertion on a built payload has to merge
+`extra_body` first. `test_streaming_does_not_smuggle_in_a_sampling_param` checked only the
+top level, so after the upgrade it could not fail until it was changed to merge them.
 
 **`thinking={"type": "adaptive", "display": "summarized"}` — and `display` is the
 load-bearing half.** The thinking default *inverted* at Opus 5: omitting the parameter
@@ -1142,10 +1162,11 @@ assumes otherwise:
   root, and `Path("").resolve()` + `rmtree` deletes the working tree); and
   `ensure_isolated_state_dir` refuses any path that **is or contains** the live
   `.deep_research/`. If you touch any of these, keep the others.
-- **The judge is Haiku, not the app's Opus.** Grading is cheap classification, and Opus
-  5 400s on `temperature` — a judge wants `temperature=0`. Do not reuse
-  `config.build_model()` for it. Opus 5 would also *think* on every grade, which is pure
-  cost on a classification call.
+- **The judge is Haiku, not the app's Opus.** Grading is cheap classification. API
+  version `2026-10-21` rejects `temperature` on every model, so a judge can no longer be
+  pinned to `temperature=0` and its grades vary from run to run. Do not reuse
+  `config.build_model()` for it. Haiku 5.5 thinks on every grade too, so `effort` is the
+  cost control, and thinking counts toward `max_tokens`.
 
 - **An experiment's `run_stats.token_count` is agent-only — the judges' tokens are filed
   somewhere else entirely.** `langsmith/evaluation/_runner.py` wraps every evaluator in a
@@ -1405,7 +1426,7 @@ not being enforced for the evaluators themselves.
   (truncation drops uncited claims, never adds them) and is worst exactly where the
   metric matters most, since each `_UncitedClaim` demands a verbatim quote plus a
   justification, so the worse the citation discipline the longer the honest grade and
-  the likelier the cut. Now `max_tokens=8192` **and** `include_raw=True`, with a
+  the likelier the cut. Now a higher `max_tokens` (16000 since Haiku 5.5, whose thinking counts toward it) **and** `include_raw=True`, with a
   `stop_reason == "max_tokens"` returning a non-verdict — the ceiling alone would only
   move the cliff. Note what this was: a *robustness* feature (repair partial JSON so a
   streaming UI can render it) doing its job in the one place repair is the wrong answer.

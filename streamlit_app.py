@@ -115,8 +115,10 @@ if prompt and busy:
     # is what made that matter. On the pass that DISCOVERS a pause — a fresh tab on a
     # thread another session left at an approval — `busy` is still False, so the input paints
     # enabled while `agent.get_state` deserializes the whole message list. A question
-    # typed into that window is queued, and Streamlit delivers a queued value even to a
-    # widget that is disabled by the time it arrives.
+    # typed into that window is queued, and Streamlit before 1.62 delivered a queued value
+    # even to a widget disabled by the time it arrived. The `streamlit>=1.67` floor means
+    # no supported version does that now, so this branch is cheap defence: it is kept
+    # because a question dropped without a word is the worse failure if that ever returns.
     #
     # Accepting it here would either overwrite a `Command(resume=…)` already in
     # `payload`, wedging the turn, or be silently discarded by the approval screen below

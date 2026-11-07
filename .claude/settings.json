@@ -4,9 +4,18 @@
     "deny": [
       "Read(.env)",
       "Edit(.env)",
+      "Read(.env.*)",
+      "Edit(.env.*)",
+      "Read(!.env.example)",
+      "Edit(!.env.example)",
       "Read(./.deep_research/**)",
       "Edit(./.deep_research/**)",
       "Edit(./uv.lock)"
+    ],
+    "ask": [
+      "Bash(uv run pytest *-m live*)",
+      "Bash(uv run python -m evals *)",
+      "Bash(* uv run python -m evals *)"
     ],
     "allow": [
       "Bash(uv sync *)",
@@ -25,6 +34,17 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR}\"/.claude/hooks/post-edit.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}\"/.claude/hooks/stop-check.sh",
             "timeout": 120
           }
         ]

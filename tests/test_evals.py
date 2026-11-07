@@ -1027,6 +1027,26 @@ def test_drift_reports_a_question_uploaded_twice():
     )
 
 
+def test_the_judge_request_is_one_the_api_accepts():
+    """The real `JUDGE`, which every other test here replaces with `_StubJudge`.
+
+    Reads `extra_body` too, and that is the point of the merge below. `anthropic` 2.x
+    dropped the sampling parameters from `messages.create`, so `langchain_anthropic`
+    moves them there and the SDK still sends them: checking top-level keys passes while
+    `temperature` goes out on the wire and the API answers 400.
+    """
+    from evals.evaluators import JUDGE
+
+    payload = JUDGE._get_request_payload("grade this")
+    sent = {**payload, **payload.get("extra_body", {})}
+
+    assert not {"temperature", "top_p", "top_k"} & set(sent)
+    assert sent["model"] == "claude-haiku-5-5"
+    assert sent["output_config"]["effort"] == "medium"
+    # Non-streaming above this can hang rather than fail. See `config.build_model`.
+    assert sent["max_tokens"] <= 21_333 or JUDGE._should_stream(async_api=False)
+
+
 class _StubJudge:
     """A `JUDGE` stand-in whose `with_structured_output(...).invoke(...)` is fixed.
 
