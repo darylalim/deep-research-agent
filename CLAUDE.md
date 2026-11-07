@@ -1461,6 +1461,13 @@ not being enforced for the evaluators themselves.
   closed now (the call sites raise `total` to at least the number of misses; the
   function floors a zero total with misses at 0.0), deliberately belt-and-braces,
   because this is a pure function with its own test and its contract should hold alone.
+- **A refusal could score a perfect 1.0 on citations.** `_coverage_score(0, 0)` is 1.0, and
+  `claims_are_cited` used to pass that straight through, on the argument that an empty
+  answer was `answers_the_question`'s problem. But the 1.0 still lands in the citation mean.
+  Found by a three-repeat regrade of a stored refusal, which scored 0.33, 1.00 and 0.50: the
+  1.00 was a repeat that found no claims. A zero total is now a non-verdict, while a zero
+  count beside listed misses stays a 0. This closes only the zero case: the judge can still
+  find a few claims in a refusal, so that metric stays noisy on any answer with no research.
 - **`delete` counted as persisting a finding.** deepagents' `delete` tool takes a
   `file_path` exactly as `write_file` does, and `TurnRecorder` recorded the path of
   every `MUTATING_TOOLS` call — so an orchestrator asking to DESTROY

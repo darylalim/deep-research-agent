@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: PR 1 in progress, offline work committed and the real judge call passed. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress. Real judge call and regrade done; hand check, rule check and Phase 0 steps 6 and 7 remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -96,11 +96,26 @@ have to work it out again.
   Regrade tool: `evals/regrade.py`, read path checked against real LangSmith (free). Results go
   to `~/deep-research-regrades/`. Experiments to regrade: `judgesplit-full-8708ffe9` (2026-09-06,
   the only full judged sweep, 5 answers) plus `workflow-feef8724` and `workflow-d516e642`
-  (2026-10-01, 1 answer each, the same Tavily and LangSmith question). **The September scores are
-  a compromised baseline:** Haiku 4.5 at `max_tokens=1024`, the day before the truncation fixes.
-  Two of its grades read `0/0 claims cited (100%)`, and the same two score 0 on
-  `answers_the_question`. The October pair ran at `max_tokens=8192`, so they are the clean
-  Haiku 4.5 comparison, but they are n=2 on one question.
+  (2026-10-01, 1 answer each, the same Tavily and LangSmith question). All three ran on 2026-11-06:
+  42 judge calls, three repeats each. Full grades are in `~/deep-research-regrades/`.
+  - **Two of the September answers are failed runs, not research.** Tavily returned `Error 432`
+    (quota) on every search, so the Tavily and SqliteSaver answers hold no sourced findings. An
+    earlier note here blamed their `0/0 claims cited` on truncation. That was wrong, or at least
+    unproven: the new judge also returned `0/0` on one repeat of the Tavily answer.
+  - On the 5 normal answers: `claims_are_cited` mean 0.97 old, 0.92 new, so the new judge is
+    stricter by about 0.05. `answers_the_question` was identical. Repeats moved a score by 0.07 at
+    most and 0.04 on average, and `answers_the_question` did not move at all. Claim counts are
+    less stable than scores (30 to 42 on one answer).
+  - The failed runs: SqliteSaver cited 1.00 old, 0.44 new, and the true figure is 0, since it
+    retrieved nothing and says so. New is closer and still wrong. `answers_the_question` went from
+    0 to 1.00 on that answer, which fits the prompt's rule that a hedged answer counts. The Tavily
+    answer cited 0.33, 1.00 and 0.50 across repeats, the only large swing (0.67).
+  - **Defect found and fixed:** an answer with no claims scored 1.0 through
+    `_coverage_score(0, 0)`, so a refusal could collect a perfect citation score. It is now a
+    non-verdict. Not fixed: the same refusal still scores 0.33 or 0.50 when the judge finds a few
+    claims, and SqliteSaver still reads as partly cited with no sources behind it.
+  - Not done: the hand check on normal answers (step 3), so Haiku 5.5 is not accepted yet. Only
+    the two failed answers were read. The score shift goes in `CLAUDE.md` once it is accepted.
 - [ ] PR 1: Phase 0 steps 6 and 7 passed
 - [ ] PR 1: Release 0.4.0 published and note added
 - [ ] PR 2: Judge calibrated

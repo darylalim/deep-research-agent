@@ -1251,3 +1251,29 @@ def test_a_run_missing_ONLY_this_metrics_observation_is_not_graded():
     assert searched_the_web(prose_only, {})["score"] is None
     # …while the metric that really does only need the prose still grades it.
     assert response_cites_sources(prose_only, {})["score"] == 0
+
+
+def test_an_answer_with_no_claims_is_not_scored_as_fully_cited(monkeypatch):
+    """A refusal asserts nothing, so it has no citation score, and certainly not 1.0.
+
+    Measured: an answer reporting that every search failed graded 0.33, 1.00 and 0.50 on
+    three repeats. The 1.00 was a judge finding no claims, and it counted in the mean as
+    a perfect report.
+    """
+    reply = _judge_reply({"substantive_claims": 0, "uncited_claims": []})
+    monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+    run = {"outputs": {"response": "I could not answer: search is out of quota."}}
+    graded = claims_are_cited(run, {"inputs": {"question": "q"}})
+    assert graded["score"] is None
+    assert "no substantive claims" in graded["comment"]
+
+
+def test_a_zero_count_beside_listed_misses_is_still_a_failure(monkeypatch):
+    # The other side of the guard above: this is a broken reading with evidence of
+    # uncited claims, so it must stay a 0 and not be excused as having nothing to grade.
+    reply = _judge_reply(
+        {"substantive_claims": 0, "uncited_claims": [{"claim": "a"}, {"claim": "b"}]}
+    )
+    monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+    run = {"outputs": {"response": "two unsourced claims"}}
+    assert claims_are_cited(run, {"inputs": {"question": "q"}})["score"] == 0.0

@@ -569,8 +569,9 @@ def _coverage_score(total: int, missing: int) -> float:
     left it with no gradient and no way to show that a fix had helped. Measured: it
     returned 0 on 4 of 5 sweep examples while `response_cites_sources` passed 5 of 5.
 
-    Vacuously perfect when there is nothing to attribute; an answer that asserts
-    nothing is `answers_the_question`'s problem, not this one's.
+    Vacuously perfect when there is nothing to attribute, which is only arithmetic.
+    `claims_are_cited` does not let that reach a score: it returns a non-verdict first,
+    because a 1.0 would be averaged into the experiment mean as a perfect report.
 
     **But vacuous only when there is nothing MISSING either.** `total <= 0` used to
     return 1.0 unconditionally, so a grade reporting zero claims *while listing five
@@ -718,6 +719,11 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
     # the SCORE either way, so this is what keeps the COMMENT coherent: a contradictory
     # grade of 3 claims with 5 misses would otherwise print "-2/3 claims cited (0%)".
     total = max(grade.get("substantive_claims") or 0, len(uncited))
+    # No claims means nothing was measured, not that everything was cited. Measured on
+    # a stored refusal (search out of quota, nothing found): one repeat in three
+    # returned 0/0, which scored 1.0 beside 0.33 and 0.50 for the same text.
+    if total == 0:
+        return _not_measured("the judge found no substantive claims to grade")
     score = _coverage_score(total, len(uncited))
     cited = total - len(uncited)
     summary = "; ".join(item.get("claim", "?") for item in uncited[:5])
