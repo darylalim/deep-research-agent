@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: PR 1 in progress. Real judge call and regrade done; hand check and Phase 0 steps 6 and 7 remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress. Judge accepted after the hand check; Phase 0 steps 6 and 7 (paid) and the release remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -87,7 +87,7 @@ have to work it out again.
     repo or in `langchain_anthropic` and `deepagents`. The SDK is now Apache 2.0, not MIT.
   - Docs confirm the `!` lines, and that `ask` prompts in auto mode and matches past a leading
     env assignment, so the third `ask` pattern is redundant but harmless.
-- [ ] PR 1: Phase 1 judge and regrade. Steps 1 to 4 done and the regrade tool built; running it is next.
+- [x] PR 1: Phase 1 judge and regrade. Steps 1 to 4, the regrade and the hand check are done.
   `effort` and the structured-output `format` merge correctly in `output_config` (checked
   offline). Correction to step 3: asserting on top-level keys misses a sampling parameter on
   `anthropic` 2.x, because `langchain_anthropic` moves it into `extra_body` and it is still
@@ -120,8 +120,14 @@ have to work it out again.
     `_coverage_score(0, 0)`, so a refusal could collect a perfect citation score. It is now a
     non-verdict. Not fixed: the same refusal still scores 0.33 or 0.50 when the judge finds a few
     claims, and SqliteSaver still reads as partly cited with no sources behind it.
-  - Not done: the hand check on normal answers (step 3), so Haiku 5.5 is not accepted yet. Only
-    the two failed answers were read. The score shift goes in `CLAUDE.md` once it is accepted.
+  - **Hand check (step 3), 2026-11-07: Haiku 5.5 accepted.** All 5 normal reports were read
+    against every claim either judge flagged; the reports came from LangSmith through
+    `stored_answers`, read only. Old: 7 accusations, 2 true, 1 borderline, 4 false, 11 real
+    gaps missed. New, as the union of 3 repeats: 19 accusations, 12 true, 3 borderline, 4
+    false, 1 gap missed. Each of new's false accusations appeared in one repeat only, and two
+    of the 15 gradings hold all four. Claim by claim:
+    `~/deep-research-regrades/hand-check-2026-11-07.md`. The score shift is recorded in
+    `CLAUDE.md`. A model did this check, so the user-labelled calibration in PR 2 still applies.
 - [ ] PR 1: Phase 0 steps 6 and 7 passed
 - [ ] PR 1: Release 0.4.0 published and note added
 - [ ] PR 2: Judge calibrated

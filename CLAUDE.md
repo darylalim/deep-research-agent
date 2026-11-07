@@ -1173,6 +1173,15 @@ assumes otherwise:
   pinned to `temperature=0` and its grades vary from run to run. Do not reuse
   `config.build_model()` for it. Haiku 5.5 thinks on every grade too, so `effort` is the
   cost control, and thinking counts toward `max_tokens`.
+  **Haiku 5.5 replaced Haiku 4.5 on 2026-11-07, and citation scores before and after are
+  not comparable.** On the same 5 stored answers `claims_are_cited` fell from a mean of 0.97
+  to 0.92. A hand check found that the new figure is closer to the truth. Haiku 4.5 made 7
+  accusations, 4 of them false, and missed 11 real gaps. Haiku 5.5's 19 distinct
+  accusations across three repeats held 4 false ones, each in only one repeat, and it
+  missed 1 gap. Most real gaps were claims about *other* sources ("many articles still
+  say…"), which the agent states without a link. Across repeats a score moved by 0.07 at
+  most, and `answers_the_question` did not move at all. This check was done by a model,
+  not a person, so it does not replace calibration against human labels.
 
 - **An experiment's `run_stats.token_count` is agent-only — the judges' tokens are filed
   somewhere else entirely.** `langsmith/evaluation/_runner.py` wraps every evaluator in a
