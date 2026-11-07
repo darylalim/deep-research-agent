@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: PR 1 in progress, offline work done and uncommitted. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress, offline work committed and the real judge call passed. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -81,12 +81,26 @@ have to work it out again.
     repo or in `langchain_anthropic` and `deepagents`. The SDK is now Apache 2.0, not MIT.
   - Docs confirm the `!` lines, and that `ask` prompts in auto mode and matches past a leading
     env assignment, so the third `ask` pattern is redundant but harmless.
-- [ ] PR 1: Phase 1 judge and regrade. Steps 1 to 3 done; step 4 and the regrade are next.
+- [ ] PR 1: Phase 1 judge and regrade. Steps 1 to 4 done and the regrade tool built; running it is next.
   `effort` and the structured-output `format` merge correctly in `output_config` (checked
   offline). Correction to step 3: asserting on top-level keys misses a sampling parameter on
   `anthropic` 2.x, because `langchain_anthropic` moves it into `extra_body` and it is still
   sent. The new test merges `extra_body`, and so does the `test_config.py` guard, which had
   been unable to fail. Both were seen to fail with a parameter put back.
+  Step 4, measured on 2026-11-06 with one real `claims_are_cited` grade (1,714 input and 805
+  output tokens, 426 of them thinking, tracing off): the response was `['thinking', 'text']`,
+  `parsed` was correct with `parsing_error` None, and `stop_reason` read `end_turn` from
+  `raw.response_metadata`. The fixture had 4 cited and 2 uncited figures, and the judge scored
+  4/6. The thinking block carried no text, because `display` is omitted. That is one short
+  answer, so it proves the plumbing, not the judge's accuracy; the regrade and calibration cover that.
+  Regrade tool: `evals/regrade.py`, read path checked against real LangSmith (free). Results go
+  to `~/deep-research-regrades/`. Experiments to regrade: `judgesplit-full-8708ffe9` (2026-09-06,
+  the only full judged sweep, 5 answers) plus `workflow-feef8724` and `workflow-d516e642`
+  (2026-10-01, 1 answer each, the same Tavily and LangSmith question). **The September scores are
+  a compromised baseline:** Haiku 4.5 at `max_tokens=1024`, the day before the truncation fixes.
+  Two of its grades read `0/0 claims cited (100%)`, and the same two score 0 on
+  `answers_the_question`. The October pair ran at `max_tokens=8192`, so they are the clean
+  Haiku 4.5 comparison, but they are n=2 on one question.
 - [ ] PR 1: Phase 0 steps 6 and 7 passed
 - [ ] PR 1: Release 0.4.0 published and note added
 - [ ] PR 2: Judge calibrated

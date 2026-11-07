@@ -1,4 +1,4 @@
-"""Entry point:  uv run python -m evals [--upload] [--run]
+"""Entry point:  uv run python -m evals [--upload] [--run] [--regrade EXPERIMENT]
 
     --upload    create/sync the dataset in LangSmith (idempotent)
     --run       run the agent over the dataset and score it
@@ -7,6 +7,10 @@
                 See CLAUDE.md, *What a sweep costs*, for the measured figures;
                 they are deliberately not restated here, because five copies of
                 a number is how the last one drifted.
+    --regrade   grade a stored experiment's answers again with the current judge.
+                Paid, but judge calls only: the agent does not run, and nothing is
+                written back to LangSmith. Results go to ~/deep-research-regrades/.
+    --repeats   how many times --regrade grades each answer, per metric
 
 `argparse` gets an explicit one-line `description=` rather than this docstring.
 The default formatter reflows whatever it is handed into a single paragraph, so
@@ -25,6 +29,8 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -51,9 +57,24 @@ def main() -> None:
         help="only evaluate the first N examples in evals/dataset.py order "
         "(47k-1M tokens each, measured — the first is not the cheapest)",
     )
+    parser.add_argument(
+        "--regrade",
+        metavar="EXPERIMENT",
+        help="grade a stored experiment's answers again (judge calls only, no agent)",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="times --regrade grades each answer, per metric (default 3)",
+    )
     args = parser.parse_args()
-    if not (args.upload or args.run):
-        parser.error("nothing to do — pass --upload and/or --run")
+    if not (args.upload or args.run or args.regrade):
+        parser.error("nothing to do — pass --upload, --run or --regrade")
+    if args.regrade and (args.upload or args.run):
+        parser.error("--regrade runs alone, not with --upload or --run")
+    if args.repeats < 1:
+        parser.error(f"--repeats must be at least 1 (got {args.repeats})")
     # `--limit 0` used to be the most expensive way to ask for nothing: the guard
     # below was `if args.limit:`, so a falsy zero fell through to the *whole*
     # dataset. Measured, by doing it: one example got through before the kill, at
@@ -80,7 +101,24 @@ def main() -> None:
         prefix="deep_research_evals_"
     )
 
+    if args.regrade:
+        # Off before anything imports langsmith, whose settings are read once and
+        # cached. A regrade writes nothing to LangSmith, and that includes traces.
+        for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
+            os.environ[name] = "false"
+
     from langsmith import Client, evaluate
+
+    if args.regrade:
+        from .regrade import regrade, summary
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        # Outside the repo, and named so that no run overwrites an earlier one.
+        out = Path.home() / "deep-research-regrades" / f"{args.regrade}-{stamp}.json"
+        report = regrade(Client(), args.regrade, out=out, repeats=args.repeats)
+        print("\n".join(summary(report)))
+        print(f"full grades and comments: {out}")
+        return
 
     from . import dataset
     from .evaluators import ALL_EVALUATORS, CODE_EVALUATORS
