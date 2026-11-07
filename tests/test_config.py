@@ -2,9 +2,75 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from typing import get_args
+
 import pytest
+from langchain_anthropic import ChatAnthropic
 
 from deep_research import config
+from deep_research.subagents import build_research_subagent
+
+_HI = [{"role": "user", "content": "hi"}]
+
+
+class TestResearcherModel:
+    def test_by_default_the_researcher_sends_exactly_what_the_orchestrator_sends(
+        self,
+    ) -> None:
+        # Phase 2's promise is NO behaviour change: the researcher used to inherit the
+        # orchestrator's model object, and now builds its own. Compare whole payloads,
+        # not the two fields that vary, so any setting that diverges between the two
+        # constructions (thinking, streaming, max_tokens, effort) goes red here.
+        researcher = build_research_subagent()["model"]
+        assert isinstance(researcher, ChatAnthropic)
+        assert researcher._get_request_payload(
+            _HI
+        ) == config.build_model()._get_request_payload(_HI)
+
+    def test_an_override_reaches_the_payload_and_nothing_else_moves(self) -> None:
+        payload = config.build_model(
+            model="claude-sonnet-5-5", effort="low"
+        )._get_request_payload(_HI)
+        assert payload["model"] == "claude-sonnet-5-5"
+        assert payload.get("output_config", {}).get("effort") == "low"
+        # The invariants `TestBuildModel` pins for the default must hold for an
+        # override too — they are properties of the constructor, not of one model.
+        assert payload.get("thinking") == {"type": "adaptive", "display": "summarized"}
+        sent = {**payload, **payload.get("extra_body", {})}
+        assert not {"temperature", "top_p", "top_k"} & set(sent)
+
+    def _import_config_with(self, **env: str) -> subprocess.CompletedProcess[str]:
+        # A fresh interpreter, because both values resolve at IMPORT time and reloading
+        # `config` in-process would leave every module that already imported from it
+        # holding the old objects.
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from deep_research import config as c;"
+                "print(c.RESEARCHER_MODEL, c.RESEARCHER_EFFORT)",
+            ],
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_the_environment_overrides_are_read_at_import(self) -> None:
+        result = self._import_config_with(
+            DEEP_RESEARCH_RESEARCHER_MODEL="claude-sonnet-5-5",
+            DEEP_RESEARCH_RESEARCHER_EFFORT="medium",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["claude-sonnet-5-5", "medium"]
+
+    def test_a_mistyped_effort_fails_at_import_not_mid_turn(self) -> None:
+        result = self._import_config_with(DEEP_RESEARCH_RESEARCHER_EFFORT="hihg")
+        assert result.returncode != 0
+        assert "unknown effort 'hihg'" in result.stderr
 
 
 class TestMissingKeys:
@@ -37,6 +103,27 @@ class TestMissingKeys:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
         monkeypatch.setenv("TAVILY_API_KEY", "y")
         assert set(config.missing_keys()) == {"ANTHROPIC_API_KEY"}
+
+
+class TestParseEffort:
+    def test_every_effort_the_model_accepts_parses_to_itself(self) -> None:
+        for level in get_args(config.Effort):
+            assert config.parse_effort(level) == level
+
+    @pytest.mark.parametrize("bad", ["", "High", "hgh", " high", "none"])
+    def test_anything_else_raises_naming_the_value(self, bad: str) -> None:
+        # Strict on purpose: a near-miss must fail at import, not 400 mid-turn.
+        with pytest.raises(ValueError, match=repr(bad)):
+            config.parse_effort(bad)
+
+    def test_effort_matches_what_chatanthropic_accepts(self) -> None:
+        # `Effort` is a hand-copy of langchain's `Literal`, so compare by set equality
+        # against the installed field: a level added or removed upstream goes red here
+        # instead of being rejected (or silently unreachable) at runtime.
+        annotation = ChatAnthropic.model_fields["reasoning_effort"].annotation
+        upstream = {a for a in get_args(annotation) if a is not type(None)}
+        (literal,) = upstream
+        assert set(get_args(literal)) == set(get_args(config.Effort))
 
 
 class TestBuildModel:

@@ -34,6 +34,7 @@ uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
 uv run python -m evals --run --limit 1   # FIRST example in dataset.py: 47k-1M tokens (see *What a sweep costs*)
 uv run python -m evals --run --code-only # trajectory metrics only — skips the judges, NOT the agent
 uv run python -m evals --regrade <experiment>  # grade stored answers again: judge calls only, writes nothing to LangSmith
+uv run python -m evals --calibrate  # judges vs the human labels in evals/calibration.json: judge calls only, ANTHROPIC key only
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
@@ -92,7 +93,7 @@ uv run ty check                  # type check (Astral's ty)
   The accepted cost is several seconds on every turn while such changes are uncommitted.
   If you edit Python outside `Edit`/`Write`, you can run the steps yourself sooner:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
-- **Tests** live in `tests/` (pytest) — 9 files, ~4,400 lines, and the offline suite runs
+- **Tests** live in `tests/` (pytest) — 10 files, ~4,400 lines, and the offline suite runs
   in **~4s**. Where things are: `test_activity_feed.py` (`ActivityFeed` as recorded
   `FeedEvent`s, plus the interrupt-parsing helpers — `pending_reviews`,
   `allowed_decisions_by_tool`, `_declined_tools`), `test_turn_parsing.py` (`render_turn` /
@@ -101,7 +102,7 @@ uv run ty check                  # type check (Astral's ty)
   contract), `test_webui.py` + `test_streamlit_page.py` (the renderer and the page's
   rerun state machine, including the stop-reason notes), `test_evals.py` (the largest —
   evaluators, harness, and — see *When the INSTRUMENT is broken* — whether the evaluators
-  themselves can be trusted), `test_regrade.py` (`--regrade`), `test_config.py` (the model payload), `test_live.py`
+  themselves can be trusted), `test_regrade.py` (`--regrade`), `test_calibrate.py` (`--calibrate`: the labelled file, the flag matcher, the 85% bar), `test_config.py` (the model payload), `test_live.py`
   (marked `live`, deselected by default).
   The offline suite is deliberately narrow —
   it targets the branching logic in `turns.py` and the page, and the load-bearing wiring
@@ -869,8 +870,33 @@ The default model is `claude-opus-5-5` (at an explicit `effort="high"` — Opus 
 no `temperature`/`top_p`/`top_k`** — Opus 5 returns a 400 if any sampling param
 is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
-accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
-has no `model` key — so the rule covers them too.
+accepts them. The `researcher` builds its own model through the same `build_model()`,
+with `model=` / `effort=` taken from `DEEP_RESEARCH_RESEARCHER_MODEL` /
+`DEEP_RESEARCH_RESEARCHER_EFFORT`. Both default to the orchestrator's settings, so the
+default sends a payload byte-identical to the orchestrator's, and every rule here covers
+it too. (The general-purpose subagent deepagents adds still inherits the parent's model.)
+
+**Giving the researcher a `model` does not cost it the gate or the cache.** This was read
+off deepagents 0.7 `graph.py`, not assumed. A spec's `model` (`:717`) and its
+`interrupt_on` (`:799`) resolve independently, and `append_prompt_caching_middleware` is
+called for every declarative subagent unconditionally (`:755`). Any `BaseChatModel`
+instance takes the same path as the inherited one: `resolve_model` returns it unchanged,
+and the harness profile is looked up by identifier either way. Two consequences:
+
+- **Never put an `interrupt_on` key in the researcher dict, not even `{}`.** A key that is
+  present *replaces* the inherited `GATED_TOOLS`, and the researcher's `write_file` would
+  then run unreviewed.
+  `test_a_researcher_with_its_own_model_keeps_the_gate_and_the_cache` reads the built
+  middleware and was verified red by exactly that edit.
+- **A non-Anthropic or other-family researcher model picks up that model's harness
+  profile** (`excluded_tools`, `extra_middleware`), found by identifier. Check the
+  profile before trusting a sweep run on it.
+
+`effort` from the environment is parsed by `config.parse_effort` into the `Effort`
+`Literal`, so a typo fails at import, not as a 400 in the middle of a turn.
+`test_effort_matches_what_chatanthropic_accepts` compares that `Literal` with the
+installed `ChatAnthropic.reasoning_effort` by set equality, the same way `_SILENT_STOPS`
+is checked against `StopReason`.
 
 **A sampling param is invisible at the top level of the payload on `anthropic` 2.x.** The
 SDK removed `temperature`, `top_p` and `top_k` from `messages.create`, so
@@ -911,9 +937,27 @@ the turn after an abandoned approval. The test: a turn whose two researchers bot
 reached a `write_file` approval, "Abandon this turn" was clicked, and a new question was
 sent on the same thread. It answered, with no 400. The checkpoint showed the patch's three
 synthetic `status=error` replies to the dangling calls, and every thinking block, including
-the abandoned message's, still carried its summarized text. The enforcement applies to
-accounts created on or after 2026-08-31. Account age for this run: not recorded, so if the
-account is older, this pass proves less.
+the abandoned message's, still carried its summarized text.
+
+**That live pass proved little on its own.** The account predates 2026-08-31, so the check
+was not enforced and the turn could not have failed. **The opt-in check is what settles
+it:** setting `prefix_mismatch_behavior` runs the check on any account. The method came
+from `/claude-api preserved-thinking-migration`. A three-request self-test confirmed the
+check catches an edited first message. Then every `/v1/messages` body from the same three
+turns was captured at the HTTP layer, by wrapping `anthropic`'s `_build_request`: 10
+orchestrator requests and 27 from two researchers. Two instruments agreed:
+`prefix_diff.py` matched every consecutive pair, and the free `count_tokens` endpoint in
+`error` mode returned 200 on all 34 requests that replay thinking, at up to 13 replayed
+blocks per request. **Zero breaks.** Both suspected edits are append-only on the wire.
+`PatchToolCallsMiddleware`'s delete-and-re-add leaves the abandoned assistant turn
+byte-identical, with the error replies and the new question after it. langchain's
+re-serialization of history loaded from the checkpoint matched byte for byte, including
+`tool_use.input`. Not covered: compaction at 85% of the 1M window, which never fired,
+though deepagents strips the kept turns' thinking (`_drop_bound_reasoning`, the documented
+recipe), and its old-argument truncation, which fires alongside it and is unverified. The
+*Edit*, *Reject* and *Respond* decisions were not exercised either. Re-run the capture and
+`count_tokens` pass after any deepagents or langchain-anthropic upgrade. It costs about
+the price of one turn.
 
 **A related shape change worth knowing about `_text_of`.** Once thinking is on, an
 assistant message's `content` is a *mixed* list: `["", {…thinking…}, "the answer"]` —
@@ -1193,6 +1237,20 @@ assumes otherwise:
   say…"), which the agent states without a link. Across repeats a score moved by 0.07 at
   most, and `answers_the_question` did not move at all. This check was done by a model,
   not a person, so it does not replace calibration against human labels.
+  **Human calibration followed the same day** (`python -m evals --calibrate`, labels in
+  `evals/calibration.json`). Blind, the judge agreed with the owner on **55 of 75**
+  comparisons (25 claims x 3 repeats, 73%), short of the preset 85% bar. It was not erratic:
+  6 of the 8 disagreements recurred in all three repeats, each with a coherent quoted reason.
+  The split was over the RULE, which never said what covers a sentence that comes after a
+  paragraph's last citation. The owner chose the strict reading: **a citation covers only
+  the unit it closes**, so such a sentence, or a bullet with no link of its own, is uncited.
+  Four labels were revised to it, after the verdicts had been seen, and stored as
+  `adjudicated` beside the blind `label`. On those, the judge scores **67 of 75 (89%)** and
+  passes. Always quote both figures. The residual bias runs one way: the judge is slightly
+  *lenient* on a lead-in citation over sub-bullets, and on bullets directly below a table
+  standing in for a source line (c08 and c22, missed in all three repeats). So sweep
+  citation scores read about 2 claims in 25 high. Do not tune the prompt to these 25 claims
+  to close that gap. Proving a prompt change helps needs fresh claims labelled blind.
 
 - **An experiment's `run_stats.token_count` is agent-only — the judges' tokens are filed
   somewhere else entirely.** `langsmith/evaluation/_runner.py` wraps every evaluator in a
@@ -1433,6 +1491,43 @@ old behaviour was never a designed property and could not be relied on; if you w
 cheap one specifically, the control is last, and there is no flag for picking an example
 by name.
 
+### Citation truth: `citations_are_real` and `claims_are_supported`
+
+`response_cites_sources` asks only whether a URL is present, and `claims_are_cited` only
+whether a claim has a citation nearby. Neither can tell a real source from an invented
+one, and a cheaper researcher (Phase 3) is exactly what might invent one. Two metrics
+close that, both reading `TurnRecorder`'s `search_results`: the `{url, title, content}`
+of every result a successful search returned, anywhere in the tree.
+
+- **`citations_are_real`** (code) scores the share of distinct cited URLs that some search
+  returned. Both sides go through `_normalise_url`, which can only *merge* spellings
+  (trailing punctuation, scheme, `www.`, slash, fragment, `utm_*`, percent-encoding, and
+  parentheses, because `URL` stops at `)`). It keeps every other query parameter.
+  Its tests run in both directions, and the riskier one is "different pages stay
+  different": over-merging fails silently, in the agent's favour. **It cannot see** a
+  retrieved URL that does not support its claim, or a genuine primary source cited from
+  the model's own knowledge, which scores as not retrieved. Its comment separates
+  unretrieved URLs on a site some search reached, usually the second case, from URLs on no
+  such site. Read those by hand before calling one fabricated.
+- **`claims_are_supported`** (judge) samples up to 5 cited sentences or table rows that
+  carry their own URL. They are found in code, and the sample is seeded from SHA-256 of
+  the question, never `hash()`, which is randomised per process. Each claim goes to the
+  judge with its URLs' retrieved text for a `supported` / `contradicted` / `cannot_tell`
+  verdict, quoted evidence first. The score is supported ÷ (supported + contradicted).
+  `cannot_tell` is excluded and counted, because a snippet that does not mention a claim
+  is not evidence that it is false. **It cannot see** claims outside its sample, or claims
+  covered only by a citation elsewhere in their paragraph or below their table: those
+  units carry no URL, and `claims_are_cited` grades that inheritance. A claim whose URLs
+  no search returned is skipped and counted, because that is `citations_are_real`'s
+  finding.
+
+Both follow the non-verdict rules below. A row with no `search_results` (every
+experiment before 2026-11-07), a response with no URLs, an all-`cannot_tell` sample, and
+a grade whose verdict ids do not match the numbered claims one to one are all "not
+measured", never a vacuous 1. `--regrade` includes `claims_are_supported`, but on old
+experiments it stops before calling the judge. The 85% calibration bar for it waits on
+human labels from the Phase 2b short run.
+
 ### When the INSTRUMENT is broken, every metric reads fine
 
 Everything above this heading is about catching the agent misbehaving. This section is
@@ -1512,7 +1607,15 @@ not being enforced for the evaluators themselves.
   model's own memory. A run whose every `tavily_search` came back `status="error"`
   scored a clean 1. Failures are now recorded separately and subtracted there, leaving
   the trajectory ordering the two `_first_research_index` evaluators depend on
-  untouched.
+  untouched. **That fix covered only half the failures, and the other half look like
+  successes.** `TavilySearch._run` raises only for an empty result set. Every other
+  API error it *returns* as `{"error": exc}`, which `json.dumps` cannot encode, so the
+  message arrives with `status="success"` and a Python repr for content. This was
+  measured through the real tool. A run whose every search hit an HTTP error still
+  scored 1. `harness._search_hits` now returns `None` for content that is not a result
+  set, and `TurnRecorder` records that as a failure too. Status alone is not a reliable
+  failure signal for this tool. Test fixtures must use real result-set JSON (`HITS` in
+  `test_evals.py`) for a search that is meant to have worked.
 - **Nothing graded WHY a turn ended, so the API's fault read as the agent's.** A
   refusal, a context-window overrun or a `max_tokens` truncation all reach the
   evaluators as nothing but a thin `response` — both judges score 0.0,
@@ -1599,7 +1702,11 @@ verified red by breaking the source.
   toggle, and this app's output is long-form prose whose reading mode is the reader's
   call. Don't reach for CSS injection — native elements and that file first.
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
-  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`. All three are resolved into
+  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`,
+  `DEEP_RESEARCH_RESEARCHER_MODEL` and `DEEP_RESEARCH_RESEARCHER_EFFORT`. The last two
+  default to the orchestrator's model and effort, and the effort must be one of
+  `config.Effort`. All five are resolved into
   module-level constants at *import* time, so they must be set before
   `deep_research.config` is first imported — a `monkeypatch.setenv` in a test body is
-  too late, which is why `tests/conftest.py` sets them as top-level code.
+  too late, which is why `tests/conftest.py` sets (or pops) them as top-level code, and
+  why `test_config.py` checks the two researcher variables in a fresh interpreter.

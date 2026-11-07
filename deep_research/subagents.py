@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from deepagents import SubAgent
 
+from .config import RESEARCHER_EFFORT, RESEARCHER_MODEL, build_model
 from .tools import build_web_search
 
 RESEARCHER_PROMPT = """You are a focused web researcher. You are given exactly \
@@ -42,6 +43,15 @@ def build_research_subagent() -> SubAgent:
     Give it one independent sub-question per `task` call; fan several out in the
     same turn to research breadth in parallel while keeping the orchestrator's
     context focused on synthesis.
+
+    **It carries its own `model`**, built from `RESEARCHER_MODEL` / `RESEARCHER_EFFORT`,
+    which default to the orchestrator's — so by default this is the configuration it
+    used to inherit. Read off deepagents 0.7 (`graph.py`), not assumed: a spec's `model`
+    and its `interrupt_on` are resolved independently, so giving the researcher a model
+    does not cost it the inherited `GATED_TOOLS`, and prompt caching is appended to every
+    declarative subagent unconditionally. **Never add an `interrupt_on` key here**, not
+    even `{}`: a present key REPLACES the inherited gate, and a researcher's `write_file`
+    would then go through unreviewed. `test_agent_wiring.py` pins both.
     """
     return {
         "name": "researcher",
@@ -52,4 +62,5 @@ def build_research_subagent() -> SubAgent:
         ),
         "system_prompt": RESEARCHER_PROMPT,
         "tools": [build_web_search()],
+        "model": build_model(model=RESEARCHER_MODEL, effort=RESEARCHER_EFFORT),
     }

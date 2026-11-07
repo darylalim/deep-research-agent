@@ -1,10 +1,9 @@
 # Upgrade plan: dependencies, models, evals and interface
 
-**Work on the `upgrade/phase-0` branch.** The dependency upgrade and this plan are committed there
-and have not been pushed. `main` does not have them, so check out that branch before starting. Do
-not merge it alone: Phase 0 ships with Phase 1.
+**PR 1 (Phases 0 and 1) is merged to `main` and released as v0.4.0.** Start each later PR on its
+own branch from `main`; PR 2's is `upgrade/pr-2`.
 
-Status: PR 1 in progress. All checks passed; only Release 0.4.0 remains. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is open as draft PR #3 from `upgrade/pr-2`, with CI green. Judge calibration, Phase 2 and Phase 2b's offline work are done. What remains is paid: Phase 2b's short run, the hand read and the labels. It waits for the LangSmith trace quota to reset on 2026-12-01, so check the quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -143,10 +142,53 @@ have to work it out again.
     The app's tracing (on in `.env`) also spends the same quota.
   - Display quirk, not fixed: after an abandoned turn, its question and the next one render
     in a single user bubble, because the abandoned turn left no assistant text between them.
-- [ ] PR 1: Release 0.4.0 published and note added
-- [ ] PR 2: Judge calibrated
-- [ ] PR 2: Phase 2 researcher settings
+- [x] PR 1: Release 0.4.0 published and note added. PR #2 merged as `4aea065` on
+  2026-11-07, and the tag points there. The release body opens with a *Compatibility*
+  section: API version `2026-10-21`, the bearer-auth change, resolved versions, the
+  `streamlit>=1.67` floor, and the judge-shift warning.
+  - Follow-up, 2026-11-07: the account predates enforcement, so step 7 was re-checked
+    with the opt-in check. Zero breaks across 34 captured requests; see `CLAUDE.md`. No
+    harness change is needed.
+- [x] PR 2: Judge calibrated, 2026-11-07. `evals/calibration.json` holds 25 claims and 5
+  question parts from 6 stored reports, labelled blind by the user. `--calibrate` (3 repeats,
+  30 Haiku calls) scored the citation judge at **55/75 (73%) blind: FAIL**. The output
+  schema was working: 6 of the 8 disagreements recurred in every repeat with coherent
+  reasons, and the split was over the rule. The user chose the strict reading (a citation
+  covers only the unit it closes) and revised c13 to c16 to uncited, stored as `adjudicated`.
+  On those, the judge scores **67/75 (89%): PASS**, at 22, 22 and 23 of 25 per repeat. Known
+  bias: the judge is lenient on lead-in citations and on bullets under a table (c08 and c22),
+  so sweep citation scores read about 2 claims in 25 high. The answer judge flagged p03 in
+  all three repeats, so it scored 12/15. It has no bar, and with no part labelled unanswered
+  it can show only false accusations. Run saved at
+  `~/deep-research-regrades/calibration-20261107T191649Z.json`.
+- [x] PR 2: Phase 2 researcher settings, 2026-11-07, offline. `config.Effort` and
+  `parse_effort`, `RESEARCHER_MODEL` / `RESEARCHER_EFFORT`, and `build_model(*, model, effort)`.
+  The researcher dict now carries its own `model`. Step 5 was read off the installed deepagents
+  `graph.py`: `model` (`:717`) and `interrupt_on` (`:799`) resolve independently, and caching is
+  appended unconditionally (`:755`). A spy on the built subagents confirmed it: the researcher's
+  middleware stack matches the inheriting general-purpose subagent's, with `HumanInTheLoopMiddleware`
+  over all four `GATED_TOOLS`. Added beyond the plan: an `Effort` vs `ChatAnthropic` parity test, a
+  gate-and-cache test on the built researcher, and import-time env tests in a subprocess. All of
+  them were verified red by breaking the source. Phase 3 note: a researcher on another model
+  family gets that model's harness profile, found by identifier, so check its extras first.
 - [ ] PR 2: Phase 2b metrics added and calibrated
+  - Offline so far, 2026-11-07. **Recorder:** `search_results` holds `{url, title, content}`
+    from every successful search (`0caec47`). **A bug found on the way:** Tavily *returns* most
+    API errors as `{"error": exc}`, which arrives as `status="success"` with a Python repr, so
+    `searched_the_web` scored such runs 1. Fixed in `f60e228`: content that is not a result set is
+    now a failed search. **`citations_are_real`** is done. It scores distinct cited URLs, and its
+    normaliser is tested both ways: spellings that must merge (trailing punctuation, scheme,
+    `www.`, slash, fragment, `utm_*`, encoding, Wikipedia parentheses) and pages that must not
+    (query, parent path, subdomain, port). Its comment separates URLs on a site a search reached
+    from URLs on no such site, for the hand read in step 6. **`claims_are_supported`** is done:
+    one judge call per run over up to 5 sampled claims, seeded by SHA-256 of the question (a
+    subprocess test under three `PYTHONHASHSEED`s pins it), with verdict ids matched one to one.
+    It also joins `--regrade`'s defaults. `CLAUDE.md` now has a *Citation truth* section.
+    **All offline work in Phase 2b is done.** Still to do, all paid and waiting for the quota
+    (2026-12-01): step 5's short run, step 6's hand read of flagged URLs, and the 15 to 20 claim and
+    source labels. Those labels need `--calibrate` support for `claims_are_supported`, which is
+    not built yet. Build it from real pairs once the run exists, rather than designing the label
+    format blind.
 - [ ] PR 3: `score=None` measured
 - [ ] PR 3: Phase 3 sweeps run and decision recorded
 - [ ] PR 3: Phase 3b memory example added

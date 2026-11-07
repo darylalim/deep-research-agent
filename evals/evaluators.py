@@ -34,9 +34,12 @@ an error in LangSmith, so each check gets its own function.
 
 from __future__ import annotations
 
+import hashlib
+import random
 import re
 from collections import Counter
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict, get_args
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 from langchain_anthropic import ChatAnthropic
 
@@ -90,6 +93,7 @@ _COMPLETED_RUN_KEYS = frozenset(
         "gated_tools",
         "failed_tools",
         "stop_reasons",
+        "search_results",
     }
 )
 
@@ -339,7 +343,9 @@ def searched_the_web(run: Any, example: Any) -> dict[str, Any]:
     whether the agent researched or answered out of the model's own memory, and a run
     whose every `tavily_search` came back `status="error"` answered out of memory while
     scoring a clean 1. So the failures are subtracted here rather than hidden at the
-    source. The three counts are reported side by side and NOT as subsets of one
+    source. "Failed" includes a search reported as `status="success"` whose content is
+    not a result set — Tavily's own shape for most API errors — which `TurnRecorder`
+    classifies, since only it sees the content. The three counts are reported side by side and NOT as subsets of one
     another: which namespace a failure happened in is not recorded, so "N of them
     inside a subagent" would be arithmetic nobody can check.
     """
@@ -463,6 +469,95 @@ def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
             else "the user is shown no source URLs"
         ),
     }
+
+
+# Characters `URL` can capture that end a sentence or close Markdown emphasis, never a
+# URL: "see https://x.example/a." must match the retrieved "https://x.example/a".
+_TRAILING = ".;:!?'\"*"
+# Query keys that track the click rather than identify the page. Every OTHER key is
+# kept, because `?id=`, `?v=` or `?page=` can be the whole difference between pages.
+_TRACKING = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid")
+
+
+def _normalise_url(url: str) -> str:
+    """One canonical spelling of a URL, so a cited URL can be matched to a retrieved one.
+
+    Applied to BOTH sides, so every rule here can only merge two spellings of a page,
+    never split one. Each rule exists because a false "not retrieved" reads as
+    fabrication, which is the gravest thing this metric can say:
+
+    - the scheme is dropped (an agent writing `http://` for a page fetched over https
+      cited the same page), the host lower-cased and a leading `www.` removed;
+    - the path is percent-DECODED, so `%C3%A9` and a literal `é` agree;
+    - parentheses are deleted from the path, because `URL` stops at `)` — a Wikipedia
+      `Foo_(bar)` is captured as `Foo_(bar` and must still match;
+    - a trailing slash, the fragment (including `#:~:text=` highlights), and tracking
+      parameters are dropped; the remaining query is kept, sorted.
+    """
+    parts = urlsplit(url.rstrip(_TRAILING))
+    host = parts.netloc.lower().removeprefix("www.")
+    path = unquote(parts.path).replace("(", "").replace(")", "").rstrip("/")
+    query = sorted(
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith(_TRACKING)
+    )
+    return f"{host}{path}" + (f"?{urlencode(query)}" if query else "")
+
+
+def citations_are_real(run: Any, example: Any) -> dict[str, Any]:
+    """Was every URL the user is shown actually returned by one of the agent's searches?
+
+    `response_cites_sources` asks only whether a URL is present, and `claims_are_cited`
+    whether a claim has one nearby. Neither can tell a real source from a plausible
+    invented one, and a cheaper researcher is exactly what might invent one. So this
+    compares the distinct URLs in the response against every URL any search returned,
+    anywhere in the tree (`search_results`, recorded by `TurnRecorder`).
+
+    **What it cannot see:** a real, retrieved URL that does not support the claim it is
+    attached to (`claims_are_supported` samples that), and a genuine primary source the
+    model cited from its own knowledge, which scores as not retrieved. Read the listed
+    URLs before calling one fabricated — the comment separates URLs on a site some search
+    DID reach, which is usually the second case.
+
+    Reads `search_results` alone through `_ungradable`, so a row holding only a
+    `response` is "not measured" rather than calling every URL invented. A response with
+    no URLs is also a non-verdict: there is nothing to check, `response_cites_sources`
+    already scores that 0, and a vacuous 1.0 here would be averaged in as a perfect run.
+    """
+    if reason := _ungradable(run, "search_results"):
+        return _not_measured(reason)
+    outputs = _outputs(run)
+    cited: dict[str, str] = {}
+    for url in URL.findall(outputs.get("response", "")):
+        cited.setdefault(_normalise_url(url), url.rstrip(_TRAILING))
+    if not cited:
+        return _not_measured(
+            "the response cites no URLs (response_cites_sources scores that)"
+        )
+    retrieved = {
+        _normalise_url(hit["url"])
+        for hit in outputs["search_results"]
+        if isinstance(hit, dict) and isinstance(hit.get("url"), str)
+    }
+    reached_hosts = {key.split("/", 1)[0].split("?", 1)[0] for key in retrieved}
+    missing = [url for key, url in cited.items() if key not in retrieved]
+    score = _coverage_score(len(cited), len(missing))
+    comment = f"{len(cited) - len(missing)} of {len(cited)} cited URL(s) were returned by a search"
+    if not retrieved:
+        comment += "; no search returned anything"
+    if missing:
+        on_site = [
+            u
+            for u in missing
+            if _normalise_url(u).split("/", 1)[0].split("?", 1)[0] in reached_hosts
+        ]
+        elsewhere = [u for u in missing if u not in on_site]
+        if elsewhere:
+            comment += f". Not retrieved, on no site any search reached: {', '.join(elsewhere)}"
+        if on_site:
+            comment += f". Not retrieved, but on a site a search did reach: {', '.join(on_site)}"
+    return {"score": score, "comment": comment}
 
 
 def turn_stopped_cleanly(run: Any, example: Any) -> dict[str, Any]:
@@ -663,21 +758,14 @@ def _graded(
     return grade, ""
 
 
-def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
-    """Judge: what share of the answer's substantive claims carry a source?
+def grade_citations(question: str, prose: str) -> tuple[dict[str, Any] | None, str]:
+    """The citation judge's raw grade of `prose`, or `None` and why it has none.
 
-    Claim-level, where `response_cites_sources` is only URL-presence: an answer can
-    carry one link and still assert six unsourced facts around it. Scored as a
-    proportion — see `_coverage_score` for why that is load-bearing rather than
-    cosmetic.
+    `claims_are_cited` scores this, and `evals.calibrate` compares its
+    `uncited_claims` with human labels. Both go through this one function, so the
+    calibration measures the prompt and schema a sweep actually uses.
     """
-    if reason := _ungradable(run, "response"):
-        return _not_measured(reason)
-    prose = _outputs(run).get("response", "")
-    if not prose.strip():
-        return {"score": 0.0, "comment": "the agent produced no prose"}
-
-    grade, refusal = _graded(
+    return _graded(
         _CitationGrade,
         (
             "Grade how well a research agent attributed its claims to sources.\n\n"
@@ -706,11 +794,28 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
             "it out.\n\n"
             "Count every substantive claim, then list only the genuinely "
             "unsupported ones.\n\n"
-            f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
+            f"QUESTION:\n{question}\n\n"
             f"ANSWER:\n{prose}"
         ),
         count_key="substantive_claims",
     )
+
+
+def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
+    """Judge: what share of the answer's substantive claims carry a source?
+
+    Claim-level, where `response_cites_sources` is only URL-presence: an answer can
+    carry one link and still assert six unsourced facts around it. Scored as a
+    proportion — see `_coverage_score` for why that is load-bearing rather than
+    cosmetic.
+    """
+    if reason := _ungradable(run, "response"):
+        return _not_measured(reason)
+    prose = _outputs(run).get("response", "")
+    if not prose.strip():
+        return {"score": 0.0, "comment": "the agent produced no prose"}
+
+    grade, refusal = grade_citations(_inputs(example).get("question", ""), prose)
     if grade is None:
         return _not_measured(refusal)
 
@@ -734,6 +839,228 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
     }
 
 
+# How many cited claims `claims_are_supported` sends to the judge per run, and how much
+# retrieved text it sends with each. Search snippets are short, so the cap rarely bites;
+# it bounds the prompt if a URL was returned by many searches.
+_SUPPORT_SAMPLE = 5
+_SOURCE_CHARS = 4000
+# A cited unit needs this many words once its links are removed, or it is a source
+# list entry ("- [Anthropic docs](...)") rather than a claim.
+_MIN_CLAIM_WORDS = 4
+_MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_WORD = re.compile(r"[A-Za-z0-9]+")
+
+Verdict = Literal["supported", "contradicted", "cannot_tell"]
+
+
+def _cited_units(response: str) -> list[str]:
+    """The sentences and table rows of `response` that carry a URL, in order.
+
+    Found in code, not by a model, so a regrade sees the same list. **The known limit:**
+    a claim covered by a citation elsewhere in its paragraph or below its table is not a
+    unit with a URL, so it is never sampled. `claims_are_cited` grades that inheritance;
+    this metric grades only claims that carry their own source.
+    """
+    units: list[str] = []
+    for line in response.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("|"):
+            units.append(line)
+        else:
+            units.extend(part for part in _SENTENCE_END.split(line) if part.strip())
+    return [
+        unit
+        for unit in units
+        if URL.search(unit)
+        and len(_WORD.findall(URL.sub("", _MARKDOWN_LINK.sub("", unit))))
+        >= _MIN_CLAIM_WORDS
+    ]
+
+
+def _claims_with_sources(
+    response: str, search_results: list[Any]
+) -> tuple[list[tuple[str, str]], int]:
+    """Each cited unit paired with the text its URLs returned, and how many had none.
+
+    Matched through `_normalise_url`, like `citations_are_real`. A unit whose URLs no
+    search returned (or returned with no text) is skipped and counted: that is
+    `citations_are_real`'s finding, and grading it here would score a missing source as
+    an unsupported claim.
+    """
+    texts: dict[str, list[str]] = {}
+    for hit in search_results:
+        if not isinstance(hit, dict) or not isinstance(hit.get("url"), str):
+            continue
+        snippets = texts.setdefault(_normalise_url(hit["url"]), [])
+        content = str(hit.get("content") or "").strip()
+        if content and content not in snippets:
+            snippets.append(content)
+    pairs: list[tuple[str, str]] = []
+    skipped = 0
+    for unit in _cited_units(response):
+        source: list[str] = []
+        for url in URL.findall(unit):
+            for snippet in texts.get(_normalise_url(url), []):
+                if snippet not in source:
+                    source.append(snippet)
+        if not source:
+            skipped += 1
+            continue
+        pairs.append((unit, "\n\n".join(source)[:_SOURCE_CHARS]))
+    return pairs, skipped
+
+
+def _sample_claims(
+    pairs: list[tuple[str, str]], question: str
+) -> list[tuple[str, str]]:
+    """Up to `_SUPPORT_SAMPLE` pairs, chosen reproducibly from the question, in order.
+
+    Seeded from SHA-256 of the question, never `hash()`: Python randomises string hashes
+    per process, so a `hash()` seed would pick different claims on every regrade and the
+    metric's run-to-run spread would include the sampling, not just the judge.
+    """
+    if len(pairs) <= _SUPPORT_SAMPLE:
+        return list(pairs)
+    seed = int.from_bytes(hashlib.sha256(question.encode()).digest()[:8], "big")
+    picked = sorted(random.Random(seed).sample(range(len(pairs)), _SUPPORT_SAMPLE))
+    return [pairs[i] for i in picked]
+
+
+class _ClaimVerdict(TypedDict):
+    """The judge's reading of one numbered claim against its source's retrieved text."""
+
+    claim_id: Annotated[int, ..., "The claim's number, exactly as given."]
+    evidence: Annotated[
+        str,
+        ...,
+        "Quote the passage of THAT claim's SOURCE TEXT that bears on it, verbatim — or "
+        "the exact string 'nothing' if no passage does.",
+    ]
+    reasoning: Annotated[
+        str, ..., "One sentence: how that passage relates to the claim."
+    ]
+    verdict: Annotated[
+        Verdict,
+        ...,
+        "supported: the source text states the claim. contradicted: it states something "
+        "incompatible with the claim. cannot_tell: it does not address the claim.",
+    ]
+
+
+class _SupportGrade(TypedDict):
+    """One verdict per numbered claim, each backed by a quote from its source text."""
+
+    verdicts: Annotated[
+        list[_ClaimVerdict], ..., "Exactly one verdict for every numbered claim."
+    ]
+
+
+def grade_support(
+    question: str, claims: list[tuple[str, str]]
+) -> tuple[dict[str, Any] | None, str]:
+    """The support judge's raw grade of `(claim, source text)` pairs, or `None` and why.
+
+    Kept apart from `claims_are_supported` for the same reason as `grade_citations`:
+    `evals.calibrate` can then grade labelled pairs through the exact prompt and schema
+    a sweep uses.
+    """
+    numbered = "\n\n".join(
+        f"CLAIM {number}:\n{claim}\n\nSOURCE TEXT {number}:\n{source}"
+        for number, (claim, source) in enumerate(claims, start=1)
+    )
+    return _graded(
+        _SupportGrade,
+        (
+            "A research agent cited web sources for the claims below. For each claim "
+            "you are given the text its cited source returned to the agent's search. "
+            "Judge each claim ONLY against its own SOURCE TEXT, not against what you "
+            "know.\n\n"
+            "- supported: the source text states the claim's specific facts (numbers, "
+            "dates, names, limits). A faithful paraphrase is supported.\n"
+            "- contradicted: the source text states something incompatible — a "
+            "different figure, the opposite finding.\n"
+            "- cannot_tell: the source text does not address the claim. The text is a "
+            "short search snippet, so this is common and is NOT a failure: a claim "
+            "missing from a snippet may still be true.\n\n"
+            "Quote your evidence before you decide. If you cannot quote a passage that "
+            "states or contradicts the claim, the verdict is cannot_tell.\n\n"
+            f"QUESTION THE AGENT ANSWERED:\n{question}\n\n{numbered}"
+        ),
+        count_key="verdicts",
+    )
+
+
+def claims_are_supported(run: Any, example: Any) -> dict[str, Any]:
+    """Judge: do the cited claims say what their sources' retrieved text says?
+
+    `citations_are_real` checks a cited URL was retrieved; this checks the claim
+    attached to it is borne out by what the retrieval returned. It samples up to
+    `_SUPPORT_SAMPLE` claims that carry their own URL (see `_cited_units` for what that
+    misses), and scores supported over supported plus contradicted. `cannot_tell` is
+    excluded and counted: a snippet that does not mention a claim is not evidence that
+    it is false. If every sampled claim is `cannot_tell`, the metric measured nothing,
+    and says so instead of scoring.
+
+    A grade whose verdicts do not match the numbered claims one to one — an id missing,
+    repeated or invented — is refused like a truncated one: scoring the verdicts that
+    did arrive would quietly grade a different sample than the one drawn.
+    """
+    if reason := _ungradable(run, "search_results"):
+        return _not_measured(reason)
+    outputs = _outputs(run)
+    pairs, skipped = _claims_with_sources(
+        outputs.get("response", ""), outputs["search_results"]
+    )
+    if not pairs:
+        return _not_measured(
+            "no cited claim has retrieved text to check it against "
+            f"({skipped} cited claim(s) whose URLs no search returned)"
+        )
+    question = _inputs(example).get("question", "")
+    sample = _sample_claims(pairs, question)
+    grade, refusal = grade_support(question, sample)
+    if grade is None:
+        return _not_measured(refusal)
+
+    verdicts = [v for v in grade.get("verdicts") or [] if isinstance(v, dict)]
+    ids = [v.get("claim_id") for v in verdicts]
+    expected = list(range(1, len(sample) + 1))
+    if sorted(ids, key=str) != sorted(expected, key=str):
+        return _not_measured(
+            f"the judge returned verdicts for claims {ids}, not for exactly {expected}"
+        )
+    unknown = {v.get("verdict") for v in verdicts} - set(get_args(Verdict))
+    if unknown:
+        return _not_measured(f"the judge returned unrecognised verdict(s) {unknown}")
+
+    counts = Counter(v["verdict"] for v in verdicts)
+    supported, contradicted = counts["supported"], counts["contradicted"]
+    unclear = counts["cannot_tell"]
+    if supported + contradicted == 0:
+        return _not_measured(
+            f"all {unclear} sampled claim(s) were cannot_tell: the retrieved text does "
+            "not address them, so this run measures nothing"
+        )
+    score = _coverage_score(supported + contradicted, contradicted)
+    comment = (
+        f"{supported} supported, {contradicted} contradicted, {unclear} cannot tell, "
+        f"of {len(sample)} sampled from {len(pairs)} checkable cited claim(s)"
+    )
+    if skipped:
+        comment += f"; {skipped} cited claim(s) had no retrieved text"
+    wrong = [
+        sample[v["claim_id"] - 1][0][:160]
+        for v in verdicts
+        if v["verdict"] == "contradicted"
+    ]
+    if wrong:
+        comment += ". Contradicted: " + " | ".join(wrong)
+    return {"score": score, "comment": comment}
+
+
 def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
     """Judge: what share of what was asked did the user-visible response deliver?
 
@@ -750,7 +1077,15 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
     if not response.strip():
         return {"score": 0.0, "comment": "empty response"}
 
-    grade, refusal = _graded(
+    grade, refusal = grade_answer(_inputs(example).get("question", ""), response)
+    if grade is None:
+        return _not_measured(refusal)
+    return _answer_score(grade)
+
+
+def grade_answer(question: str, response: str) -> tuple[dict[str, Any] | None, str]:
+    """The answer judge's raw grade of `response`; see `grade_citations` for why."""
+    return _graded(
         _AnswerGrade,
         (
             "How much of this question did the response actually answer?\n\n"
@@ -766,14 +1101,14 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
             "For each part you list, quote the passage that comes closest to "
             "answering it and say why that passage falls short. If you cannot, the "
             "part was answered: leave it out.\n\n"
-            f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
+            f"QUESTION:\n{question}\n\n"
             f"RESPONSE:\n{response}"
         ),
         count_key="question_parts",
     )
-    if grade is None:
-        return _not_measured(refusal)
 
+
+def _answer_score(grade: dict[str, Any]) -> dict[str, Any]:
     missing = grade.get("unanswered_parts") or []
     # `or 1` already floors the count at one, so the literal `1` inside `max` was a
     # second spelling of the same guard and is gone. The `len(missing)` term is the
@@ -798,9 +1133,10 @@ CODE_EVALUATORS = [
     persists_findings,
     mutations_require_approval,
     response_cites_sources,
+    citations_are_real,
     turn_stopped_cleanly,
 ]
 
-JUDGE_EVALUATORS = [claims_are_cited, answers_the_question]
+JUDGE_EVALUATORS = [claims_are_cited, answers_the_question, claims_are_supported]
 
 ALL_EVALUATORS = [*CODE_EVALUATORS, *JUDGE_EVALUATORS]

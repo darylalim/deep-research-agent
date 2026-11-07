@@ -13,8 +13,13 @@ Everything here runs without keys or network.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
+from unittest import mock
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -22,6 +27,7 @@ from langgraph.types import Interrupt
 
 from deep_research.agent import GATED_TOOLS
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
+from deep_research.tools import build_web_search
 from deep_research.turns import _SILENT_STOPS, render_turn
 from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
@@ -29,10 +35,16 @@ from evals.evaluators import (
     ALL_EVALUATORS,
     CODE_EVALUATORS,
     UNCLEAN_STOPS,
+    _cited_units,
+    _claims_with_sources,
     _coverage_score,
+    _normalise_url,
+    _sample_claims,
     answers_the_question,
     checks_memory_first,
+    citations_are_real,
     claims_are_cited,
+    claims_are_supported,
     delegates_breadth,
     mutations_require_approval,
     persists_findings,
@@ -46,6 +58,7 @@ from evals.harness import (
     MUTATING_TOOLS,
     NON_WRITE_TOOLS,
     RESPONSE_KEY,
+    SEARCH_TOOL,
     WRITE_TOOLS,
     TurnRecorder,
     _approve_all,
@@ -83,6 +96,12 @@ def test_the_evals_mutation_list_covers_every_gated_tool() -> None:
 ORCHESTRATOR: tuple[str, ...] = ()
 # What a subagent's subgraph namespace actually looks like (measured).
 SUBAGENT: tuple[str, ...] = ("tools:9d0c2f4e",)
+# A successful search's content: `json.dumps` of a Tavily result set. Placeholder text
+# like "hits" would now (correctly) be recorded as a FAILED search, so every positive
+# control that means "this search worked" has to look like one that did.
+HITS = json.dumps(
+    {"results": [{"url": "https://a.example/x", "title": "t", "content": "c"}]}
+)
 
 
 def _updates(node: str, *messages: object) -> dict:
@@ -105,11 +124,11 @@ def test_recorder_sees_searches_that_the_returned_state_cannot():
     )
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="2", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="2", name="tavily_search")),
     )
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="3", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="3", name="tavily_search")),
     )
     recorder.absorb(
         ORCHESTRATOR,
@@ -630,9 +649,11 @@ def test_a_subagents_bookkeeping_does_not_earn_the_orchestrator_a_pass():
     recorder = TurnRecorder()
     # The orchestrator delegates immediately — no plan, no memory check.
     # Inside the subagent: its own todos, its own ls, its own /memories/ write.
-    for tool in ("write_todos", "ls", "tavily_search"):
+    # The search's content is a real result set: the subagent's search WORKED.
+    for tool, content in (("write_todos", "x"), ("ls", "x"), ("tavily_search", HITS)):
         recorder.absorb(
-            SUBAGENT, _updates("tools", ToolMessage("x", tool_call_id=tool, name=tool))
+            SUBAGENT,
+            _updates("tools", ToolMessage(content, tool_call_id=tool, name=tool)),
         )
     recorder.absorb(
         SUBAGENT,
@@ -892,7 +913,7 @@ def test_searches_that_all_failed_are_not_evidence_that_it_researched():
     # Positive control: one search that actually returned is enough.
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="s2", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="s2", name="tavily_search")),
     )
     assert searched_the_web({"outputs": recorder.actions()}, {})["score"] == 1
 
@@ -1173,7 +1194,11 @@ def test_every_code_evaluator_reads_a_key_the_harness_emits(evaluator):
     answer. Driving every evaluator against a complete (if empty) recorder output is
     what pins each literal against a key the harness really emits.
     """
-    outputs = {**TurnRecorder().actions(), RESPONSE_KEY: "some prose"}
+    # Prose WITH a URL: `citations_are_real` honestly has no reading on a response that
+    # cites nothing (its own test pins that non-verdict), so URL-free prose here would
+    # stop this test checking its key literal at all.
+    response = "some prose, per https://a.example/x"
+    outputs = {**TurnRecorder().actions(), RESPONSE_KEY: response}
     assert evaluator({"outputs": outputs}, {"outputs": {}})["score"] is not None
 
 
@@ -1277,3 +1302,443 @@ def test_a_zero_count_beside_listed_misses_is_still_a_failure(monkeypatch):
     monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
     run = {"outputs": {"response": "two unsourced claims"}}
     assert claims_are_cited(run, {"inputs": {"question": "q"}})["score"] == 0.0
+
+
+class TestSearchResults:
+    """`TurnRecorder` keeps what each search returned, for the Phase 2b citation metrics.
+
+    The messages come from the REAL `TavilySearch.invoke` with only the HTTP call stubbed,
+    so the shapes under test are the ones the installed tool emits, not ones written to
+    suit the parser. Each case below was read off that path first.
+    """
+
+    @staticmethod
+    def _search(
+        call_id: str, *, returns: Any = None, raises: Exception | None = None
+    ) -> ToolMessage:
+        tool = build_web_search()
+        stub = {"side_effect": raises} if raises else {"return_value": returns}
+        with mock.patch.object(type(tool.api_wrapper), "raw_results", **stub):
+            message = tool.invoke(
+                {
+                    "type": "tool_call",
+                    "id": call_id,
+                    "name": tool.name,
+                    "args": {"query": "q"},
+                }
+            )
+        assert isinstance(message, ToolMessage)
+        return message
+
+    @staticmethod
+    def _response(*urls: str) -> dict:
+        # The API response's shape, as `langchain_tavily` documents it and as a stored
+        # trace shows it, including the keys the recorder ignores.
+        return {
+            "query": "q",
+            "follow_up_questions": None,
+            "answer": None,
+            "images": [],
+            "results": [
+                {
+                    "url": url,
+                    "title": f"title {i}",
+                    "content": f"snippet {i}",
+                    "score": 0.9,
+                    "raw_content": None,
+                }
+                for i, url in enumerate(urls)
+            ],
+            "response_time": 0.4,
+        }
+
+    def test_the_search_tool_name_is_the_real_one(self):
+        # A rename would make every search record nothing, and `citations_are_real`
+        # would then call every cited URL invented.
+        assert build_web_search().name == SEARCH_TOOL
+
+    def test_results_are_kept_from_anywhere_in_the_tree(self):
+        recorder = TurnRecorder()
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools",
+                self._search("s1", returns=self._response("https://a.example/x")),
+            ),
+        )
+        recorder.absorb(
+            ORCHESTRATOR,
+            _updates(
+                "tools",
+                self._search("s2", returns=self._response("https://b.example/y")),
+            ),
+        )
+        assert recorder.actions()["search_results"] == [
+            {"url": "https://a.example/x", "title": "title 0", "content": "snippet 0"},
+            {"url": "https://b.example/y", "title": "title 0", "content": "snippet 0"},
+        ]
+
+    def test_a_replayed_search_is_recorded_once(self):
+        # A resumed superstep re-emits a finished sibling's result as a FRESH object;
+        # the recorder's tool-call-id dedupe must cover search results too.
+        recorder = TurnRecorder()
+        for _ in range(2):
+            message = self._search("s1", returns=self._response("https://a.example/x"))
+            recorder.absorb(SUBAGENT, _updates("tools", message))
+        assert len(recorder.actions()["search_results"]) == 1
+
+    def test_an_empty_search_is_an_error_and_records_nothing(self):
+        message = self._search("s1", returns={"results": []})
+        assert message.status == "error"
+        recorder = TurnRecorder()
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        assert recorder.actions()["search_results"] == []
+
+    def test_a_failed_search_reported_as_success_records_nothing(self):
+        # The sharp one: `TavilySearch._run` RETURNS `{"error": exc}` for an API
+        # failure, `json.dumps` cannot encode the exception, and the message arrives as
+        # `status="success"` with a Python repr for content.
+        message = self._search("s1", raises=RuntimeError("HTTP 500"))
+        assert message.status == "success"
+        recorder = TurnRecorder()
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        outputs = recorder.actions()
+        assert outputs["search_results"] == []
+        # …and it is a FAILED search, not research. Before this, a run whose every
+        # search hit an API error scored 1 on `searched_the_web`.
+        assert outputs["trajectory"] == [SEARCH_TOOL]
+        assert outputs["failed_tools"] == [SEARCH_TOOL]
+        assert searched_the_web({"outputs": outputs}, {})["score"] == 0
+
+    def test_a_json_error_payload_records_nothing(self):
+        recorder = TurnRecorder()
+        content = json.dumps(
+            {"error": "rate limited", "results": [{"url": "https://x"}]}
+        )
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools", ToolMessage(content, tool_call_id="s1", name=SEARCH_TOOL)
+            ),
+        )
+        assert recorder.actions()["search_results"] == []
+        assert recorder.actions()["failed_tools"] == [SEARCH_TOOL]
+
+    def test_a_real_search_is_not_recorded_as_failed(self):
+        # The positive control for the two above: without it, recording EVERY search
+        # as failed would pass them both.
+        recorder = TurnRecorder()
+        message = self._search("s1", returns=self._response("https://a.example/x"))
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        outputs = recorder.actions()
+        assert outputs["failed_tools"] == []
+        assert searched_the_web({"outputs": outputs}, {})["score"] == 1
+
+    def test_a_result_without_a_string_url_is_skipped(self):
+        response = self._response("https://a.example/x")
+        response["results"].append({"title": "no url", "content": "c"})
+        response["results"].append({"url": None, "content": "c"})
+        recorder = TurnRecorder()
+        recorder.absorb(
+            SUBAGENT, _updates("tools", self._search("s1", returns=response))
+        )
+        assert [hit["url"] for hit in recorder.actions()["search_results"]] == [
+            "https://a.example/x"
+        ]
+
+    def test_another_tool_with_the_same_shape_is_not_a_search(self):
+        # Only the search tool's results are evidence of what was retrieved.
+        recorder = TurnRecorder()
+        content = json.dumps(self._response("https://a.example/x"))
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools", ToolMessage(content, tool_call_id="r1", name="read_file")
+            ),
+        )
+        assert recorder.actions()["search_results"] == []
+
+
+class TestCitationsAreReal:
+    """Every URL the user is shown should be one some search actually returned."""
+
+    @staticmethod
+    def _run(response: str, *retrieved: str) -> dict:
+        hits = [{"url": url, "title": "", "content": ""} for url in retrieved]
+        return {"outputs": {RESPONSE_KEY: response, "search_results": hits}}
+
+    @pytest.mark.parametrize(
+        ("cited", "retrieved"),
+        [
+            ("https://x.example/a.", "https://x.example/a"),  # sentence end
+            ("https://x.example/a**", "https://x.example/a"),  # Markdown bold
+            ("http://x.example/a", "https://x.example/a"),  # scheme
+            ("https://www.X.example/a", "https://x.example/a"),  # www. and host case
+            ("https://x.example/a/", "https://x.example/a"),  # trailing slash
+            ("https://x.example/a#pricing", "https://x.example/a"),  # fragment
+            ("https://x.example/a#:~:text=limit", "https://x.example/a"),  # highlight
+            ("https://x.example/a?utm_source=t&id=7", "https://x.example/a?id=7"),
+            ("https://x.example/a?fbclid=z", "https://x.example/a"),
+            ("https://x.example/a?b=2&a=1", "https://x.example/a?a=1&b=2"),  # order
+            ("https://x.example/caf%C3%A9", "https://x.example/café"),  # encoding
+            # `URL` stops at ")", so a Wikipedia title is captured unclosed.
+            (
+                "https://en.wikipedia.org/wiki/Foo_(bar",
+                "https://en.wikipedia.org/wiki/Foo_(bar)",
+            ),
+        ],
+    )
+    def test_spellings_of_one_page_match(self, cited: str, retrieved: str) -> None:
+        # A false "not retrieved" reads as fabrication, so each of these must merge.
+        assert _normalise_url(cited) == _normalise_url(retrieved)
+
+    @pytest.mark.parametrize(
+        ("cited", "retrieved"),
+        [
+            (
+                "https://x.example/a?id=7",
+                "https://x.example/a?id=8",
+            ),  # query is identity
+            (
+                "https://x.example/a",
+                "https://x.example/a/b",
+            ),  # a parent is not the page
+            ("https://docs.x.example/a", "https://x.example/a"),  # subdomain
+            ("https://x.example/a", "https://y.example/a"),
+            ("https://x.example:8443/a", "https://x.example/a"),  # port
+        ],
+    )
+    def test_different_pages_stay_different(self, cited: str, retrieved: str) -> None:
+        # The other direction, without which normalising EVERYTHING to the host would
+        # pass the test above while crediting invented URLs.
+        assert _normalise_url(cited) != _normalise_url(retrieved)
+
+    def test_scores_the_share_of_distinct_cited_urls_that_were_retrieved(self) -> None:
+        response = (
+            "Limits per [the docs](https://x.example/limits). Also see "
+            "<https://x.example/pricing>, https://x.example/limits again, "
+            "https://x.example/made-up and https://nowhere.example/ghost."
+        )
+        result = citations_are_real(
+            self._run(
+                response, "https://x.example/limits", "https://x.example/pricing"
+            ),
+            {},
+        )
+        # Four distinct URLs (the repeat counts once), two retrieved.
+        assert result["score"] == pytest.approx(2 / 4)
+        comment = result["comment"]
+        assert "2 of 4" in comment
+        assert "on no site any search reached: https://nowhere.example/ghost" in comment
+        assert "on a site a search did reach: https://x.example/made-up" in comment
+
+    def test_all_retrieved_scores_one(self) -> None:
+        result = citations_are_real(
+            self._run("Per https://x.example/a.", "https://x.example/a"), {}
+        )
+        assert result["score"] == 1.0
+
+    def test_urls_with_no_search_results_score_zero_and_say_why(self) -> None:
+        result = citations_are_real(self._run("Per https://x.example/a."), {})
+        assert result["score"] == 0.0
+        assert "no search returned anything" in result["comment"]
+
+    def test_a_response_with_no_urls_is_not_measured(self) -> None:
+        # `response_cites_sources` scores this 0; a vacuous 1.0 here would be averaged
+        # into the experiment mean as a perfect run.
+        result = citations_are_real(
+            self._run("No links at all.", "https://x.example/a"), {}
+        )
+        assert result["score"] is None
+
+    def test_a_row_without_search_results_is_not_measured(self) -> None:
+        # The plan's guard: a row holding only a response must not have every URL in it
+        # called invented. Old experiments recorded no `search_results` at all.
+        run = {"outputs": {RESPONSE_KEY: "Per https://x.example/a."}}
+        assert citations_are_real(run, {})["score"] is None
+
+    def test_end_to_end_through_the_recorder_and_the_real_tool(self) -> None:
+        # The searches come from the real `TavilySearch.invoke` (HTTP stubbed), so the
+        # recorder and the evaluator are checked against the shape the tool emits.
+        recorder = TurnRecorder()
+        response = TestSearchResults._response("https://www.x.example/a/")
+        message = TestSearchResults._search("s1", returns=response)
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        outputs = {**recorder.actions(), RESPONSE_KEY: "See https://x.example/a."}
+        assert citations_are_real({"outputs": outputs}, {})["score"] == 1.0
+
+
+class _RecordingJudge(_StubJudge):
+    """A `_StubJudge` that also keeps the prompt it was sent."""
+
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload)
+        self.prompts: list[str] = []
+
+    def invoke(self, messages: Any) -> dict:
+        self.prompts.append(messages[0]["content"])
+        return super().invoke(messages)
+
+
+class TestClaimsAreSupported:
+    """Cited claims checked against the text their sources' searches returned."""
+
+    REPORT = (
+        "## Limits\n"
+        "Tier 1 allows 50 RPM per [the docs](https://x.example/limits). "
+        "Batch jobs finish within 24 hours (https://x.example/batch). "
+        "This sentence has no source.\n"
+        "| Tier | RPM |\n"
+        "|---|---|\n"
+        "| Tier 2 limit is 1000 RPM | https://x.example/limits |\n"
+        "- [Anthropic docs](https://x.example/limits)\n"
+        "A ghost claim about pricing is here https://nowhere.example/ghost.\n"
+    )
+    HITS: ClassVar[list[dict[str, str]]] = [
+        {"url": "https://x.example/limits", "title": "", "content": "Tier 1: 50 RPM."},
+        {
+            "url": "https://x.example/limits/",
+            "title": "",
+            "content": "Tier 2: 1000 RPM.",
+        },
+        {
+            "url": "https://x.example/batch",
+            "title": "",
+            "content": "Most batches end in 1 hour.",
+        },
+    ]
+
+    def _run(self) -> dict:
+        return {"outputs": {RESPONSE_KEY: self.REPORT, "search_results": self.HITS}}
+
+    @staticmethod
+    def _grade(*verdicts: str) -> dict:
+        return {
+            "verdicts": [
+                {"claim_id": i, "evidence": "q", "reasoning": "r", "verdict": v}
+                for i, v in enumerate(verdicts, start=1)
+            ]
+        }
+
+    def test_units_are_cited_sentences_and_rows_but_not_source_lists(self):
+        units = _cited_units(self.REPORT)
+        assert units == [
+            "Tier 1 allows 50 RPM per [the docs](https://x.example/limits).",
+            "Batch jobs finish within 24 hours (https://x.example/batch).",
+            "| Tier 2 limit is 1000 RPM | https://x.example/limits |",
+            "A ghost claim about pricing is here https://nowhere.example/ghost.",
+        ]
+
+    def test_each_claim_gets_its_own_sources_text_and_unretrieved_ones_are_counted(
+        self,
+    ):
+        pairs, skipped = _claims_with_sources(self.REPORT, self.HITS)
+        # Both spellings of /limits normalise together, so both snippets come along.
+        assert pairs[0][1] == "Tier 1: 50 RPM.\n\nTier 2: 1000 RPM."
+        assert pairs[1][1] == "Most batches end in 1 hour."
+        assert len(pairs) == 3
+        assert skipped == 1  # the ghost URL, which citations_are_real reports
+
+    def test_the_sample_is_capped_ordered_and_seeded_by_the_question(self):
+        pairs = [(f"claim {i}", "s") for i in range(20)]
+        first = _sample_claims(pairs, "question A")
+        assert len(first) == 5
+        assert first == sorted(first, key=lambda p: int(p[0].split()[1]))
+        assert first == _sample_claims(pairs, "question A")
+        assert _sample_claims(pairs[:3], "question A") == pairs[:3]
+
+    def test_the_sample_does_not_change_between_processes(self):
+        # The property `hash()` would break: Python randomises string hashes per
+        # process, so a regrade would silently grade different claims.
+        code = (
+            "from evals.evaluators import _sample_claims;"
+            "print([c for c, _ in _sample_claims("
+            "[(f'c{i}', 's') for i in range(20)], 'q')])"
+        )
+        picked = {
+            subprocess.run(
+                [sys.executable, "-c", code],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for seed in ("1", "2", "3")
+        }
+        assert len(picked) == 1, picked
+
+    def test_scores_supported_over_supported_plus_contradicted(self, monkeypatch):
+        judge = _RecordingJudge(
+            _judge_reply(self._grade("supported", "contradicted", "cannot_tell"))
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", judge)
+        result = claims_are_supported(self._run(), {"inputs": {"question": "limits?"}})
+        assert result["score"] == pytest.approx(1 / 2)  # cannot_tell is excluded
+        assert "1 supported, 1 contradicted, 1 cannot tell" in result["comment"]
+        assert "1 cited claim(s) had no retrieved text" in result["comment"]
+        assert "Contradicted: Batch jobs finish within 24 hours" in result["comment"]
+
+    def test_the_judge_is_shown_each_claim_with_its_source_text(self, monkeypatch):
+        # Without this, a prompt that dropped the SOURCE TEXT would have the judge
+        # grading from its own knowledge, and every scoring test would still pass.
+        judge = _RecordingJudge(
+            _judge_reply(self._grade("supported", "supported", "supported"))
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", judge)
+        claims_are_supported(self._run(), {"inputs": {"question": "limits?"}})
+        (prompt,) = judge.prompts
+        assert "CLAIM 2:\nBatch jobs finish within 24 hours" in prompt
+        assert "SOURCE TEXT 2:\nMost batches end in 1 hour." in prompt
+        assert "limits?" in prompt
+        assert "nowhere.example" not in prompt  # skipped, not graded
+
+    def test_all_cannot_tell_measures_nothing(self, monkeypatch):
+        reply = _judge_reply(self._grade("cannot_tell", "cannot_tell", "cannot_tell"))
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        result = claims_are_supported(self._run(), {})
+        assert result["score"] is None
+        assert "measures nothing" in result["comment"]
+
+    @pytest.mark.parametrize(
+        "ids",
+        [[1, 2], [1, 2, 2], [1, 2, 3, 4], [0, 1, 2]],
+        ids=["missing", "duplicated", "extra", "off-by-one"],
+    )
+    def test_verdicts_that_do_not_match_the_sample_are_refused(self, monkeypatch, ids):
+        grade = {
+            "verdicts": [
+                {
+                    "claim_id": i,
+                    "evidence": "q",
+                    "reasoning": "r",
+                    "verdict": "supported",
+                }
+                for i in ids
+            ]
+        }
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(_judge_reply(grade)))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_an_unrecognised_verdict_is_refused(self, monkeypatch):
+        reply = _judge_reply(self._grade("supported", "probably", "supported"))
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_a_truncated_grade_is_refused(self, monkeypatch):
+        reply = _judge_reply(
+            self._grade("supported", "supported", "supported"), "max_tokens"
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_nothing_checkable_is_not_measured_and_calls_no_judge(self, monkeypatch):
+        monkeypatch.setattr("evals.evaluators.JUDGE", None)  # any call would raise
+        run = {
+            "outputs": {
+                RESPONSE_KEY: "Only https://nowhere.example/ghost here, sadly.",
+                "search_results": self.HITS,
+            }
+        }
+        assert claims_are_supported(run, {})["score"] is None
+        no_results = {"outputs": {RESPONSE_KEY: self.REPORT}}
+        assert claims_are_supported(no_results, {})["score"] is None

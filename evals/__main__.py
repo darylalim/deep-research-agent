@@ -1,4 +1,4 @@
-"""Entry point:  uv run python -m evals [--upload] [--run] [--regrade EXPERIMENT]
+"""Entry point:  uv run python -m evals [--upload] [--run] [--regrade EXPERIMENT] [--calibrate]
 
     --upload    create/sync the dataset in LangSmith (idempotent)
     --run       run the agent over the dataset and score it
@@ -10,7 +10,10 @@
     --regrade   grade a stored experiment's answers again with the current judge.
                 Paid, but judge calls only: the agent does not run, and nothing is
                 written back to LangSmith. Results go to ~/deep-research-regrades/.
-    --repeats   how many times --regrade grades each answer, per metric
+    --calibrate grade the human-labelled reports in evals/calibration.json and
+                report agreement with the labels. Paid, judge calls only; needs
+                only ANTHROPIC_API_KEY, and nothing goes to LangSmith.
+    --repeats   how many times --regrade or --calibrate grades each answer
 
 `argparse` gets an explicit one-line `description=` rather than this docstring.
 The default formatter reflows whatever it is handed into a single paragraph, so
@@ -63,16 +66,23 @@ def main() -> None:
         help="grade a stored experiment's answers again (judge calls only, no agent)",
     )
     parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="measure the judges against the human labels (judge calls only)",
+    )
+    parser.add_argument(
         "--repeats",
         type=int,
         default=3,
-        help="times --regrade grades each answer, per metric (default 3)",
+        help="times --regrade or --calibrate grades each answer (default 3)",
     )
     args = parser.parse_args()
-    if not (args.upload or args.run or args.regrade):
-        parser.error("nothing to do — pass --upload, --run or --regrade")
-    if args.regrade and (args.upload or args.run):
-        parser.error("--regrade runs alone, not with --upload or --run")
+    if not (args.upload or args.run or args.regrade or args.calibrate):
+        parser.error("nothing to do — pass --upload, --run, --regrade or --calibrate")
+    if args.regrade and (args.upload or args.run or args.calibrate):
+        parser.error("--regrade runs alone, not with --upload, --run or --calibrate")
+    if args.calibrate and (args.upload or args.run):
+        parser.error("--calibrate runs alone, not with --upload or --run")
     if args.repeats < 1:
         parser.error(f"--repeats must be at least 1 (got {args.repeats})")
     # `--limit 0` used to be the most expensive way to ask for nothing: the guard
@@ -84,7 +94,15 @@ def main() -> None:
         parser.error(f"--limit must be at least 1 (got {args.limit})")
 
     load_dotenv()
-    for key in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY", "LANGSMITH_API_KEY"):
+    # Calibration reads a local file and calls only the judge, so it needs neither
+    # LangSmith nor Tavily. Demanding them would block it for no reason, as it would
+    # have while LangSmith's monthly trace quota ran out in November 2026.
+    needed = (
+        ("ANTHROPIC_API_KEY",)
+        if args.calibrate
+        else ("ANTHROPIC_API_KEY", "TAVILY_API_KEY", "LANGSMITH_API_KEY")
+    )
+    for key in needed:
         if not os.environ.get(key):
             raise SystemExit(f"{key} is not set — evals need real credentials.")
 
@@ -101,11 +119,22 @@ def main() -> None:
         prefix="deep_research_evals_"
     )
 
-    if args.regrade:
+    if args.regrade or args.calibrate:
         # Off before anything imports langsmith, whose settings are read once and
-        # cached. A regrade writes nothing to LangSmith, and that includes traces.
+        # cached. Neither writes anything to LangSmith, and that includes traces.
         for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
             os.environ[name] = "false"
+
+    if args.calibrate:
+        from .calibrate import calibrate, load, summary
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        out = Path.home() / "deep-research-regrades" / f"calibration-{stamp}.json"
+        reports = load()
+        result = calibrate(reports, out=out, repeats=args.repeats)
+        print("\n".join(summary(result, reports)))
+        print(f"full grades and matches: {out}")
+        return
 
     from langsmith import Client, evaluate
 

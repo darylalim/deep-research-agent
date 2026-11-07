@@ -18,9 +18,13 @@ from unittest import mock
 
 from deepagents import graph as graph_module
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.middleware import subagents as subagents_module
 from deepagents.middleware.filesystem import supports_execution
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 
 from deep_research import agent as agent_module
+from deep_research import config as config_module
+from deep_research import subagents as research_module
 from deep_research.agent import (
     GATED_TOOLS,
     MEMORY_NAMESPACE,
@@ -276,6 +280,65 @@ def test_open_agent_wires_the_gate_together_with_its_persistence() -> None:
     assert captured.get("system_prompt") is SYSTEM_PROMPT
     assert captured.get("tools"), "the agent lost its web-search tool"
     assert captured.get("subagents"), "the agent lost its researcher subagent"
+
+
+@contextmanager
+def _built_subagents() -> Generator[dict[str, tuple[Any, list[Any]]]]:
+    """Yield `{name: (model, middleware)}` for each subagent deepagents actually built.
+
+    Spies on the `create_agent` that `deepagents.middleware.subagents` calls per
+    declarative subagent, at assembly time — so this reads the model and middleware the
+    running subagent will have, after deepagents has merged in its inheritance, rather
+    than the spec dict this repo wrote. The model is positional there, which is why
+    `_capture_calls` (kwargs only) does not fit.
+    """
+    built: dict[str, tuple[Any, list[Any]]] = {}
+    real = subagents_module.create_agent
+
+    def spy(model: Any, **kwargs: Any) -> Any:
+        built[kwargs["name"]] = (model, kwargs["middleware"])
+        return real(model, **kwargs)
+
+    with mock.patch.object(subagents_module, "create_agent", spy):
+        yield built
+
+
+def test_the_researcher_is_built_with_its_configured_model(
+    monkeypatch: Any,
+) -> None:
+    # Patch to values that differ from the orchestrator's: at the defaults the two are
+    # equal, so a researcher silently inheriting the parent model would pass.
+    monkeypatch.setattr(research_module, "RESEARCHER_MODEL", "claude-sonnet-5-5")
+    monkeypatch.setattr(research_module, "RESEARCHER_EFFORT", "low")
+    with _built_subagents() as built, open_agent():
+        pass
+    model, _ = built["researcher"]
+    assert (model.model, model.reasoning_effort) == ("claude-sonnet-5-5", "low")
+    # And the override is the researcher's alone.
+    parent, _ = built["general-purpose"]
+    assert parent.model == config_module.MODEL_NAME
+
+
+def test_a_researcher_with_its_own_model_keeps_the_gate_and_the_cache() -> None:
+    # Read off deepagents 0.7 `graph.py`: a spec's `model` and `interrupt_on` resolve
+    # independently, and prompt caching is appended to every declarative subagent. This
+    # pins it against the BUILT stack, because the gate is the safety property here — a
+    # researcher whose `write_file` bypasses approval is what `mutations_require_approval`
+    # exists to catch, and only a paid sweep would see it otherwise.
+    with _built_subagents() as built, open_agent():
+        pass
+    _, middleware = built["researcher"]
+    gates = [m for m in middleware if isinstance(m, HumanInTheLoopMiddleware)]
+    assert len(gates) == 1, "the researcher lost (or doubled) its approval gate"
+    assert set(gates[0].interrupt_on) == set(GATED_TOOLS)
+    assert any("PromptCaching" in type(m).__name__ for m in middleware), (
+        "the researcher lost prompt caching — every search would re-send its prefix "
+        "at full price, with no visible symptom"
+    )
+    # The general-purpose subagent still INHERITS the parent model, so an identical
+    # stack shows a model of its own changes nothing else about how it is assembled.
+    _, inherited = built["general-purpose"]
+    assert [type(m) for m in middleware] == [type(m) for m in inherited]
 
 
 def test_open_agent_assembles_offline() -> None:

@@ -28,6 +28,7 @@ live run, not inferred from the source:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,56 @@ NON_WRITE_TOOLS = ("delete", "execute")
 # one — which is the half that would then drift unnoticed.
 RESPONSE_KEY = "response"
 
+# The web-search tool, whose results `TurnRecorder` keeps for `citations_are_real` and
+# `claims_are_supported`. A literal, like `RESEARCH_ACTIONS` in the evaluators, and pinned
+# against `tools.build_web_search().name` so a renamed tool cannot silently record nothing.
+SEARCH_TOOL = "tavily_search"
+
+
+def _search_hits(content: Any) -> list[dict[str, str]] | None:
+    """The `{url, title, content}` of each result in one `tavily_search` ToolMessage,
+    or `None` when the message is not a result set at all — i.e. the search FAILED.
+
+    Read off the installed `langchain_tavily` and checked against a stored trace: a
+    successful search's `content` is `json.dumps` of the API response, whose `results`
+    are dicts carrying `url`, `title` and `content` (the snippet the model actually read).
+
+    **Anything else yields nothing, never a guess.** `TavilySearch._run` turns an empty
+    result set into a `ToolException` (`status="error"`, skipped by the caller), but any
+    other failure it RETURNS as `{"error": <Exception>}` — which `json.dumps` cannot
+    encode, so langchain falls back to `str()` and the message arrives with
+    `status="success"` and a Python repr for content. Measured. So unparsable content,
+    a non-dict, an `error` key or a missing `results` list return `None`: the caller
+    records that as a FAILED search, which `searched_the_web` subtracts — without it, a
+    run whose every search hit an HTTP error scored a clean 1 on "did it research". A
+    result with no string `url` is merely skipped, so `citations_are_real` cannot credit
+    a URL nothing returned.
+    """
+    if not isinstance(content, str):
+        return None
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or "error" in payload
+        or not isinstance(payload.get("results"), list)
+    ):
+        return None
+    hits: list[dict[str, str]] = []
+    for result in payload["results"]:
+        if not isinstance(result, dict) or not isinstance(result.get("url"), str):
+            continue
+        hits.append(
+            {
+                "url": result["url"],
+                "title": str(result.get("title") or ""),
+                "content": str(result.get("content") or ""),
+            }
+        )
+    return hits
+
 
 def ensure_isolated_state_dir(state_dir: Path) -> None:
     """Refuse to run evals against — or anywhere *above* — the agent's real state.
@@ -142,6 +193,7 @@ class TurnRecorder:
         self.gated: list[str] = []  # tools that required approval
         self.failed_tools: list[str] = []  # …of those that ran, the ones that errored
         self.stop_reasons: list[str] = []  # why each generation ended, whole tree
+        self.search_results: list[dict[str, str]] = []  # what searches returned
         self._seen: set[str] = set()  # event keys already folded in
 
     def _first_time(self, key: str) -> bool:
@@ -254,6 +306,22 @@ class TurnRecorder:
             # evaluators depend on are untouched.
             if getattr(message, "status", None) == "error":
                 self.failed_tools.append(name)
+                return
+            # WHAT THE SEARCH RETURNED, from anywhere in the tree — a researcher's search
+            # is where nearly every cited URL comes from. Inherits the `tool_call_id`
+            # dedupe above, so a replayed result is not recorded twice.
+            #
+            # And a SECOND kind of failure, which the status check above cannot see:
+            # Tavily returns most API errors as `{"error": exc}`, which reaches the
+            # stream as `status="success"` with a Python repr for content (measured —
+            # see `_search_hits`). It is a failed search all the same, and recording it
+            # as one is what keeps `searched_the_web` from scoring it as research.
+            if name == SEARCH_TOOL:
+                hits = _search_hits(getattr(message, "content", None))
+                if hits is None:
+                    self.failed_tools.append(name)
+                else:
+                    self.search_results.extend(hits)
             return
 
         if kind == "ai":
@@ -340,6 +408,10 @@ class TurnRecorder:
             # `turn_stopped_cleanly`, which is what separates "the API stopped this"
             # from "the agent answered badly".
             "stop_reasons": list(self.stop_reasons),
+            # Every result a successful search returned — `{url, title, content}` — so
+            # the evaluators can ask whether a cited URL was ever retrieved
+            # (`citations_are_real`) and what it said (`claims_are_supported`).
+            "search_results": [dict(hit) for hit in self.search_results],
         }
 
 

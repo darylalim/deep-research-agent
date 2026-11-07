@@ -40,3 +40,8 @@ os.environ["DEEP_RESEARCH_STATE_DIR"] = tempfile.mkdtemp(prefix="deep_research_t
 # And because `.claude/hooks/post-edit.sh` runs this suite on every `.py` edit, that
 # failure would block all further editing until they found and unset it.
 os.environ.pop("DEEP_RESEARCH_MAX_TOKENS", None)
+# Same reasoning for the researcher overrides: `test_config.py` asserts that by DEFAULT
+# the researcher runs the orchestrator's model and effort, which a developer sweeping a
+# cheaper researcher from their `.env` would otherwise fail on every edit.
+os.environ.pop("DEEP_RESEARCH_RESEARCHER_MODEL", None)
+os.environ.pop("DEEP_RESEARCH_RESEARCHER_EFFORT", None)
