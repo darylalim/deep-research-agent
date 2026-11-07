@@ -904,6 +904,17 @@ thinking turn with 3 tool calls: `summarized` → replay OK; `omitted` → the 4
 costs nothing — and it never reaches the user, because `turns._text_of` collects bare
 strings and `{"type": "text"}` blocks, and a thinking block is neither.
 
+**An abandoned approval does not break thinking replay. Measured live on 2026-11-07 with
+`anthropic` 2.6.0.** The worry was that Opus 5.5 rejects replayed thinking once earlier
+history has been edited, and `PatchToolCallsMiddleware` rewrites the whole thread on exactly
+the turn after an abandoned approval. The test: a turn whose two researchers both ran
+reached a `write_file` approval, "Abandon this turn" was clicked, and a new question was
+sent on the same thread. It answered, with no 400. The checkpoint showed the patch's three
+synthetic `status=error` replies to the dangling calls, and every thinking block, including
+the abandoned message's, still carried its summarized text. The enforcement applies to
+accounts created on or after 2026-08-31. Account age for this run: not recorded, so if the
+account is older, this pass proves less.
+
 **A related shape change worth knowing about `_text_of`.** Once thinking is on, an
 assistant message's `content` is a *mixed* list: `["", {…thinking…}, "the answer"]` —
 the answer arrives as a **bare string element**, not a `{"type": "text"}` dict.

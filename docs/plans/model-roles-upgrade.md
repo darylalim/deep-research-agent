@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: PR 1 in progress. Judge accepted after the hand check; Phase 0 steps 6 and 7 (paid) and the release remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress. All checks passed; only Release 0.4.0 remains. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -128,7 +128,21 @@ have to work it out again.
     of the 15 gradings hold all four. Claim by claim:
     `~/deep-research-regrades/hand-check-2026-11-07.md`. The score shift is recorded in
     `CLAUDE.md`. A model did this check, so the user-labelled calibration in PR 2 still applies.
-- [ ] PR 1: Phase 0 steps 6 and 7 passed
+- [x] PR 1: Phase 0 steps 6 and 7 passed, 2026-11-07, on `anthropic` 2.6.0.
+  - Step 6: `pytest -m live` passed 3/3 in 15s: caching with `cache_read > 0`, thinking replay
+    after a tool result, and Tavily. A real app turn, run in a scratch state dir, reached a
+    `write_file` approval; Approve resumed it to a cited answer, and the server log showed no
+    errors.
+  - Step 7: a second turn on the same thread ran two researchers and reached approval, then
+    was abandoned. A new question then answered with no 400, and the checkpoint kept every
+    thinking block's text. Recorded in `CLAUDE.md`. Account age was not recorded.
+  - Found on the way, not fixed: **LangSmith is over its monthly trace limit.** Every trace
+    upload returned 429 "Monthly unique traces usage limit exceeded". The app is unaffected,
+    because tracing fails in the background, but `python -m evals --run` writes its
+    experiment to LangSmith. Check this before Phase 2b's short run and Phase 3's sweeps.
+    The app's tracing (on in `.env`) also spends the same quota.
+  - Display quirk, not fixed: after an abandoned turn, its question and the next one render
+    in a single user bubble, because the abandoned turn left no assistant text between them.
 - [ ] PR 1: Release 0.4.0 published and note added
 - [ ] PR 2: Judge calibrated
 - [ ] PR 2: Phase 2 researcher settings
