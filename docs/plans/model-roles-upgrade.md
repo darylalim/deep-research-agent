@@ -3,7 +3,7 @@
 **PR 1 (Phases 0 and 1) is merged to `main` and released as v0.4.0.** Start each later PR on its
 own branch from `main`; PR 2's is `upgrade/pr-2`.
 
-Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is in progress on `upgrade/pr-2`; judge calibration and Phase 2 are done, and Phase 2b is next. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is open as draft PR #3 from `upgrade/pr-2`, with CI green. Judge calibration, Phase 2 and Phase 2b's offline work are done. What remains is paid: Phase 2b's short run, the hand read and the labels. It waits for the LangSmith trace quota to reset on 2026-12-01, so check the quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
