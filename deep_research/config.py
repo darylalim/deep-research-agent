@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal, get_args
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -22,19 +23,55 @@ load_dotenv()
 # rule that held on Opus 5 and 4.8, and the reason no sampling parameter is set
 # anywhere in this file. `ChatAnthropic` omits those params when they are left unset.
 MODEL_NAME = os.environ.get("DEEP_RESEARCH_MODEL", "claude-opus-5-5")
+
+# The values `ChatAnthropic(effort=...)` accepts. A copy of its `Literal`, so
+# `test_config.py` compares the two by set equality rather than trusting it.
+Effort = Literal["max", "xhigh", "high", "medium", "low"]
+_EFFORTS: dict[str, Effort] = {level: level for level in get_args(Effort)}
+
+
+def parse_effort(value: str) -> Effort:
+    """Return `value` as an `Effort`, or raise `ValueError` on anything else.
+
+    An environment variable is a plain `str`, which `ty` rightly refuses where the
+    model wants the `Literal`. Parsing (rather than a cast or a `ty: ignore`, of which
+    this repo has none) also moves a typo's failure to import time: an unknown effort
+    would otherwise surface as a 400 on the first request, mid-turn.
+    """
+    try:
+        return _EFFORTS[value]
+    except KeyError:
+        raise ValueError(
+            f"unknown effort {value!r}; expected one of {', '.join(_EFFORTS)}"
+        ) from None
+
+
 # Set EXPLICITLY because Opus 5.5 moved the default down a level: it runs `medium`
 # when unset, where Opus 5 ran `high`. Swapping the model id alone would have quietly
 # made every research turn shallower. `high` keeps the depth the evals were measured
 # at, so a before/after sweep isolates the model change; move it only on eval evidence.
-EFFORT = "high"
+EFFORT: Effort = "high"
+
+# The `researcher` subagent's model and effort. Both default to the orchestrator's,
+# so leaving them unset changes nothing: these exist so Phase 3 of the upgrade plan
+# can sweep a cheaper researcher, not because any other setting has been measured.
+RESEARCHER_MODEL = os.environ.get("DEEP_RESEARCH_RESEARCHER_MODEL", MODEL_NAME)
+RESEARCHER_EFFORT = parse_effort(
+    os.environ.get("DEEP_RESEARCH_RESEARCHER_EFFORT", EFFORT)
+)
 # 64k, not 32k, because on Opus 5 `max_tokens` now has to cover the model's THINKING
 # as well as its answer — see the `thinking` note in `build_model`. `streaming=True`
 # is what makes a ceiling this high safe.
 MAX_TOKENS = int(os.environ.get("DEEP_RESEARCH_MAX_TOKENS", "64000"))
 
 
-def build_model() -> ChatAnthropic:
-    """Construct the Claude chat model used by the orchestrator and subagents.
+def build_model(*, model: str = MODEL_NAME, effort: Effort = EFFORT) -> ChatAnthropic:
+    """Construct a Claude chat model: the orchestrator's by default.
+
+    The `researcher` subagent calls this with `RESEARCHER_MODEL` / `RESEARCHER_EFFORT`.
+    Only the model id and effort vary between the two; everything below — streaming,
+    `max_tokens`, the `thinking` shape, no sampling params — holds for both, which is
+    why there is one constructor and not two.
 
     **`streaming=True` is what holds the `max_tokens` ceiling open, and it is not
     about the live feed.** It flips the *model's own HTTP request* to SSE
@@ -114,10 +151,10 @@ def build_model() -> ChatAnthropic:
     three lines are hard errors again.
     """
     return ChatAnthropic(
-        model=MODEL_NAME,
+        model=model,
         max_tokens=MAX_TOKENS,
         streaming=True,
-        effort=EFFORT,
+        effort=effort,
         # `display="summarized"` is REQUIRED, not cosmetic: Opus 5's default
         # ("omitted") returns thinking blocks with no `thinking` text, which then
         # cannot be replayed — and every tool result replays the assistant message

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
+from langchain_anthropic import ChatAnthropic
 
 from deep_research import config
 
@@ -37,6 +40,27 @@ class TestMissingKeys:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
         monkeypatch.setenv("TAVILY_API_KEY", "y")
         assert set(config.missing_keys()) == {"ANTHROPIC_API_KEY"}
+
+
+class TestParseEffort:
+    def test_every_effort_the_model_accepts_parses_to_itself(self) -> None:
+        for level in get_args(config.Effort):
+            assert config.parse_effort(level) == level
+
+    @pytest.mark.parametrize("bad", ["", "High", "hgh", " high", "none"])
+    def test_anything_else_raises_naming_the_value(self, bad: str) -> None:
+        # Strict on purpose: a near-miss must fail at import, not 400 mid-turn.
+        with pytest.raises(ValueError, match=repr(bad)):
+            config.parse_effort(bad)
+
+    def test_effort_matches_what_chatanthropic_accepts(self) -> None:
+        # `Effort` is a hand-copy of langchain's `Literal`, so compare by set equality
+        # against the installed field: a level added or removed upstream goes red here
+        # instead of being rejected (or silently unreachable) at runtime.
+        annotation = ChatAnthropic.model_fields["reasoning_effort"].annotation
+        upstream = {a for a in get_args(annotation) if a is not type(None)}
+        (literal,) = upstream
+        assert set(get_args(literal)) == set(get_args(config.Effort))
 
 
 class TestBuildModel:
