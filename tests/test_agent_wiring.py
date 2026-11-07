@@ -11,7 +11,7 @@ catches that class of failure cheaply.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 from unittest import mock
@@ -31,7 +31,7 @@ from deep_research.agent import (
 
 
 @contextmanager
-def _capture_calls(module: Any, attr: str) -> Iterator[list[dict[str, Any]]]:
+def _capture_calls(module: Any, attr: str) -> Generator[list[dict[str, Any]]]:
     """Replace `module.attr` with a pass-through spy; yield each call's kwargs.
 
     The assembly tests all need the same thing — swap a constructor

@@ -26,6 +26,7 @@ jobs:
   lint:
     name: Lint & type check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1  # exact patch, deliberately — see the note above
@@ -41,6 +42,7 @@ jobs:
   test:
     name: Tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

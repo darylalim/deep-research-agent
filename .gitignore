@@ -1,5 +1,7 @@
-# Secrets
+# Secrets: any env variant, but keep the committed template
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -9,12 +11,19 @@ __pycache__/
 .ruff_cache/
 .coverage
 
-# What `/export` writes by default (cli.py: `research-<thread>-<utc>.md`). These are the
-# user's reports, not source — and they land in the CWD, which is usually the repo root.
+# The name `streamlit_app.py` gives a downloaded report (`research-<thread>-<utc>.md`).
+# These are the user's reports, not source, and a browser can save them into the repo.
 research-*.md
 
 # uv / virtualenv
 .venv/
+
+# Build output (the project builds with hatchling)
+dist/
+build/
+
+# macOS
+.DS_Store
 
 # Local agent state (checkpoints + persistent memory)
 .deep_research/

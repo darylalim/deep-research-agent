@@ -7,7 +7,7 @@ are open, so callers run their whole session inside the `with` block.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -230,7 +230,7 @@ def build_agent(*, checkpointer: Any, store: Any) -> Any:
 
 
 @contextmanager
-def open_agent() -> Iterator[Any]:
+def open_agent() -> Generator[Any]:
     """Yield a fully wired deep research agent with disk-backed persistence.
 
     Usage:

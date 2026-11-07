@@ -12,14 +12,14 @@
 #   2. ty    — CI's `lint` job runs `ty check` alongside ruff, so leaving it out
 #              here meant a type error surfaced as a red GitHub Actions run rather
 #              than next to the file that caused it. Project-wide (ty has no useful
-#              single-file mode) and measured at 0.24s, so it runs on EVERY .py edit
-#              — including `evals/`, which CI type-checks but the pytest step below
-#              deliberately skips. Note that a DEAD
+#              single-file mode) and measured at 0.24s, so it runs on EVERY .py edit.
+#              Note that a DEAD
 #              `# ty: ignore` is itself a failure here (`unused-ignore-comment`),
 #              which is exactly the kind of error that otherwise only shows up in CI.
-#   3. pytest — for edits to deep_research/, tests/ or streamlit_app.py (the app
-#               itself, driven end to end by tests/test_streamlit_page.py), run the
-#               offline suite.
+#   3. pytest — for edits to deep_research/, evals/, tests/ or streamlit_app.py (the
+#               app itself, driven end to end by tests/test_streamlit_page.py), run the
+#               offline suite. `evals/` is here because tests/test_evals.py is the
+#               largest test file.
 #               ~5s, needs no keys and no network: conftest.py sets dummy keys and
 #               redirects DEEP_RESEARCH_STATE_DIR to a tempdir, and pyproject sets
 #               `addopts = -m 'not live'` so the paid `live` tests are deselected.
@@ -83,7 +83,7 @@ fi
 
 # --- 3. pytest: only for source/test edits ------------------------------------
 case "$rel" in
-  deep_research/*|tests/*|streamlit_app.py) ;;
+  deep_research/*|evals/*|tests/*|streamlit_app.py) ;;
   *) exit 0 ;;
 esac
 

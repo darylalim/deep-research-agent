@@ -94,25 +94,29 @@ _COMPLETED_RUN_KEYS = frozenset(
 )
 
 
-# The judge is Haiku, not the agent's own Opus 5, for two independent reasons:
-# grading is a cheap, high-volume classification task that does not need Opus, and
-# Opus 5 rejects `temperature` with a 400 — a judge wants `temperature=0`, so the
-# app's own `build_model()` is the wrong constructor to reuse here. (Opus 5 would
-# also think on every grade, which is pure cost for a classification call.)
-# This line used to carry the same `ty: ignore` as `config.py::build_model`, for the
-# same Pydantic-alias false positive; ty 0.0.63 fixed it and the now-dead directive was
-# itself a `ty check` failure. See that docstring — and the `ty>=0.0.63` dev floor it
-# explains, which this line depends on too.
+# The judge is Haiku, not the agent's own Opus, because grading is a cheap, high-volume
+# classification task that does not need Opus. `build_model()` is the wrong constructor
+# to reuse for the same reason: its effort and token ceiling are sized for a long report.
 #
-# `max_tokens` is 8192, and the number is load-bearing rather than generous. At 1024 a
-# grade could not always FIT: `_UncitedClaim` requires a verbatim quote of the nearest
-# citation plus a justification (~88 tokens an entry, so ~11 entries), and a
-# claim-dense report cited badly needs more than that. The failure was silent and
-# one-directional — see `_graded` for the mechanism, and note that the bias runs
-# *towards* a good score in exactly the regime the metric exists to detect. Output is
-# billed on tokens produced, never on the ceiling, so a ceiling clear of the worst case
-# costs nothing; the same argument as `config.MAX_TOKENS`, one layer down.
-JUDGE = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=8192)
+# No `temperature`, `top_p` or `top_k`. API version `2026-10-21` rejects all three on
+# every model, even at their defaults, and Haiku 5.5 rejects non-default sampling on any
+# version. So a judge can no longer be pinned to `temperature=0`, and grades vary from
+# run to run. Effort is the control instead. Do not disable thinking to save tokens.
+#
+# Thinking is on by default here and leaves `display` at `omitted`, which `config.py`
+# forbids for the agent. That rule exists because tool calls replay thinking blocks, and
+# a grade is one request that replays nothing, so it does not apply.
+#
+# `max_tokens` is load-bearing in both directions. Too low and a grade cannot FIT:
+# `_UncitedClaim` requires a verbatim quote of the nearest citation plus a justification
+# (~88 tokens an entry), thinking counts toward the same ceiling, and the failure is
+# silent and one-directional. See `_graded` for the mechanism, and note that the bias
+# runs *towards* a good score in exactly the regime the metric exists to detect. Output
+# is billed on tokens produced, never on the ceiling, so headroom is free. Too high is
+# the other trap: `JUDGE` does not stream, and above 21,333 a non-streaming request can
+# hang rather than fail (see `config.build_model`), so stay under it or set
+# `streaming=True`.
+JUDGE = ChatAnthropic(model="claude-haiku-5-5", effort="medium", max_tokens=16000)
 
 
 def _outputs(record: Any) -> dict[str, Any]:
@@ -565,8 +569,9 @@ def _coverage_score(total: int, missing: int) -> float:
     left it with no gradient and no way to show that a fix had helped. Measured: it
     returned 0 on 4 of 5 sweep examples while `response_cites_sources` passed 5 of 5.
 
-    Vacuously perfect when there is nothing to attribute; an answer that asserts
-    nothing is `answers_the_question`'s problem, not this one's.
+    Vacuously perfect when there is nothing to attribute, which is only arithmetic.
+    `claims_are_cited` does not let that reach a score: it returns a non-verdict first,
+    because a 1.0 would be averaged into the experiment mean as a perfect report.
 
     **But vacuous only when there is nothing MISSING either.** `total <= 0` used to
     return 1.0 unconditionally, so a grade reporting zero claims *while listing five
@@ -714,6 +719,11 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
     # the SCORE either way, so this is what keeps the COMMENT coherent: a contradictory
     # grade of 3 claims with 5 misses would otherwise print "-2/3 claims cited (0%)".
     total = max(grade.get("substantive_claims") or 0, len(uncited))
+    # No claims means nothing was measured, not that everything was cited. Measured on
+    # a stored refusal (search out of quota, nothing found): one repeat in three
+    # returned 0/0, which scored 1.0 beside 0.33 and 0.50 for the same text.
+    if total == 0:
+        return _not_measured("the judge found no substantive claims to grade")
     score = _coverage_score(total, len(uncited))
     cited = total - len(uncited)
     summary = "; ".join(item.get("claim", "?") for item in uncited[:5])
