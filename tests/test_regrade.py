@@ -209,11 +209,15 @@ def test_an_empty_experiment_is_refused(tmp_path: Path) -> None:
         regrade(_Reader([], []), "exp", out=tmp_path / "r.json", repeats=1)
 
 
-def test_the_default_metrics_are_the_two_judges(tmp_path: Path) -> None:
+def test_the_default_metrics_are_the_judges(tmp_path: Path) -> None:
     rows = stored_answers(
         _Reader([_run(1)], []), "exp", [e.__name__ for e in JUDGE_EVALUATORS]
     )
-    assert set(rows[0][1]["new"]) == {"claims_are_cited", "answers_the_question"}
+    assert set(rows[0][1]["new"]) == {
+        "claims_are_cited",
+        "answers_the_question",
+        "claims_are_supported",
+    }
 
 
 @pytest.mark.parametrize(

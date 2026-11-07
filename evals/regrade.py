@@ -116,7 +116,8 @@ def regrade(
     _save(report, out)
     print(
         f"{len(answers)} answer(s) x {len(metrics)} metric(s) x {repeats} repeat(s) = "
-        f"{len(answers) * len(metrics) * repeats} judge call(s); saving to {out}"
+        f"at most {len(answers) * len(metrics) * repeats} judge call(s), since a metric "
+        f"with nothing to read stops before calling; saving to {out}"
     )
 
     for number, (run, row) in enumerate(answers, start=1):

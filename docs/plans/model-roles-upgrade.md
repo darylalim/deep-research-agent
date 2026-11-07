@@ -180,9 +180,15 @@ have to work it out again.
     normaliser is tested both ways: spellings that must merge (trailing punctuation, scheme,
     `www.`, slash, fragment, `utm_*`, encoding, Wikipedia parentheses) and pages that must not
     (query, parent path, subdomain, port). Its comment separates URLs on a site a search reached
-    from URLs on no such site, for the hand read in step 6. **Still to do:** `claims_are_supported`,
-    then the `CLAUDE.md` evaluator list, deliberately left for *Finish this phase*. Steps 5 and 6
-    and the calibration labels are paid, so they wait for the quota (2026-12-01).
+    from URLs on no such site, for the hand read in step 6. **`claims_are_supported`** is done:
+    one judge call per run over up to 5 sampled claims, seeded by SHA-256 of the question (a
+    subprocess test under three `PYTHONHASHSEED`s pins it), with verdict ids matched one to one.
+    It also joins `--regrade`'s defaults. `CLAUDE.md` now has a *Citation truth* section.
+    **All offline work in Phase 2b is done.** Still to do, all paid and waiting for the quota
+    (2026-12-01): step 5's short run, step 6's hand read of flagged URLs, and the 15 to 20 claim and
+    source labels. Those labels need `--calibrate` support for `claims_are_supported`, which is
+    not built yet. Build it from real pairs once the run exists, rather than designing the label
+    format blind.
 - [ ] PR 3: `score=None` measured
 - [ ] PR 3: Phase 3 sweeps run and decision recorded
 - [ ] PR 3: Phase 3b memory example added

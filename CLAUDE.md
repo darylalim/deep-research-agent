@@ -1491,6 +1491,43 @@ old behaviour was never a designed property and could not be relied on; if you w
 cheap one specifically, the control is last, and there is no flag for picking an example
 by name.
 
+### Citation truth: `citations_are_real` and `claims_are_supported`
+
+`response_cites_sources` asks only whether a URL is present, and `claims_are_cited` only
+whether a claim has a citation nearby. Neither can tell a real source from an invented
+one, and a cheaper researcher (Phase 3) is exactly what might invent one. Two metrics
+close that, both reading `TurnRecorder`'s `search_results`: the `{url, title, content}`
+of every result a successful search returned, anywhere in the tree.
+
+- **`citations_are_real`** (code) scores the share of distinct cited URLs that some search
+  returned. Both sides go through `_normalise_url`, which can only *merge* spellings
+  (trailing punctuation, scheme, `www.`, slash, fragment, `utm_*`, percent-encoding, and
+  parentheses, because `URL` stops at `)`). It keeps every other query parameter.
+  Its tests run in both directions, and the riskier one is "different pages stay
+  different": over-merging fails silently, in the agent's favour. **It cannot see** a
+  retrieved URL that does not support its claim, or a genuine primary source cited from
+  the model's own knowledge, which scores as not retrieved. Its comment separates
+  unretrieved URLs on a site some search reached, usually the second case, from URLs on no
+  such site. Read those by hand before calling one fabricated.
+- **`claims_are_supported`** (judge) samples up to 5 cited sentences or table rows that
+  carry their own URL. They are found in code, and the sample is seeded from SHA-256 of
+  the question, never `hash()`, which is randomised per process. Each claim goes to the
+  judge with its URLs' retrieved text for a `supported` / `contradicted` / `cannot_tell`
+  verdict, quoted evidence first. The score is supported ÷ (supported + contradicted).
+  `cannot_tell` is excluded and counted, because a snippet that does not mention a claim
+  is not evidence that it is false. **It cannot see** claims outside its sample, or claims
+  covered only by a citation elsewhere in their paragraph or below their table: those
+  units carry no URL, and `claims_are_cited` grades that inheritance. A claim whose URLs
+  no search returned is skipped and counted, because that is `citations_are_real`'s
+  finding.
+
+Both follow the non-verdict rules below. A row with no `search_results` (every
+experiment before 2026-11-07), a response with no URLs, an all-`cannot_tell` sample, and
+a grade whose verdict ids do not match the numbered claims one to one are all "not
+measured", never a vacuous 1. `--regrade` includes `claims_are_supported`, but on old
+experiments it stops before calling the judge. The 85% calibration bar for it waits on
+human labels from the Phase 2b short run.
+
 ### When the INSTRUMENT is broken, every metric reads fine
 
 Everything above this heading is about catching the agent misbehaving. This section is

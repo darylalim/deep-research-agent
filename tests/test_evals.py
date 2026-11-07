@@ -14,8 +14,11 @@ Everything here runs without keys or network.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 import pytest
@@ -32,12 +35,16 @@ from evals.evaluators import (
     ALL_EVALUATORS,
     CODE_EVALUATORS,
     UNCLEAN_STOPS,
+    _cited_units,
+    _claims_with_sources,
     _coverage_score,
     _normalise_url,
+    _sample_claims,
     answers_the_question,
     checks_memory_first,
     citations_are_real,
     claims_are_cited,
+    claims_are_supported,
     delegates_breadth,
     mutations_require_approval,
     persists_findings,
@@ -1559,3 +1566,179 @@ class TestCitationsAreReal:
         recorder.absorb(SUBAGENT, _updates("tools", message))
         outputs = {**recorder.actions(), RESPONSE_KEY: "See https://x.example/a."}
         assert citations_are_real({"outputs": outputs}, {})["score"] == 1.0
+
+
+class _RecordingJudge(_StubJudge):
+    """A `_StubJudge` that also keeps the prompt it was sent."""
+
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload)
+        self.prompts: list[str] = []
+
+    def invoke(self, messages: Any) -> dict:
+        self.prompts.append(messages[0]["content"])
+        return super().invoke(messages)
+
+
+class TestClaimsAreSupported:
+    """Cited claims checked against the text their sources' searches returned."""
+
+    REPORT = (
+        "## Limits\n"
+        "Tier 1 allows 50 RPM per [the docs](https://x.example/limits). "
+        "Batch jobs finish within 24 hours (https://x.example/batch). "
+        "This sentence has no source.\n"
+        "| Tier | RPM |\n"
+        "|---|---|\n"
+        "| Tier 2 limit is 1000 RPM | https://x.example/limits |\n"
+        "- [Anthropic docs](https://x.example/limits)\n"
+        "A ghost claim about pricing is here https://nowhere.example/ghost.\n"
+    )
+    HITS: ClassVar[list[dict[str, str]]] = [
+        {"url": "https://x.example/limits", "title": "", "content": "Tier 1: 50 RPM."},
+        {
+            "url": "https://x.example/limits/",
+            "title": "",
+            "content": "Tier 2: 1000 RPM.",
+        },
+        {
+            "url": "https://x.example/batch",
+            "title": "",
+            "content": "Most batches end in 1 hour.",
+        },
+    ]
+
+    def _run(self) -> dict:
+        return {"outputs": {RESPONSE_KEY: self.REPORT, "search_results": self.HITS}}
+
+    @staticmethod
+    def _grade(*verdicts: str) -> dict:
+        return {
+            "verdicts": [
+                {"claim_id": i, "evidence": "q", "reasoning": "r", "verdict": v}
+                for i, v in enumerate(verdicts, start=1)
+            ]
+        }
+
+    def test_units_are_cited_sentences_and_rows_but_not_source_lists(self):
+        units = _cited_units(self.REPORT)
+        assert units == [
+            "Tier 1 allows 50 RPM per [the docs](https://x.example/limits).",
+            "Batch jobs finish within 24 hours (https://x.example/batch).",
+            "| Tier 2 limit is 1000 RPM | https://x.example/limits |",
+            "A ghost claim about pricing is here https://nowhere.example/ghost.",
+        ]
+
+    def test_each_claim_gets_its_own_sources_text_and_unretrieved_ones_are_counted(
+        self,
+    ):
+        pairs, skipped = _claims_with_sources(self.REPORT, self.HITS)
+        # Both spellings of /limits normalise together, so both snippets come along.
+        assert pairs[0][1] == "Tier 1: 50 RPM.\n\nTier 2: 1000 RPM."
+        assert pairs[1][1] == "Most batches end in 1 hour."
+        assert len(pairs) == 3
+        assert skipped == 1  # the ghost URL, which citations_are_real reports
+
+    def test_the_sample_is_capped_ordered_and_seeded_by_the_question(self):
+        pairs = [(f"claim {i}", "s") for i in range(20)]
+        first = _sample_claims(pairs, "question A")
+        assert len(first) == 5
+        assert first == sorted(first, key=lambda p: int(p[0].split()[1]))
+        assert first == _sample_claims(pairs, "question A")
+        assert _sample_claims(pairs[:3], "question A") == pairs[:3]
+
+    def test_the_sample_does_not_change_between_processes(self):
+        # The property `hash()` would break: Python randomises string hashes per
+        # process, so a regrade would silently grade different claims.
+        code = (
+            "from evals.evaluators import _sample_claims;"
+            "print([c for c, _ in _sample_claims("
+            "[(f'c{i}', 's') for i in range(20)], 'q')])"
+        )
+        picked = {
+            subprocess.run(
+                [sys.executable, "-c", code],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for seed in ("1", "2", "3")
+        }
+        assert len(picked) == 1, picked
+
+    def test_scores_supported_over_supported_plus_contradicted(self, monkeypatch):
+        judge = _RecordingJudge(
+            _judge_reply(self._grade("supported", "contradicted", "cannot_tell"))
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", judge)
+        result = claims_are_supported(self._run(), {"inputs": {"question": "limits?"}})
+        assert result["score"] == pytest.approx(1 / 2)  # cannot_tell is excluded
+        assert "1 supported, 1 contradicted, 1 cannot tell" in result["comment"]
+        assert "1 cited claim(s) had no retrieved text" in result["comment"]
+        assert "Contradicted: Batch jobs finish within 24 hours" in result["comment"]
+
+    def test_the_judge_is_shown_each_claim_with_its_source_text(self, monkeypatch):
+        # Without this, a prompt that dropped the SOURCE TEXT would have the judge
+        # grading from its own knowledge, and every scoring test would still pass.
+        judge = _RecordingJudge(
+            _judge_reply(self._grade("supported", "supported", "supported"))
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", judge)
+        claims_are_supported(self._run(), {"inputs": {"question": "limits?"}})
+        (prompt,) = judge.prompts
+        assert "CLAIM 2:\nBatch jobs finish within 24 hours" in prompt
+        assert "SOURCE TEXT 2:\nMost batches end in 1 hour." in prompt
+        assert "limits?" in prompt
+        assert "nowhere.example" not in prompt  # skipped, not graded
+
+    def test_all_cannot_tell_measures_nothing(self, monkeypatch):
+        reply = _judge_reply(self._grade("cannot_tell", "cannot_tell", "cannot_tell"))
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        result = claims_are_supported(self._run(), {})
+        assert result["score"] is None
+        assert "measures nothing" in result["comment"]
+
+    @pytest.mark.parametrize(
+        "ids",
+        [[1, 2], [1, 2, 2], [1, 2, 3, 4], [0, 1, 2]],
+        ids=["missing", "duplicated", "extra", "off-by-one"],
+    )
+    def test_verdicts_that_do_not_match_the_sample_are_refused(self, monkeypatch, ids):
+        grade = {
+            "verdicts": [
+                {
+                    "claim_id": i,
+                    "evidence": "q",
+                    "reasoning": "r",
+                    "verdict": "supported",
+                }
+                for i in ids
+            ]
+        }
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(_judge_reply(grade)))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_an_unrecognised_verdict_is_refused(self, monkeypatch):
+        reply = _judge_reply(self._grade("supported", "probably", "supported"))
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_a_truncated_grade_is_refused(self, monkeypatch):
+        reply = _judge_reply(
+            self._grade("supported", "supported", "supported"), "max_tokens"
+        )
+        monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
+        assert claims_are_supported(self._run(), {})["score"] is None
+
+    def test_nothing_checkable_is_not_measured_and_calls_no_judge(self, monkeypatch):
+        monkeypatch.setattr("evals.evaluators.JUDGE", None)  # any call would raise
+        run = {
+            "outputs": {
+                RESPONSE_KEY: "Only https://nowhere.example/ghost here, sadly.",
+                "search_results": self.HITS,
+            }
+        }
+        assert claims_are_supported(run, {})["score"] is None
+        no_results = {"outputs": {RESPONSE_KEY: self.REPORT}}
+        assert claims_are_supported(no_results, {})["score"] is None
