@@ -1570,7 +1570,15 @@ not being enforced for the evaluators themselves.
   model's own memory. A run whose every `tavily_search` came back `status="error"`
   scored a clean 1. Failures are now recorded separately and subtracted there, leaving
   the trajectory ordering the two `_first_research_index` evaluators depend on
-  untouched.
+  untouched. **That fix covered only half the failures, and the other half look like
+  successes.** `TavilySearch._run` raises only for an empty result set. Every other
+  API error it *returns* as `{"error": exc}`, which `json.dumps` cannot encode, so the
+  message arrives with `status="success"` and a Python repr for content. This was
+  measured through the real tool. A run whose every search hit an HTTP error still
+  scored 1. `harness._search_hits` now returns `None` for content that is not a result
+  set, and `TurnRecorder` records that as a failure too. Status alone is not a reliable
+  failure signal for this tool. Test fixtures must use real result-set JSON (`HITS` in
+  `test_evals.py`) for a search that is meant to have worked.
 - **Nothing graded WHY a turn ended, so the API's fault read as the agent's.** A
   refusal, a context-window overrun or a `max_tokens` truncation all reach the
   evaluators as nothing but a thin `response` — both judges score 0.0,

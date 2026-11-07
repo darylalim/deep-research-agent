@@ -99,8 +99,9 @@ RESPONSE_KEY = "response"
 SEARCH_TOOL = "tavily_search"
 
 
-def _search_hits(content: Any) -> list[dict[str, str]]:
-    """The `{url, title, content}` of each result in one `tavily_search` ToolMessage.
+def _search_hits(content: Any) -> list[dict[str, str]] | None:
+    """The `{url, title, content}` of each result in one `tavily_search` ToolMessage,
+    or `None` when the message is not a result set at all — i.e. the search FAILED.
 
     Read off the installed `langchain_tavily` and checked against a stored trace: a
     successful search's `content` is `json.dumps` of the API response, whose `results`
@@ -111,19 +112,26 @@ def _search_hits(content: Any) -> list[dict[str, str]]:
     other failure it RETURNS as `{"error": <Exception>}` — which `json.dumps` cannot
     encode, so langchain falls back to `str()` and the message arrives with
     `status="success"` and a Python repr for content. Measured. So unparsable content,
-    an `error` key, or a result with no string `url` are all "no evidence", which is the
-    honest reading: `citations_are_real` then cannot credit a URL nothing returned.
+    a non-dict, an `error` key or a missing `results` list return `None`: the caller
+    records that as a FAILED search, which `searched_the_web` subtracts — without it, a
+    run whose every search hit an HTTP error scored a clean 1 on "did it research". A
+    result with no string `url` is merely skipped, so `citations_are_real` cannot credit
+    a URL nothing returned.
     """
     if not isinstance(content, str):
-        return []
+        return None
     try:
         payload = json.loads(content)
     except ValueError:
-        return []
-    if not isinstance(payload, dict) or "error" in payload:
-        return []
+        return None
+    if (
+        not isinstance(payload, dict)
+        or "error" in payload
+        or not isinstance(payload.get("results"), list)
+    ):
+        return None
     hits: list[dict[str, str]] = []
-    for result in payload.get("results") or []:
+    for result in payload["results"]:
         if not isinstance(result, dict) or not isinstance(result.get("url"), str):
             continue
         hits.append(
@@ -301,12 +309,19 @@ class TurnRecorder:
                 return
             # WHAT THE SEARCH RETURNED, from anywhere in the tree — a researcher's search
             # is where nearly every cited URL comes from. Inherits the `tool_call_id`
-            # dedupe above, so a replayed result is not recorded twice, and the error
-            # return just above, so a failed search contributes nothing.
+            # dedupe above, so a replayed result is not recorded twice.
+            #
+            # And a SECOND kind of failure, which the status check above cannot see:
+            # Tavily returns most API errors as `{"error": exc}`, which reaches the
+            # stream as `status="success"` with a Python repr for content (measured —
+            # see `_search_hits`). It is a failed search all the same, and recording it
+            # as one is what keeps `searched_the_web` from scoring it as research.
             if name == SEARCH_TOOL:
-                self.search_results.extend(
-                    _search_hits(getattr(message, "content", None))
-                )
+                hits = _search_hits(getattr(message, "content", None))
+                if hits is None:
+                    self.failed_tools.append(name)
+                else:
+                    self.search_results.extend(hits)
             return
 
         if kind == "ai":

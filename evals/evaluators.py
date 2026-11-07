@@ -340,7 +340,9 @@ def searched_the_web(run: Any, example: Any) -> dict[str, Any]:
     whether the agent researched or answered out of the model's own memory, and a run
     whose every `tavily_search` came back `status="error"` answered out of memory while
     scoring a clean 1. So the failures are subtracted here rather than hidden at the
-    source. The three counts are reported side by side and NOT as subsets of one
+    source. "Failed" includes a search reported as `status="success"` whose content is
+    not a result set — Tavily's own shape for most API errors — which `TurnRecorder`
+    classifies, since only it sees the content. The three counts are reported side by side and NOT as subsets of one
     another: which namespace a failure happened in is not recorded, so "N of them
     inside a subagent" would be arithmetic nobody can check.
     """

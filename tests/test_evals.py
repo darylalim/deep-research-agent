@@ -87,6 +87,12 @@ def test_the_evals_mutation_list_covers_every_gated_tool() -> None:
 ORCHESTRATOR: tuple[str, ...] = ()
 # What a subagent's subgraph namespace actually looks like (measured).
 SUBAGENT: tuple[str, ...] = ("tools:9d0c2f4e",)
+# A successful search's content: `json.dumps` of a Tavily result set. Placeholder text
+# like "hits" would now (correctly) be recorded as a FAILED search, so every positive
+# control that means "this search worked" has to look like one that did.
+HITS = json.dumps(
+    {"results": [{"url": "https://a.example/x", "title": "t", "content": "c"}]}
+)
 
 
 def _updates(node: str, *messages: object) -> dict:
@@ -109,11 +115,11 @@ def test_recorder_sees_searches_that_the_returned_state_cannot():
     )
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="2", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="2", name="tavily_search")),
     )
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="3", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="3", name="tavily_search")),
     )
     recorder.absorb(
         ORCHESTRATOR,
@@ -634,9 +640,11 @@ def test_a_subagents_bookkeeping_does_not_earn_the_orchestrator_a_pass():
     recorder = TurnRecorder()
     # The orchestrator delegates immediately — no plan, no memory check.
     # Inside the subagent: its own todos, its own ls, its own /memories/ write.
-    for tool in ("write_todos", "ls", "tavily_search"):
+    # The search's content is a real result set: the subagent's search WORKED.
+    for tool, content in (("write_todos", "x"), ("ls", "x"), ("tavily_search", HITS)):
         recorder.absorb(
-            SUBAGENT, _updates("tools", ToolMessage("x", tool_call_id=tool, name=tool))
+            SUBAGENT,
+            _updates("tools", ToolMessage(content, tool_call_id=tool, name=tool)),
         )
     recorder.absorb(
         SUBAGENT,
@@ -896,7 +904,7 @@ def test_searches_that_all_failed_are_not_evidence_that_it_researched():
     # Positive control: one search that actually returned is enough.
     recorder.absorb(
         SUBAGENT,
-        _updates("tools", ToolMessage("hits", tool_call_id="s2", name="tavily_search")),
+        _updates("tools", ToolMessage(HITS, tool_call_id="s2", name="tavily_search")),
     )
     assert searched_the_web({"outputs": recorder.actions()}, {})["score"] == 1
 
@@ -1381,7 +1389,13 @@ class TestSearchResults:
         assert message.status == "success"
         recorder = TurnRecorder()
         recorder.absorb(SUBAGENT, _updates("tools", message))
-        assert recorder.actions()["search_results"] == []
+        outputs = recorder.actions()
+        assert outputs["search_results"] == []
+        # …and it is a FAILED search, not research. Before this, a run whose every
+        # search hit an API error scored 1 on `searched_the_web`.
+        assert outputs["trajectory"] == [SEARCH_TOOL]
+        assert outputs["failed_tools"] == [SEARCH_TOOL]
+        assert searched_the_web({"outputs": outputs}, {})["score"] == 0
 
     def test_a_json_error_payload_records_nothing(self):
         recorder = TurnRecorder()
@@ -1395,6 +1409,17 @@ class TestSearchResults:
             ),
         )
         assert recorder.actions()["search_results"] == []
+        assert recorder.actions()["failed_tools"] == [SEARCH_TOOL]
+
+    def test_a_real_search_is_not_recorded_as_failed(self):
+        # The positive control for the two above: without it, recording EVERY search
+        # as failed would pass them both.
+        recorder = TurnRecorder()
+        message = self._search("s1", returns=self._response("https://a.example/x"))
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        outputs = recorder.actions()
+        assert outputs["failed_tools"] == []
+        assert searched_the_web({"outputs": outputs}, {})["score"] == 1
 
     def test_a_result_without_a_string_url_is_skipped(self):
         response = self._response("https://a.example/x")
