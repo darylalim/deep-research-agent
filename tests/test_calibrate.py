@@ -88,6 +88,34 @@ def test_every_label_is_one_the_tally_understands():
                     {"claims_are_cited": "cited"}.get(kind, "answered"),
                 }
                 assert item["label"] in allowed, item
+                assert item.get("adjudicated", item["label"]) in allowed, item
+
+
+def test_an_adjudicated_label_is_scored_only_when_asked_for(tmp_path):
+    """The blind score must stay the default: it is the one nobody could steer."""
+    report = _report(CLAIMS)
+    report["claims"][0]["adjudicated"] = "uncited"  # c1: blind "cited"
+    result = cal.calibrate(
+        [report],
+        out=tmp_path / "out.json",
+        repeats=1,
+        graders_by_metric={"claims_are_cited": flagging([CLAIMS[0][1], CLAIMS[1][1]])},
+    )
+    blind = cal.tally(result, [report], "claims_are_cited")
+    adjudicated = cal.tally(result, [report], "claims_are_cited", "adjudicated")
+    assert blind["false_accusations"] == ["c1"]
+    assert adjudicated["false_accusations"] == []
+    assert (blind["agree"], adjudicated["agree"]) == (2, 3)
+    text = "\n".join(cal.summary(result, [report]))
+    assert "(blind labels)" in text and "(adjudicated labels)" in text
+
+
+def test_the_blind_label_is_never_overwritten_in_the_file():
+    for report in cal.load():
+        for item in report["claims"]:
+            if "adjudicated" in item:
+                assert item["adjudicated"] != item["label"], item["id"]
+                assert item.get("adjudication_note"), item["id"]
 
 
 # --- matching ------------------------------------------------------------------

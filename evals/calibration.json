@@ -1,5 +1,5 @@
 {
-  "description": "Human labels for calibrating the citation and answer judges. Labelled by the project owner on 2026-11-07, without seeing any judge verdict, under the attribution rule the claims_are_cited prompt states. Each claim is a verbatim substring that occurs exactly once in its report.",
+  "description": "Human labels for calibrating the citation and answer judges. Labelled by the project owner on 2026-11-07, without seeing any judge verdict, under the attribution rule the claims_are_cited prompt states. Each claim is a verbatim substring that occurs exactly once in its report. `label` is always the blind label. `adjudicated`, where present, was set after the first calibration run (2026-11-07) and is never blind; report it beside the blind score.",
   "reports": [
     {
       "experiment": "sweep-e92a5920",
@@ -109,22 +109,30 @@
         {
           "id": "c13",
           "claim": "Hitting the cap pauses API usage until 00:00 UTC on the 1st of the next month.",
-          "label": "cited"
+          "label": "cited",
+          "adjudicated": "uncited",
+          "adjudication_note": "Revised by the owner on 2026-11-07 after seeing the judge's reasons: under the strict rule, a citation covers only the unit it closes, so a sentence after a paragraph's last citation, or a bullet with no link of its own, is uncited."
         },
         {
           "id": "c14",
           "claim": "Orgs on Claude Platform on AWS are pinned to Start and do not move automatically.",
-          "label": "cited"
+          "label": "cited",
+          "adjudicated": "uncited",
+          "adjudication_note": "Revised by the owner on 2026-11-07 after seeing the judge's reasons: under the strict rule, a citation covers only the unit it closes, so a sentence after a paragraph's last citation, or a bullet with no link of its own, is uncited."
         },
         {
           "id": "c15",
           "claim": "Cached tokens are also billed at 10% of base input price.",
-          "label": "cited"
+          "label": "cited",
+          "adjudicated": "uncited",
+          "adjudication_note": "Revised by the owner on 2026-11-07 after seeing the judge's reasons: under the strict rule, a citation covers only the unit it closes, so a sentence after a paragraph's last citation, or a bullet with no link of its own, is uncited."
         },
         {
           "id": "c16",
           "claim": "the spend-cap variant has **no `retry-after`** and returns `error.details.error_code = enforced_spend_limit_reached`",
-          "label": "cited"
+          "label": "cited",
+          "adjudicated": "uncited",
+          "adjudication_note": "Revised by the owner on 2026-11-07 after seeing the judge's reasons: under the strict rule, a citation covers only the unit it closes, so a sentence after a paragraph's last citation, or a bullet with no link of its own, is uncited."
         },
         {
           "id": "c17",

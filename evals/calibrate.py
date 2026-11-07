@@ -190,8 +190,23 @@ def calibrate(
     return result
 
 
+def label_of(item: dict[str, Any], labels: str) -> str:
+    """The item's blind label, or its adjudicated one when asked for and present.
+
+    `label` is what the owner chose without seeing any verdict, and it never changes.
+    `adjudicated` is set only where the owner revised a label AFTER seeing the judge's
+    reasons, so a score on it is not blind and is always reported beside the blind one.
+    """
+    if labels == "adjudicated":
+        return item.get("adjudicated", item["label"])
+    return item["label"]
+
+
 def tally(
-    result: dict[str, Any], reports: Sequence[dict[str, Any]], metric: str
+    result: dict[str, Any],
+    reports: Sequence[dict[str, Any]],
+    metric: str,
+    labels: str = "blind",
 ) -> dict[str, Any]:
     """Counts for one metric, pooled over every graded round.
 
@@ -218,7 +233,7 @@ def tally(
         counts["unmatched"].extend(f["flag"] for f in rnd["flags"] if not f["matched"])
         tallies = per_repeat.setdefault(rnd["repeat"], [0, 0])
         for item in reports[rnd["report"]][spec["labelled"]]:
-            should_flag = item["label"] == spec["flag_means"]
+            should_flag = label_of(item, labels) == spec["flag_means"]
             tallies[1] += 1
             if (item["id"] in flagged) == should_flag:
                 counts["agree"] += 1
@@ -246,26 +261,47 @@ def verdict(counts: dict[str, Any]) -> str:
 
 
 def summary(result: dict[str, Any], reports: Sequence[dict[str, Any]]) -> list[str]:
+    """Blind figures for every metric, then adjudicated ones wherever a label was revised."""
     lines: list[str] = []
+    revised = {
+        metric
+        for metric, spec in METRICS.items()
+        for report in reports
+        for item in report[spec["labelled"]]
+        if "adjudicated" in item
+    }
     for metric, spec in METRICS.items():
         if not any(rnd["metric"] == metric for rnd in result["rounds"]):
             continue
-        counts = tally(result, reports, metric)
-        shown = "n/a" if counts["agreement"] is None else f"{counts['agreement']:.0%}"
-        lines.append(
-            f"{metric}: agreement {counts['agree']}/{counts['compared']} ({shown}); "
-            f"per repeat {counts['per_repeat']}; {counts['not_measured']} round(s) not measured"
-        )
-        lines.append(
-            f"  false accusations (flagged, labelled not {spec['flag_means']}): "
-            f"{len(counts['false_accusations'])} {sorted(counts['false_accusations'])}"
-        )
-        lines.append(
-            f"  misses (labelled {spec['flag_means']}, not flagged): "
-            f"{len(counts['misses'])} {sorted(counts['misses'])}"
-        )
-        lines.append(f"  flags matching no labelled item: {len(counts['unmatched'])}")
-        lines.extend(f"    - {flag[:110]}" for flag in counts["unmatched"])
-        if metric == "claims_are_cited":
-            lines.append(f"  verdict at {PASS_AGREEMENT:.0%}: {verdict(counts)}")
+        for labels in ("blind", "adjudicated") if metric in revised else ("blind",):
+            lines.extend(_metric_lines(result, reports, metric, spec, labels))
+    return lines
+
+
+def _metric_lines(
+    result: dict[str, Any],
+    reports: Sequence[dict[str, Any]],
+    metric: str,
+    spec: dict[str, str],
+    labels: str,
+) -> list[str]:
+    lines: list[str] = []
+    counts = tally(result, reports, metric, labels)
+    shown = "n/a" if counts["agreement"] is None else f"{counts['agreement']:.0%}"
+    lines.append(
+        f"{metric} ({labels} labels): agreement {counts['agree']}/{counts['compared']} ({shown}); "
+        f"per repeat {counts['per_repeat']}; {counts['not_measured']} round(s) not measured"
+    )
+    lines.append(
+        f"  false accusations (flagged, labelled not {spec['flag_means']}): "
+        f"{len(counts['false_accusations'])} {sorted(counts['false_accusations'])}"
+    )
+    lines.append(
+        f"  misses (labelled {spec['flag_means']}, not flagged): "
+        f"{len(counts['misses'])} {sorted(counts['misses'])}"
+    )
+    lines.append(f"  flags matching no labelled item: {len(counts['unmatched'])}")
+    lines.extend(f"    - {flag[:110]}" for flag in counts["unmatched"])
+    if metric == "claims_are_cited":
+        lines.append(f"  verdict at {PASS_AGREEMENT:.0%}: {verdict(counts)}")
     return lines

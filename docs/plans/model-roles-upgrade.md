@@ -3,7 +3,7 @@
 **PR 1 (Phases 0 and 1) is merged to `main` and released as v0.4.0.** Start each later PR on its
 own branch from `main`; PR 2's is `upgrade/pr-2`.
 
-Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is next, on `upgrade/pr-2`; it starts with judge calibration. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is in progress on `upgrade/pr-2`; judge calibration passed, and Phase 2 is next. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -149,14 +149,18 @@ have to work it out again.
   - Follow-up, 2026-11-07: the account predates enforcement, so step 7 was re-checked
     with the opt-in check. Zero breaks across 34 captured requests; see `CLAUDE.md`. No
     harness change is needed.
-- [ ] PR 2: Judge calibrated. Steps 1 to 3 done on 2026-11-07: `evals/calibration.json` holds
-  25 claims (19 cited, 6 uncited) and 5 question parts (all answered) from 6 stored reports
-  across all 5 questions, labelled by the user blind to the judge. Next is step 4,
-  `--calibrate`. Two things to settle there. The judge's `claim` field may be "closely
-  paraphrased", so exact matching will miss some flags; use containment or overlap, and print
-  what goes unmatched. With no unanswered part, the answer judge can show only false
-  accusations, not misses. LangSmith's trace quota resets 2026-12-01, and `--calibrate` must
-  not depend on it.
+- [x] PR 2: Judge calibrated, 2026-11-07. `evals/calibration.json` holds 25 claims and 5
+  question parts from 6 stored reports, labelled blind by the user. `--calibrate` (3 repeats,
+  30 Haiku calls) scored the citation judge at **55/75 (73%) blind: FAIL**. The output
+  schema was working: 6 of the 8 disagreements recurred in every repeat with coherent
+  reasons, and the split was over the rule. The user chose the strict reading (a citation
+  covers only the unit it closes) and revised c13 to c16 to uncited, stored as `adjudicated`.
+  On those, the judge scores **67/75 (89%): PASS**, at 22, 22 and 23 of 25 per repeat. Known
+  bias: the judge is lenient on lead-in citations and on bullets under a table (c08 and c22),
+  so sweep citation scores read about 2 claims in 25 high. The answer judge flagged p03 in
+  all three repeats, so it scored 12/15. It has no bar, and with no part labelled unanswered
+  it can show only false accusations. Run saved at
+  `~/deep-research-regrades/calibration-20261107T191649Z.json`.
 - [ ] PR 2: Phase 2 researcher settings
 - [ ] PR 2: Phase 2b metrics added and calibrated
 - [ ] PR 3: `score=None` measured

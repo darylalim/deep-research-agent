@@ -1212,6 +1212,20 @@ assumes otherwise:
   say…"), which the agent states without a link. Across repeats a score moved by 0.07 at
   most, and `answers_the_question` did not move at all. This check was done by a model,
   not a person, so it does not replace calibration against human labels.
+  **Human calibration followed the same day** (`python -m evals --calibrate`, labels in
+  `evals/calibration.json`). Blind, the judge agreed with the owner on **55 of 75**
+  comparisons (25 claims x 3 repeats, 73%), short of the preset 85% bar. It was not erratic:
+  6 of the 8 disagreements recurred in all three repeats, each with a coherent quoted reason.
+  The split was over the RULE, which never said what covers a sentence that comes after a
+  paragraph's last citation. The owner chose the strict reading: **a citation covers only
+  the unit it closes**, so such a sentence, or a bullet with no link of its own, is uncited.
+  Four labels were revised to it, after the verdicts had been seen, and stored as
+  `adjudicated` beside the blind `label`. On those, the judge scores **67 of 75 (89%)** and
+  passes. Always quote both figures. The residual bias runs one way: the judge is slightly
+  *lenient* on a lead-in citation over sub-bullets, and on bullets directly below a table
+  standing in for a source line (c08 and c22, missed in all three repeats). So sweep
+  citation scores read about 2 claims in 25 high. Do not tune the prompt to these 25 claims
+  to close that gap. Proving a prompt change helps needs fresh claims labelled blind.
 
 - **An experiment's `run_stats.token_count` is agent-only — the judges' tokens are filed
   somewhere else entirely.** `langsmith/evaluation/_runner.py` wraps every evaluator in a
