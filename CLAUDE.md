@@ -911,9 +911,27 @@ the turn after an abandoned approval. The test: a turn whose two researchers bot
 reached a `write_file` approval, "Abandon this turn" was clicked, and a new question was
 sent on the same thread. It answered, with no 400. The checkpoint showed the patch's three
 synthetic `status=error` replies to the dangling calls, and every thinking block, including
-the abandoned message's, still carried its summarized text. The enforcement applies to
-accounts created on or after 2026-08-31. Account age for this run: not recorded, so if the
-account is older, this pass proves less.
+the abandoned message's, still carried its summarized text.
+
+**That live pass proved little on its own.** The account predates 2026-08-31, so the check
+was not enforced and the turn could not have failed. **The opt-in check is what settles
+it:** setting `prefix_mismatch_behavior` runs the check on any account. The method came
+from `/claude-api preserved-thinking-migration`. A three-request self-test confirmed the
+check catches an edited first message. Then every `/v1/messages` body from the same three
+turns was captured at the HTTP layer, by wrapping `anthropic`'s `_build_request`: 10
+orchestrator requests and 27 from two researchers. Two instruments agreed:
+`prefix_diff.py` matched every consecutive pair, and the free `count_tokens` endpoint in
+`error` mode returned 200 on all 34 requests that replay thinking, at up to 13 replayed
+blocks per request. **Zero breaks.** Both suspected edits are append-only on the wire.
+`PatchToolCallsMiddleware`'s delete-and-re-add leaves the abandoned assistant turn
+byte-identical, with the error replies and the new question after it. langchain's
+re-serialization of history loaded from the checkpoint matched byte for byte, including
+`tool_use.input`. Not covered: compaction at 85% of the 1M window, which never fired,
+though deepagents strips the kept turns' thinking (`_drop_bound_reasoning`, the documented
+recipe), and its old-argument truncation, which fires alongside it and is unverified. The
+*Edit*, *Reject* and *Respond* decisions were not exercised either. Re-run the capture and
+`count_tokens` pass after any deepagents or langchain-anthropic upgrade. It costs about
+the price of one turn.
 
 **A related shape change worth knowing about `_text_of`.** Once thinking is on, an
 assistant message's `content` is a *mixed* list: `["", {…thinking…}, "the answer"]` —

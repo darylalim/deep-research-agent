@@ -1,10 +1,9 @@
 # Upgrade plan: dependencies, models, evals and interface
 
-**Work on the `upgrade/phase-0` branch.** The dependency upgrade and this plan are committed there
-and have not been pushed. `main` does not have them, so check out that branch before starting. Do
-not merge it alone: Phase 0 ships with Phase 1.
+**PR 1 (Phases 0 and 1) is merged to `main` and released as v0.4.0.** Start each later PR on its
+own branch from `main`; PR 2's is `upgrade/pr-2`.
 
-Status: PR 1 in progress. All checks passed; only Release 0.4.0 remains. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is next, on `upgrade/pr-2`; it starts with judge calibration. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -143,7 +142,13 @@ have to work it out again.
     The app's tracing (on in `.env`) also spends the same quota.
   - Display quirk, not fixed: after an abandoned turn, its question and the next one render
     in a single user bubble, because the abandoned turn left no assistant text between them.
-- [ ] PR 1: Release 0.4.0 published and note added
+- [x] PR 1: Release 0.4.0 published and note added. PR #2 merged as `4aea065` on
+  2026-11-07, and the tag points there. The release body opens with a *Compatibility*
+  section: API version `2026-10-21`, the bearer-auth change, resolved versions, the
+  `streamlit>=1.67` floor, and the judge-shift warning.
+  - Follow-up, 2026-11-07: the account predates enforcement, so step 7 was re-checked
+    with the opt-in check. Zero breaks across 34 captured requests; see `CLAUDE.md`. No
+    harness change is needed.
 - [ ] PR 2: Judge calibrated
 - [ ] PR 2: Phase 2 researcher settings
 - [ ] PR 2: Phase 2b metrics added and calibrated
