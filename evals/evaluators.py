@@ -663,21 +663,14 @@ def _graded(
     return grade, ""
 
 
-def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
-    """Judge: what share of the answer's substantive claims carry a source?
+def grade_citations(question: str, prose: str) -> tuple[dict[str, Any] | None, str]:
+    """The citation judge's raw grade of `prose`, or `None` and why it has none.
 
-    Claim-level, where `response_cites_sources` is only URL-presence: an answer can
-    carry one link and still assert six unsourced facts around it. Scored as a
-    proportion — see `_coverage_score` for why that is load-bearing rather than
-    cosmetic.
+    `claims_are_cited` scores this, and `evals.calibrate` compares its
+    `uncited_claims` with human labels. Both go through this one function, so the
+    calibration measures the prompt and schema a sweep actually uses.
     """
-    if reason := _ungradable(run, "response"):
-        return _not_measured(reason)
-    prose = _outputs(run).get("response", "")
-    if not prose.strip():
-        return {"score": 0.0, "comment": "the agent produced no prose"}
-
-    grade, refusal = _graded(
+    return _graded(
         _CitationGrade,
         (
             "Grade how well a research agent attributed its claims to sources.\n\n"
@@ -706,11 +699,28 @@ def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
             "it out.\n\n"
             "Count every substantive claim, then list only the genuinely "
             "unsupported ones.\n\n"
-            f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
+            f"QUESTION:\n{question}\n\n"
             f"ANSWER:\n{prose}"
         ),
         count_key="substantive_claims",
     )
+
+
+def claims_are_cited(run: Any, example: Any) -> dict[str, Any]:
+    """Judge: what share of the answer's substantive claims carry a source?
+
+    Claim-level, where `response_cites_sources` is only URL-presence: an answer can
+    carry one link and still assert six unsourced facts around it. Scored as a
+    proportion — see `_coverage_score` for why that is load-bearing rather than
+    cosmetic.
+    """
+    if reason := _ungradable(run, "response"):
+        return _not_measured(reason)
+    prose = _outputs(run).get("response", "")
+    if not prose.strip():
+        return {"score": 0.0, "comment": "the agent produced no prose"}
+
+    grade, refusal = grade_citations(_inputs(example).get("question", ""), prose)
     if grade is None:
         return _not_measured(refusal)
 
@@ -750,7 +760,15 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
     if not response.strip():
         return {"score": 0.0, "comment": "empty response"}
 
-    grade, refusal = _graded(
+    grade, refusal = grade_answer(_inputs(example).get("question", ""), response)
+    if grade is None:
+        return _not_measured(refusal)
+    return _answer_score(grade)
+
+
+def grade_answer(question: str, response: str) -> tuple[dict[str, Any] | None, str]:
+    """The answer judge's raw grade of `response`; see `grade_citations` for why."""
+    return _graded(
         _AnswerGrade,
         (
             "How much of this question did the response actually answer?\n\n"
@@ -766,14 +784,14 @@ def answers_the_question(run: Any, example: Any) -> dict[str, Any]:
             "For each part you list, quote the passage that comes closest to "
             "answering it and say why that passage falls short. If you cannot, the "
             "part was answered: leave it out.\n\n"
-            f"QUESTION:\n{_inputs(example).get('question', '')}\n\n"
+            f"QUESTION:\n{question}\n\n"
             f"RESPONSE:\n{response}"
         ),
         count_key="question_parts",
     )
-    if grade is None:
-        return _not_measured(refusal)
 
+
+def _answer_score(grade: dict[str, Any]) -> dict[str, Any]:
     missing = grade.get("unanswered_parts") or []
     # `or 1` already floors the count at one, so the literal `1` inside `max` was a
     # second spelling of the same guard and is gone. The `len(missing)` term is the

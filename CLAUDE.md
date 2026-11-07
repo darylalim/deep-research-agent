@@ -34,6 +34,7 @@ uv run python -m evals --upload  # create/sync the LangSmith eval dataset (free)
 uv run python -m evals --run --limit 1   # FIRST example in dataset.py: 47k-1M tokens (see *What a sweep costs*)
 uv run python -m evals --run --code-only # trajectory metrics only — skips the judges, NOT the agent
 uv run python -m evals --regrade <experiment>  # grade stored answers again: judge calls only, writes nothing to LangSmith
+uv run python -m evals --calibrate  # judges vs the human labels in evals/calibration.json: judge calls only, ANTHROPIC key only
 uv run ruff check                # lint  (add --fix to autofix)
 uv run ruff format               # format
 uv run ty check                  # type check (Astral's ty)
@@ -92,7 +93,7 @@ uv run ty check                  # type check (Astral's ty)
   The accepted cost is several seconds on every turn while such changes are uncommitted.
   If you edit Python outside `Edit`/`Write`, you can run the steps yourself sooner:
   `uv run ruff format . && uv run ruff check --fix . && uv run ty check && uv run pytest`.
-- **Tests** live in `tests/` (pytest) — 9 files, ~4,400 lines, and the offline suite runs
+- **Tests** live in `tests/` (pytest) — 10 files, ~4,400 lines, and the offline suite runs
   in **~4s**. Where things are: `test_activity_feed.py` (`ActivityFeed` as recorded
   `FeedEvent`s, plus the interrupt-parsing helpers — `pending_reviews`,
   `allowed_decisions_by_tool`, `_declined_tools`), `test_turn_parsing.py` (`render_turn` /
@@ -101,7 +102,7 @@ uv run ty check                  # type check (Astral's ty)
   contract), `test_webui.py` + `test_streamlit_page.py` (the renderer and the page's
   rerun state machine, including the stop-reason notes), `test_evals.py` (the largest —
   evaluators, harness, and — see *When the INSTRUMENT is broken* — whether the evaluators
-  themselves can be trusted), `test_regrade.py` (`--regrade`), `test_config.py` (the model payload), `test_live.py`
+  themselves can be trusted), `test_regrade.py` (`--regrade`), `test_calibrate.py` (`--calibrate`: the labelled file, the flag matcher, the 85% bar), `test_config.py` (the model payload), `test_live.py`
   (marked `live`, deselected by default).
   The offline suite is deliberately narrow —
   it targets the branching logic in `turns.py` and the page, and the load-bearing wiring
