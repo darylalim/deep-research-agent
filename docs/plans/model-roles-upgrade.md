@@ -4,7 +4,7 @@
 and have not been pushed. `main` does not have them, so check out that branch before starting. Do
 not merge it alone: Phase 0 ships with Phase 1.
 
-Status: PR 1 in progress. Real judge call and regrade done; hand check, rule check and Phase 0 steps 6 and 7 remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 in progress. Real judge call and regrade done; hand check and Phase 0 steps 6 and 7 remain. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -69,8 +69,14 @@ starts. They scale the old 5-example sweeps ($1.83 to $4.49, older models) to 9 
 Tick items as they finish, and add what was measured beside them, so the next session does not
 have to work it out again.
 
-- [ ] PR 1: Phase 0 offline work. All done except the rule check that needs a fresh session
-  (*Tighten `.claude/settings.json`* step 4). Measured on 2026-11-06:
+- [x] PR 1: Phase 0 offline work. Measured on 2026-11-06, except the rule check:
+  - Rule check (*Tighten `.claude/settings.json`* step 4), 2026-11-07, fresh session in auto
+    mode. With a dummy `.env.local`, `Read`, `cat`, `Write` and a shell redirect were all
+    refused, so the user had to create and delete the file. `.env.example` could be read
+    (Read and `head`) and edited (a line added and removed), so the `!` lines work. All three
+    `ask` probes prompted: `cd … && uv run pytest -m live --collect-only -q`,
+    `uv run pytest -q -m live --collect-only`, and
+    `DEEP_RESEARCH_RESEARCHER_EFFORT=medium uv run python -m evals --help`. Recorded in `CLAUDE.md`.
   - Lowest versions: 218 passed on `streamlit` 1.67.0, `anthropic` 2.0.0,
     `langchain-anthropic` 1.7.7 and `deepagents` 0.7.8.
   - The 13 warnings on Python 3.14 are all one line, `langsmith/_internal/_beta_decorator.py:92`

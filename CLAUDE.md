@@ -67,12 +67,17 @@ uv run ty check                  # type check (Astral's ty)
   *pending approvals*) — both gitignored, so git cannot undo damage to them — and
   `deny`s *edits* of `uv.lock`, which **is** committed: regenerate it with `uv lock`,
   never hand-edit it. `.env.*` is denied too, with `!.env.example` carved back out; the
-  `!` line must stay after the rule it narrows, or it carves nothing. **Deny rules are not
+  `!` line must stay after the rule it narrows, or it carves nothing. Measured on
+  2026-11-07 with a dummy `.env.local`: `Read`, `cat`, `Write` and a shell redirect into
+  it were all refused, while `.env.example` stayed readable and editable. One consequence:
+  Claude cannot create or delete a `.env.*` file either, so you have to do it. **Deny rules are not
   a hard boundary:** they stop the built-in tools and commands like `cat .env`, but not
   `grep -r` or a Python script opening the file. Only the sandbox enforces this at OS
   level, and that is more setup than a single-developer project needs. An `ask` list
   covers `pytest -m live` and `python -m evals`, the commands that spend money, and the
-  docs say it prompts even in auto mode and past a leading env assignment. (The `allow`
+  docs say it prompts even in auto mode and past a leading env assignment. Measured in auto
+  mode on 2026-11-07: `cd … && uv run pytest -m live`, `uv run pytest -q -m live` and
+  `DEEP_RESEARCH_RESEARCHER_EFFORT=medium uv run python -m evals` all prompted. (The `allow`
   list only suppresses permission prompts and gates nothing. It is not read-only: `uv
   sync`, `uv lock` and `ruff format` change files, and `ruff check --fix` passes it too.)
 - **The hook's matcher is `Edit|Write`, so a `.py` file changed through Bash is checked
