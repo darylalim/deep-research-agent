@@ -870,8 +870,33 @@ The default model is `claude-opus-5-5` (at an explicit `effort="high"` — Opus 
 no `temperature`/`top_p`/`top_k`** — Opus 5 returns a 400 if any sampling param
 is sent. `ChatAnthropic` omits unset params, so leave them unset. Override the
 model via `DEEP_RESEARCH_MODEL`; only widen sampling params if the target model
-accepts them. Subagents inherit this model — the `researcher` dict in `subagents.py`
-has no `model` key — so the rule covers them too.
+accepts them. The `researcher` builds its own model through the same `build_model()`,
+with `model=` / `effort=` taken from `DEEP_RESEARCH_RESEARCHER_MODEL` /
+`DEEP_RESEARCH_RESEARCHER_EFFORT`. Both default to the orchestrator's settings, so the
+default sends a payload byte-identical to the orchestrator's, and every rule here covers
+it too. (The general-purpose subagent deepagents adds still inherits the parent's model.)
+
+**Giving the researcher a `model` does not cost it the gate or the cache.** This was read
+off deepagents 0.7 `graph.py`, not assumed. A spec's `model` (`:717`) and its
+`interrupt_on` (`:799`) resolve independently, and `append_prompt_caching_middleware` is
+called for every declarative subagent unconditionally (`:755`). Any `BaseChatModel`
+instance takes the same path as the inherited one: `resolve_model` returns it unchanged,
+and the harness profile is looked up by identifier either way. Two consequences:
+
+- **Never put an `interrupt_on` key in the researcher dict, not even `{}`.** A key that is
+  present *replaces* the inherited `GATED_TOOLS`, and the researcher's `write_file` would
+  then run unreviewed.
+  `test_a_researcher_with_its_own_model_keeps_the_gate_and_the_cache` reads the built
+  middleware and was verified red by exactly that edit.
+- **A non-Anthropic or other-family researcher model picks up that model's harness
+  profile** (`excluded_tools`, `extra_middleware`), found by identifier. Check the
+  profile before trusting a sweep run on it.
+
+`effort` from the environment is parsed by `config.parse_effort` into the `Effort`
+`Literal`, so a typo fails at import, not as a 400 in the middle of a turn.
+`test_effort_matches_what_chatanthropic_accepts` compares that `Literal` with the
+installed `ChatAnthropic.reasoning_effort` by set equality, the same way `_SILENT_STOPS`
+is checked against `StopReason`.
 
 **A sampling param is invisible at the top level of the payload on `anthropic` 2.x.** The
 SDK removed `temperature`, `top_p` and `top_k` from `messages.create`, so
@@ -1632,7 +1657,11 @@ verified red by breaking the source.
   toggle, and this app's output is long-form prose whose reading mode is the reader's
   call. Don't reach for CSS injection — native elements and that file first.
 - **Env overrides** (all read in `config.py`): `DEEP_RESEARCH_MODEL`,
-  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`. All three are resolved into
+  `DEEP_RESEARCH_MAX_TOKENS`, `DEEP_RESEARCH_STATE_DIR`,
+  `DEEP_RESEARCH_RESEARCHER_MODEL` and `DEEP_RESEARCH_RESEARCHER_EFFORT`. The last two
+  default to the orchestrator's model and effort, and the effort must be one of
+  `config.Effort`. All five are resolved into
   module-level constants at *import* time, so they must be set before
   `deep_research.config` is first imported — a `monkeypatch.setenv` in a test body is
-  too late, which is why `tests/conftest.py` sets them as top-level code.
+  too late, which is why `tests/conftest.py` sets (or pops) them as top-level code, and
+  why `test_config.py` checks the two researcher variables in a fresh interpreter.

@@ -3,7 +3,7 @@
 **PR 1 (Phases 0 and 1) is merged to `main` and released as v0.4.0.** Start each later PR on its
 own branch from `main`; PR 2's is `upgrade/pr-2`.
 
-Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is in progress on `upgrade/pr-2`; judge calibration passed, and Phase 2 is next. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
+Status: PR 1 shipped as v0.4.0 on 2026-11-07. PR 2 is in progress on `upgrade/pr-2`; judge calibration and Phase 2 are done, and Phase 2b is next. Check the LangSmith trace quota first. Drafted 2026-11-06 against `main` at `c6c5392`, then revised after
 `uv lock --upgrade` moved to `anthropic` 2.6.0, `langchain-anthropic` 1.7.10 and `deepagents`
 0.7.34. Check `uv.lock` before starting, in case the `anthropic` decision below changed it.
 
@@ -161,7 +161,16 @@ have to work it out again.
   all three repeats, so it scored 12/15. It has no bar, and with no part labelled unanswered
   it can show only false accusations. Run saved at
   `~/deep-research-regrades/calibration-20261107T191649Z.json`.
-- [ ] PR 2: Phase 2 researcher settings
+- [x] PR 2: Phase 2 researcher settings, 2026-11-07, offline. `config.Effort` and
+  `parse_effort`, `RESEARCHER_MODEL` / `RESEARCHER_EFFORT`, and `build_model(*, model, effort)`.
+  The researcher dict now carries its own `model`. Step 5 was read off the installed deepagents
+  `graph.py`: `model` (`:717`) and `interrupt_on` (`:799`) resolve independently, and caching is
+  appended unconditionally (`:755`). A spy on the built subagents confirmed it: the researcher's
+  middleware stack matches the inheriting general-purpose subagent's, with `HumanInTheLoopMiddleware`
+  over all four `GATED_TOOLS`. Added beyond the plan: an `Effort` vs `ChatAnthropic` parity test, a
+  gate-and-cache test on the built researcher, and import-time env tests in a subprocess. All of
+  them were verified red by breaking the source. Phase 3 note: a researcher on another model
+  family gets that model's harness profile, found by identifier, so check its extras first.
 - [ ] PR 2: Phase 2b metrics added and calibrated
 - [ ] PR 3: `score=None` measured
 - [ ] PR 3: Phase 3 sweeps run and decision recorded
