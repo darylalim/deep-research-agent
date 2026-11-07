@@ -172,6 +172,17 @@ have to work it out again.
   them were verified red by breaking the source. Phase 3 note: a researcher on another model
   family gets that model's harness profile, found by identifier, so check its extras first.
 - [ ] PR 2: Phase 2b metrics added and calibrated
+  - Offline so far, 2026-11-07. **Recorder:** `search_results` holds `{url, title, content}`
+    from every successful search (`0caec47`). **A bug found on the way:** Tavily *returns* most
+    API errors as `{"error": exc}`, which arrives as `status="success"` with a Python repr, so
+    `searched_the_web` scored such runs 1. Fixed in `f60e228`: content that is not a result set is
+    now a failed search. **`citations_are_real`** is done. It scores distinct cited URLs, and its
+    normaliser is tested both ways: spellings that must merge (trailing punctuation, scheme,
+    `www.`, slash, fragment, `utm_*`, encoding, Wikipedia parentheses) and pages that must not
+    (query, parent path, subdomain, port). Its comment separates URLs on a site a search reached
+    from URLs on no such site, for the hand read in step 6. **Still to do:** `claims_are_supported`,
+    then the `CLAUDE.md` evaluator list, deliberately left for *Finish this phase*. Steps 5 and 6
+    and the calibration labels are paid, so they wait for the quota (2026-12-01).
 - [ ] PR 3: `score=None` measured
 - [ ] PR 3: Phase 3 sweeps run and decision recorded
 - [ ] PR 3: Phase 3b memory example added

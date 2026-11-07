@@ -37,6 +37,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from typing import Annotated, Any, TypedDict
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 from langchain_anthropic import ChatAnthropic
 
@@ -468,6 +469,95 @@ def response_cites_sources(run: Any, example: Any) -> dict[str, Any]:
     }
 
 
+# Characters `URL` can capture that end a sentence or close Markdown emphasis, never a
+# URL: "see https://x.example/a." must match the retrieved "https://x.example/a".
+_TRAILING = ".;:!?'\"*"
+# Query keys that track the click rather than identify the page. Every OTHER key is
+# kept, because `?id=`, `?v=` or `?page=` can be the whole difference between pages.
+_TRACKING = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid")
+
+
+def _normalise_url(url: str) -> str:
+    """One canonical spelling of a URL, so a cited URL can be matched to a retrieved one.
+
+    Applied to BOTH sides, so every rule here can only merge two spellings of a page,
+    never split one. Each rule exists because a false "not retrieved" reads as
+    fabrication, which is the gravest thing this metric can say:
+
+    - the scheme is dropped (an agent writing `http://` for a page fetched over https
+      cited the same page), the host lower-cased and a leading `www.` removed;
+    - the path is percent-DECODED, so `%C3%A9` and a literal `é` agree;
+    - parentheses are deleted from the path, because `URL` stops at `)` — a Wikipedia
+      `Foo_(bar)` is captured as `Foo_(bar` and must still match;
+    - a trailing slash, the fragment (including `#:~:text=` highlights), and tracking
+      parameters are dropped; the remaining query is kept, sorted.
+    """
+    parts = urlsplit(url.rstrip(_TRAILING))
+    host = parts.netloc.lower().removeprefix("www.")
+    path = unquote(parts.path).replace("(", "").replace(")", "").rstrip("/")
+    query = sorted(
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith(_TRACKING)
+    )
+    return f"{host}{path}" + (f"?{urlencode(query)}" if query else "")
+
+
+def citations_are_real(run: Any, example: Any) -> dict[str, Any]:
+    """Was every URL the user is shown actually returned by one of the agent's searches?
+
+    `response_cites_sources` asks only whether a URL is present, and `claims_are_cited`
+    whether a claim has one nearby. Neither can tell a real source from a plausible
+    invented one, and a cheaper researcher is exactly what might invent one. So this
+    compares the distinct URLs in the response against every URL any search returned,
+    anywhere in the tree (`search_results`, recorded by `TurnRecorder`).
+
+    **What it cannot see:** a real, retrieved URL that does not support the claim it is
+    attached to (`claims_are_supported` samples that), and a genuine primary source the
+    model cited from its own knowledge, which scores as not retrieved. Read the listed
+    URLs before calling one fabricated — the comment separates URLs on a site some search
+    DID reach, which is usually the second case.
+
+    Reads `search_results` alone through `_ungradable`, so a row holding only a
+    `response` is "not measured" rather than calling every URL invented. A response with
+    no URLs is also a non-verdict: there is nothing to check, `response_cites_sources`
+    already scores that 0, and a vacuous 1.0 here would be averaged in as a perfect run.
+    """
+    if reason := _ungradable(run, "search_results"):
+        return _not_measured(reason)
+    outputs = _outputs(run)
+    cited: dict[str, str] = {}
+    for url in URL.findall(outputs.get("response", "")):
+        cited.setdefault(_normalise_url(url), url.rstrip(_TRAILING))
+    if not cited:
+        return _not_measured(
+            "the response cites no URLs (response_cites_sources scores that)"
+        )
+    retrieved = {
+        _normalise_url(hit["url"])
+        for hit in outputs["search_results"]
+        if isinstance(hit, dict) and isinstance(hit.get("url"), str)
+    }
+    reached_hosts = {key.split("/", 1)[0].split("?", 1)[0] for key in retrieved}
+    missing = [url for key, url in cited.items() if key not in retrieved]
+    score = _coverage_score(len(cited), len(missing))
+    comment = f"{len(cited) - len(missing)} of {len(cited)} cited URL(s) were returned by a search"
+    if not retrieved:
+        comment += "; no search returned anything"
+    if missing:
+        on_site = [
+            u
+            for u in missing
+            if _normalise_url(u).split("/", 1)[0].split("?", 1)[0] in reached_hosts
+        ]
+        elsewhere = [u for u in missing if u not in on_site]
+        if elsewhere:
+            comment += f". Not retrieved, on no site any search reached: {', '.join(elsewhere)}"
+        if on_site:
+            comment += f". Not retrieved, but on a site a search did reach: {', '.join(on_site)}"
+    return {"score": score, "comment": comment}
+
+
 def turn_stopped_cleanly(run: Any, example: Any) -> dict[str, Any]:
     """Did the API let this turn finish, or did it end it?
 
@@ -819,6 +909,7 @@ CODE_EVALUATORS = [
     persists_findings,
     mutations_require_approval,
     response_cites_sources,
+    citations_are_real,
     turn_stopped_cleanly,
 ]
 

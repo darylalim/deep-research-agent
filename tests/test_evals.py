@@ -33,8 +33,10 @@ from evals.evaluators import (
     CODE_EVALUATORS,
     UNCLEAN_STOPS,
     _coverage_score,
+    _normalise_url,
     answers_the_question,
     checks_memory_first,
+    citations_are_real,
     claims_are_cited,
     delegates_breadth,
     mutations_require_approval,
@@ -1185,7 +1187,11 @@ def test_every_code_evaluator_reads_a_key_the_harness_emits(evaluator):
     answer. Driving every evaluator against a complete (if empty) recorder output is
     what pins each literal against a key the harness really emits.
     """
-    outputs = {**TurnRecorder().actions(), RESPONSE_KEY: "some prose"}
+    # Prose WITH a URL: `citations_are_real` honestly has no reading on a response that
+    # cites nothing (its own test pins that non-verdict), so URL-free prose here would
+    # stop this test checking its key literal at all.
+    response = "some prose, per https://a.example/x"
+    outputs = {**TurnRecorder().actions(), RESPONSE_KEY: response}
     assert evaluator({"outputs": outputs}, {"outputs": {}})["score"] is not None
 
 
@@ -1444,3 +1450,112 @@ class TestSearchResults:
             ),
         )
         assert recorder.actions()["search_results"] == []
+
+
+class TestCitationsAreReal:
+    """Every URL the user is shown should be one some search actually returned."""
+
+    @staticmethod
+    def _run(response: str, *retrieved: str) -> dict:
+        hits = [{"url": url, "title": "", "content": ""} for url in retrieved]
+        return {"outputs": {RESPONSE_KEY: response, "search_results": hits}}
+
+    @pytest.mark.parametrize(
+        ("cited", "retrieved"),
+        [
+            ("https://x.example/a.", "https://x.example/a"),  # sentence end
+            ("https://x.example/a**", "https://x.example/a"),  # Markdown bold
+            ("http://x.example/a", "https://x.example/a"),  # scheme
+            ("https://www.X.example/a", "https://x.example/a"),  # www. and host case
+            ("https://x.example/a/", "https://x.example/a"),  # trailing slash
+            ("https://x.example/a#pricing", "https://x.example/a"),  # fragment
+            ("https://x.example/a#:~:text=limit", "https://x.example/a"),  # highlight
+            ("https://x.example/a?utm_source=t&id=7", "https://x.example/a?id=7"),
+            ("https://x.example/a?fbclid=z", "https://x.example/a"),
+            ("https://x.example/a?b=2&a=1", "https://x.example/a?a=1&b=2"),  # order
+            ("https://x.example/caf%C3%A9", "https://x.example/café"),  # encoding
+            # `URL` stops at ")", so a Wikipedia title is captured unclosed.
+            (
+                "https://en.wikipedia.org/wiki/Foo_(bar",
+                "https://en.wikipedia.org/wiki/Foo_(bar)",
+            ),
+        ],
+    )
+    def test_spellings_of_one_page_match(self, cited: str, retrieved: str) -> None:
+        # A false "not retrieved" reads as fabrication, so each of these must merge.
+        assert _normalise_url(cited) == _normalise_url(retrieved)
+
+    @pytest.mark.parametrize(
+        ("cited", "retrieved"),
+        [
+            (
+                "https://x.example/a?id=7",
+                "https://x.example/a?id=8",
+            ),  # query is identity
+            (
+                "https://x.example/a",
+                "https://x.example/a/b",
+            ),  # a parent is not the page
+            ("https://docs.x.example/a", "https://x.example/a"),  # subdomain
+            ("https://x.example/a", "https://y.example/a"),
+            ("https://x.example:8443/a", "https://x.example/a"),  # port
+        ],
+    )
+    def test_different_pages_stay_different(self, cited: str, retrieved: str) -> None:
+        # The other direction, without which normalising EVERYTHING to the host would
+        # pass the test above while crediting invented URLs.
+        assert _normalise_url(cited) != _normalise_url(retrieved)
+
+    def test_scores_the_share_of_distinct_cited_urls_that_were_retrieved(self) -> None:
+        response = (
+            "Limits per [the docs](https://x.example/limits). Also see "
+            "<https://x.example/pricing>, https://x.example/limits again, "
+            "https://x.example/made-up and https://nowhere.example/ghost."
+        )
+        result = citations_are_real(
+            self._run(
+                response, "https://x.example/limits", "https://x.example/pricing"
+            ),
+            {},
+        )
+        # Four distinct URLs (the repeat counts once), two retrieved.
+        assert result["score"] == pytest.approx(2 / 4)
+        comment = result["comment"]
+        assert "2 of 4" in comment
+        assert "on no site any search reached: https://nowhere.example/ghost" in comment
+        assert "on a site a search did reach: https://x.example/made-up" in comment
+
+    def test_all_retrieved_scores_one(self) -> None:
+        result = citations_are_real(
+            self._run("Per https://x.example/a.", "https://x.example/a"), {}
+        )
+        assert result["score"] == 1.0
+
+    def test_urls_with_no_search_results_score_zero_and_say_why(self) -> None:
+        result = citations_are_real(self._run("Per https://x.example/a."), {})
+        assert result["score"] == 0.0
+        assert "no search returned anything" in result["comment"]
+
+    def test_a_response_with_no_urls_is_not_measured(self) -> None:
+        # `response_cites_sources` scores this 0; a vacuous 1.0 here would be averaged
+        # into the experiment mean as a perfect run.
+        result = citations_are_real(
+            self._run("No links at all.", "https://x.example/a"), {}
+        )
+        assert result["score"] is None
+
+    def test_a_row_without_search_results_is_not_measured(self) -> None:
+        # The plan's guard: a row holding only a response must not have every URL in it
+        # called invented. Old experiments recorded no `search_results` at all.
+        run = {"outputs": {RESPONSE_KEY: "Per https://x.example/a."}}
+        assert citations_are_real(run, {})["score"] is None
+
+    def test_end_to_end_through_the_recorder_and_the_real_tool(self) -> None:
+        # The searches come from the real `TavilySearch.invoke` (HTTP stubbed), so the
+        # recorder and the evaluator are checked against the shape the tool emits.
+        recorder = TurnRecorder()
+        response = TestSearchResults._response("https://www.x.example/a/")
+        message = TestSearchResults._search("s1", returns=response)
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        outputs = {**recorder.actions(), RESPONSE_KEY: "See https://x.example/a."}
+        assert citations_are_real({"outputs": outputs}, {})["score"] == 1.0
