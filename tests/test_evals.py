@@ -13,8 +13,10 @@ Everything here runs without keys or network.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -22,6 +24,7 @@ from langgraph.types import Interrupt
 
 from deep_research.agent import GATED_TOOLS
 from deep_research.config import CHECKPOINT_DB, MEMORY_DB, STATE_DIR, ensure_state_dir
+from deep_research.tools import build_web_search
 from deep_research.turns import _SILENT_STOPS, render_turn
 from evals.dataset import EXAMPLES, drift
 from evals.evaluators import (
@@ -46,6 +49,7 @@ from evals.harness import (
     MUTATING_TOOLS,
     NON_WRITE_TOOLS,
     RESPONSE_KEY,
+    SEARCH_TOOL,
     WRITE_TOOLS,
     TurnRecorder,
     _approve_all,
@@ -1277,3 +1281,141 @@ def test_a_zero_count_beside_listed_misses_is_still_a_failure(monkeypatch):
     monkeypatch.setattr("evals.evaluators.JUDGE", _StubJudge(reply))
     run = {"outputs": {"response": "two unsourced claims"}}
     assert claims_are_cited(run, {"inputs": {"question": "q"}})["score"] == 0.0
+
+
+class TestSearchResults:
+    """`TurnRecorder` keeps what each search returned, for the Phase 2b citation metrics.
+
+    The messages come from the REAL `TavilySearch.invoke` with only the HTTP call stubbed,
+    so the shapes under test are the ones the installed tool emits, not ones written to
+    suit the parser. Each case below was read off that path first.
+    """
+
+    @staticmethod
+    def _search(
+        call_id: str, *, returns: Any = None, raises: Exception | None = None
+    ) -> ToolMessage:
+        tool = build_web_search()
+        stub = {"side_effect": raises} if raises else {"return_value": returns}
+        with mock.patch.object(type(tool.api_wrapper), "raw_results", **stub):
+            message = tool.invoke(
+                {
+                    "type": "tool_call",
+                    "id": call_id,
+                    "name": tool.name,
+                    "args": {"query": "q"},
+                }
+            )
+        assert isinstance(message, ToolMessage)
+        return message
+
+    @staticmethod
+    def _response(*urls: str) -> dict:
+        # The API response's shape, as `langchain_tavily` documents it and as a stored
+        # trace shows it, including the keys the recorder ignores.
+        return {
+            "query": "q",
+            "follow_up_questions": None,
+            "answer": None,
+            "images": [],
+            "results": [
+                {
+                    "url": url,
+                    "title": f"title {i}",
+                    "content": f"snippet {i}",
+                    "score": 0.9,
+                    "raw_content": None,
+                }
+                for i, url in enumerate(urls)
+            ],
+            "response_time": 0.4,
+        }
+
+    def test_the_search_tool_name_is_the_real_one(self):
+        # A rename would make every search record nothing, and `citations_are_real`
+        # would then call every cited URL invented.
+        assert build_web_search().name == SEARCH_TOOL
+
+    def test_results_are_kept_from_anywhere_in_the_tree(self):
+        recorder = TurnRecorder()
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools",
+                self._search("s1", returns=self._response("https://a.example/x")),
+            ),
+        )
+        recorder.absorb(
+            ORCHESTRATOR,
+            _updates(
+                "tools",
+                self._search("s2", returns=self._response("https://b.example/y")),
+            ),
+        )
+        assert recorder.actions()["search_results"] == [
+            {"url": "https://a.example/x", "title": "title 0", "content": "snippet 0"},
+            {"url": "https://b.example/y", "title": "title 0", "content": "snippet 0"},
+        ]
+
+    def test_a_replayed_search_is_recorded_once(self):
+        # A resumed superstep re-emits a finished sibling's result as a FRESH object;
+        # the recorder's tool-call-id dedupe must cover search results too.
+        recorder = TurnRecorder()
+        for _ in range(2):
+            message = self._search("s1", returns=self._response("https://a.example/x"))
+            recorder.absorb(SUBAGENT, _updates("tools", message))
+        assert len(recorder.actions()["search_results"]) == 1
+
+    def test_an_empty_search_is_an_error_and_records_nothing(self):
+        message = self._search("s1", returns={"results": []})
+        assert message.status == "error"
+        recorder = TurnRecorder()
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        assert recorder.actions()["search_results"] == []
+
+    def test_a_failed_search_reported_as_success_records_nothing(self):
+        # The sharp one: `TavilySearch._run` RETURNS `{"error": exc}` for an API
+        # failure, `json.dumps` cannot encode the exception, and the message arrives as
+        # `status="success"` with a Python repr for content.
+        message = self._search("s1", raises=RuntimeError("HTTP 500"))
+        assert message.status == "success"
+        recorder = TurnRecorder()
+        recorder.absorb(SUBAGENT, _updates("tools", message))
+        assert recorder.actions()["search_results"] == []
+
+    def test_a_json_error_payload_records_nothing(self):
+        recorder = TurnRecorder()
+        content = json.dumps(
+            {"error": "rate limited", "results": [{"url": "https://x"}]}
+        )
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools", ToolMessage(content, tool_call_id="s1", name=SEARCH_TOOL)
+            ),
+        )
+        assert recorder.actions()["search_results"] == []
+
+    def test_a_result_without_a_string_url_is_skipped(self):
+        response = self._response("https://a.example/x")
+        response["results"].append({"title": "no url", "content": "c"})
+        response["results"].append({"url": None, "content": "c"})
+        recorder = TurnRecorder()
+        recorder.absorb(
+            SUBAGENT, _updates("tools", self._search("s1", returns=response))
+        )
+        assert [hit["url"] for hit in recorder.actions()["search_results"]] == [
+            "https://a.example/x"
+        ]
+
+    def test_another_tool_with_the_same_shape_is_not_a_search(self):
+        # Only the search tool's results are evidence of what was retrieved.
+        recorder = TurnRecorder()
+        content = json.dumps(self._response("https://a.example/x"))
+        recorder.absorb(
+            SUBAGENT,
+            _updates(
+                "tools", ToolMessage(content, tool_call_id="r1", name="read_file")
+            ),
+        )
+        assert recorder.actions()["search_results"] == []

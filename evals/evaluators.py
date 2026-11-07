@@ -90,6 +90,7 @@ _COMPLETED_RUN_KEYS = frozenset(
         "gated_tools",
         "failed_tools",
         "stop_reasons",
+        "search_results",
     }
 )
 
